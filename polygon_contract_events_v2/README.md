@@ -32,23 +32,36 @@ Example paths:
 
 ## Scraping workflow
 
-1. Scrape events from Polygon into SQLite:
+Run the scraper to fetch events from Polygon and write Parquet files:
 
-   ```sh
-   python3 polygon_contract_events_v2/scrape_events_rpc.py
-   ```
+```sh
+python3 polygon_contract_events_v2/scrape_events_rpc.py
+```
 
-2. Export SQLite rows to v2 Parquet:
+The scraper automatically solidifies completed 10K-block partitions to Parquet and deletes the corresponding rows from SQLite. The hot database stays small by design.
 
-   ```sh
-   python3 polygon_contract_events_v2/export_parquet.py
-   ```
+On startup, the scraper recovers from any interrupted solidification before resuming scraping.
 
-3. Optionally delete exported rows from SQLite to free space:
+### Manual vacuum
 
-   ```sh
-   python3 polygon_contract_events_v2/export_parquet.py --delete
-   ```
+Under normal operation the database self-manages. If the database file grows unexpectedly, run:
+
+```sh
+sqlite3 /path/to/polygon_contract_events_v2.db "PRAGMA wal_checkpoint(TRUNCATE); VACUUM;"
+```
+
+## Code organization
+
+```
+polygon_contract_events_v2/
+├── scrape_events_rpc.py        # executable: scrape + solidify
+├── schema_rpc.sql              # SQLite schema (run once to create DB)
+├── lib/
+│   ├── v2_schemas.py           # Arrow schemas, table mappings, converters
+│   └── parquet_writer.py       # Parquet writing, verification, atomic move
+├── assertions/                 # data integrity tests
+└── DATA_DICTIONARY.md          # column definitions and data types
+```
 
 ## Schema and data dictionary
 

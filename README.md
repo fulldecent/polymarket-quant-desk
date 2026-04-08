@@ -48,6 +48,6 @@ First, perform scraping to your cold storage disk. This script is optimized for 
 # Scrape from Polygon and export to Parquet files
 # With MacBook Pro M5 Pro, gigabit internet and a paid Chainstack plan,
 # try `--parallel 50` for a good experience
-python polygon_contract_events_v2/scrape_events_rpc.py
-python polygon_contract_events_v2/export_parquet.py
+python3 polygon_contract_events_v2/scrape_events_rpc.py --parallel 25
+# python3 -m pytest polygon_contract_events_v2/assertions/ -v
 ```

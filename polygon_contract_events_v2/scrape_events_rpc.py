@@ -6,6 +6,9 @@ Fetches all 5 Polymarket contracts in parallel using block-range slicing.
 Multiple eth_getLogs calls fly simultaneously, each covering a different
 block range but all contracts at once.
 
+Completed 10K-block partitions are automatically solidified to Parquet
+and deleted from the hot database. The database stays small by design.
+
 USAGE
     python3 scrape_events_rpc.py                      # scrape all contracts
     python3 scrape_events_rpc.py --max-calls 100      # limit API calls per run
@@ -13,6 +16,7 @@ USAGE
 
 ENVIRONMENT (all required, set in .env or export)
     RPC_DB_PATH                            path to SQLite database file
+    POLYGON_CONTRACT_EVENTS_V2_DIR         output directory for Parquet files
     POLYGON_RPC_URL                        JSON-RPC endpoint URL
     POLYGON_RPC_MAX_GETLOGS_BLOCK_SPAN     max blocks per eth_getLogs
     POLYGON_RPC_MAX_REQUESTS_PER_SECOND    rate limit
@@ -43,6 +47,7 @@ API CONTRACT (JSON-RPC eth_getLogs)
       - Logs do NOT include block timestamp (not stored in our DB)
 """
 
+import argparse
 import gzip
 import http.client
 import itertools
@@ -65,6 +70,21 @@ from pathlib import Path
 from dotenv import load_dotenv
 from eth_abi import decode as abi_decode
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lib.v2_schemas import (
+    SQLITE_TO_V2,
+    is_mixed_sqlite_table,
+    all_sqlite_table_names,
+    _10K,
+)
+from lib.parquet_writer import (
+    export_partition,
+    cleanup_orphaned_temp_dirs,
+    find_existing_partitions,
+    dest_path_for_partition,
+    verify_parquet,
+)
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -77,6 +97,7 @@ load_dotenv(_project_root / ".env")
 
 _REQUIRED_ENV = [
     "RPC_DB_PATH",
+    "POLYGON_CONTRACT_EVENTS_V2_DIR",
     "POLYGON_RPC_URL",
     "POLYGON_RPC_MAX_GETLOGS_BLOCK_SPAN",
     "POLYGON_RPC_MAX_REQUESTS_PER_SECOND",
@@ -91,6 +112,7 @@ if _missing:
 DB_PATH = os.environ["RPC_DB_PATH"]
 if not os.path.isabs(DB_PATH):
     DB_PATH = os.path.join(_script_dir, DB_PATH)
+OUTPUT_DIR = os.environ["POLYGON_CONTRACT_EVENTS_V2_DIR"]
 RPC_URL = os.environ["POLYGON_RPC_URL"]
 MAX_BLOCK_SPAN = int(os.environ["POLYGON_RPC_MAX_GETLOGS_BLOCK_SPAN"])
 MAX_CALLS_PER_SEC = int(os.environ["POLYGON_RPC_MAX_REQUESTS_PER_SECOND"])
@@ -729,6 +751,15 @@ def init_db(db_path):
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+
+    # Ensure compound indexes exist for mixed-table solidification DELETEs
+    for table in ("order_filled", "orders_matched", "fee_charged",
+                  "order_cancelled", "token_registered", "fee_refunded"):
+        conn.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{table}_block_addr "
+            f"ON {table} (block_number, contract_address)"
+        )
+
     return conn
 
 
@@ -822,6 +853,138 @@ def migrate_from_scrape_progress(conn):
         add_completed_range(conn, EARLIEST_BLOCK, min_block)
         conn.commit()
         print(f"Migrated progress: blocks {EARLIEST_BLOCK:,} - {min_block:,} marked complete")
+
+
+# ---------------------------------------------------------------------------
+# Solidification (hot SQLite → cold Parquet)
+# ---------------------------------------------------------------------------
+
+
+def _complete_10k_partitions(completed_ranges):
+    """Return sorted set of 10K partition starts fully covered by completed_ranges."""
+    partitions = set()
+    for from_b, to_b in completed_ranges:
+        # Find first 10K boundary at or after from_b
+        first = ((from_b + _10K - 1) // _10K) * _10K
+        # Find last 10K boundary that ends within this range
+        for p in range(first, to_b - _10K + 2, _10K):
+            if p + _10K - 1 <= to_b:
+                partitions.add(p)
+    return sorted(partitions)
+
+
+def _tables_with_rows_in_range(conn, block_start, block_end):
+    """Return list of sqlite table names that have rows in the given block range."""
+    tables = []
+    for table_name in all_sqlite_table_names():
+        try:
+            count = conn.execute(
+                f"SELECT COUNT(*) FROM {table_name} "
+                f"WHERE block_number >= ? AND block_number <= ?",
+                (block_start, block_end),
+            ).fetchone()[0]
+            if count > 0:
+                tables.append(table_name)
+        except sqlite3.OperationalError:
+            pass
+    return tables
+
+
+def solidify_partition(conn, block_start, output_dir, print_fn=print):
+    """Solidify one 10K partition: write Parquet for each target, then delete.
+
+    For each SQLite table with data in the range, writes one Parquet file
+    per (contract, event) target. Mixed tables produce multiple files.
+    After all Parquet files are written and verified, deletes the SQLite
+    rows in a single transaction.
+
+    Returns (num_files_written, total_rows, elapsed_seconds).
+    """
+    block_end = block_start + _10K - 1
+    t0 = time.time()
+    files_written = 0
+    total_rows = 0
+    delete_ops = []  # (table_name, contract_or_None) to delete after all writes
+
+    tables = _tables_with_rows_in_range(conn, block_start, block_end)
+    if not tables:
+        return 0, 0, 0
+
+    for sqlite_table in tables:
+        targets = SQLITE_TO_V2.get(sqlite_table, [])
+        for contract, event in targets:
+            rows, _ = export_partition(
+                conn, sqlite_table, contract, event,
+                block_start, block_end, output_dir,
+            )
+            if rows == -1:
+                # Already exists — still need to delete SQLite rows
+                delete_ops.append((sqlite_table, contract))
+                continue
+            if rows > 0:
+                # Verify
+                parquet_path = os.path.join(
+                    dest_path_for_partition(output_dir, contract, event, block_start),
+                    "data.parquet",
+                )
+                verified = verify_parquet(parquet_path)
+                if verified != rows:
+                    print_fn(
+                        f"  SOLIDIFY ERROR: {contract}/{event} blocks "
+                        f"{block_start}-{block_end}: wrote {rows} but "
+                        f"verified {verified}. Skipping delete."
+                    )
+                    continue
+            files_written += 1
+            total_rows += max(rows, 0)
+            delete_ops.append((sqlite_table, contract))
+
+    # Delete from SQLite in one transaction
+    if delete_ops:
+        for sqlite_table, contract in delete_ops:
+            if is_mixed_sqlite_table(sqlite_table):
+                conn.execute(
+                    f"DELETE FROM {sqlite_table} "
+                    f"WHERE block_number >= ? AND block_number <= ? "
+                    f"AND contract_address = ?",
+                    (block_start, block_end,
+                     CONTRACTS[contract].lower()),
+                )
+            else:
+                conn.execute(
+                    f"DELETE FROM {sqlite_table} "
+                    f"WHERE block_number >= ? AND block_number <= ?",
+                    (block_start, block_end),
+                )
+        conn.commit()
+
+    elapsed = time.time() - t0
+    return files_written, total_rows, elapsed
+
+
+def solidify_all_ready(conn, output_dir, print_fn=print):
+    """Solidify all complete 10K partitions. Returns count solidified."""
+    completed = get_completed_ranges(conn)
+    ready = _complete_10k_partitions(completed)
+    if not ready:
+        return 0
+
+    count = 0
+    for block_start in ready:
+        block_end = block_start + _10K - 1
+        tables = _tables_with_rows_in_range(conn, block_start, block_end)
+        if not tables:
+            continue
+        files, rows, elapsed = solidify_partition(
+            conn, block_start, output_dir, print_fn=print_fn,
+        )
+        if files > 0 or rows == 0:
+            count += 1
+            print_fn(
+                f"  solidified 10K={block_start:,}: "
+                f"{files} files, {rows:,} rows ({elapsed:.1f}s)"
+            )
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -1079,20 +1242,20 @@ def main():
         raise KeyboardInterrupt
     signal.signal(signal.SIGINT, _sigint_handler)
 
-    max_calls = None
-    if "--max-calls" in sys.argv:
-        idx = sys.argv.index("--max-calls")
-        max_calls = int(sys.argv[idx + 1])
+    parser = argparse.ArgumentParser(
+        description="Scrape Polymarket event logs from Polygon via JSON-RPC"
+    )
+    parser.add_argument("--max-calls", type=int, default=None,
+                        help="stop after N RPC calls (default: unlimited)")
+    parser.add_argument("--parallel", type=int, default=1,
+                        help="number of worker threads (default: 1)")
+    parser.add_argument("--lag-tolerance", type=int, default=2,
+                        help="stop when within N blocks of chain head (default: 2)")
+    args = parser.parse_args()
 
-    num_workers = 1
-    if "--parallel" in sys.argv:
-        idx = sys.argv.index("--parallel")
-        num_workers = int(sys.argv[idx + 1])
-
-    lag_tolerance = 2
-    if "--lag-tolerance" in sys.argv:
-        idx = sys.argv.index("--lag-tolerance")
-        lag_tolerance = int(sys.argv[idx + 1])
+    max_calls = args.max_calls
+    num_workers = args.parallel
+    lag_tolerance = args.lag_tolerance
 
     conn = None
     rate_limiter = RateLimiter(MAX_CALLS_PER_SEC)
@@ -1119,6 +1282,16 @@ def main():
 
         # Migrate from old per-contract progress if needed
         migrate_from_scrape_progress(conn)
+
+        # Clean up orphaned temp dirs from interrupted solidifications
+        orphans = cleanup_orphaned_temp_dirs(OUTPUT_DIR)
+        if orphans:
+            print(f"Cleaned up {orphans} orphaned temp director{'y' if orphans == 1 else 'ies'}")
+
+        # Startup recovery: solidify any complete 10K partitions still in SQLite
+        recovered = solidify_all_ready(conn, OUTPUT_DIR)
+        if recovered:
+            print(f"Startup recovery: solidified {recovered} partition{'s' if recovered != 1 else ''}")
 
         # Find gaps to fill
         completed = get_completed_ranges(conn)
@@ -1519,6 +1692,9 @@ def main():
                         or prc >= MAX_PENDING_ROWS):
                     flush_to_db()
 
+                    # Solidify any newly complete 10K partitions
+                    solidify_all_ready(conn, OUTPUT_DIR, print_fn=_print_msg)
+
                 # Refill pipeline — but pause submission when buffer is full
                 while (work_idx < len(work_queue)
                        and len(futures) < active_workers
@@ -1557,11 +1733,14 @@ def main():
                             pass
                     futures.clear()
                     print(f"\nReached --max-calls limit ({max_calls}). Stopping.")
+                    flush_to_db()
+                    solidify_all_ready(conn, OUTPUT_DIR, print_fn=_print_msg)
                     break
 
                 if not futures:
                     # Pass complete — check if we're within lag tolerance
                     flush_to_db()
+                    solidify_all_ready(conn, OUTPUT_DIR, print_fn=_print_msg)
                     rate_limiter.wait()
                     new_head = get_block_number()
                     new_completed = get_completed_ranges(conn)
@@ -1640,6 +1819,7 @@ def main():
         else:
             if callable(locals().get('flush_to_db')):
                 flush_to_db()
+                solidify_all_ready(conn, OUTPUT_DIR)
         elapsed = time.time() - run_start
         effective_cps = rate_limiter.total_calls / elapsed if elapsed > 1 else 0
         blk_s = blocks_done / elapsed if elapsed > 1 and blocks_done > 0 else 0

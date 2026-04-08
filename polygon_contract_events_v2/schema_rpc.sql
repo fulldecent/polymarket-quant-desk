@@ -455,6 +455,14 @@ CREATE INDEX IF NOT EXISTS idx_question_flagged_block   ON question_flagged (blo
 CREATE INDEX IF NOT EXISTS idx_question_emerg_block     ON question_emergency_resolved (block_number);
 CREATE INDEX IF NOT EXISTS idx_fee_refunded_block       ON fee_refunded (block_number);
 
+-- Compound indexes on mixed tables (used by solidification DELETE with contract_address filter)
+CREATE INDEX IF NOT EXISTS idx_order_filled_block_addr   ON order_filled (block_number, contract_address);
+CREATE INDEX IF NOT EXISTS idx_orders_matched_block_addr ON orders_matched (block_number, contract_address);
+CREATE INDEX IF NOT EXISTS idx_fee_charged_block_addr    ON fee_charged (block_number, contract_address);
+CREATE INDEX IF NOT EXISTS idx_order_cancelled_block_addr ON order_cancelled (block_number, contract_address);
+CREATE INDEX IF NOT EXISTS idx_token_registered_block_addr ON token_registered (block_number, contract_address);
+CREATE INDEX IF NOT EXISTS idx_fee_refunded_block_addr   ON fee_refunded (block_number, contract_address);
+
 -- =====================================================================
 -- Completed block ranges (for resumable parallel scraping)
 -- Tracks which block ranges have been fully fetched for ALL contracts.
