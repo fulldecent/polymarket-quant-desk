@@ -51,3 +51,9 @@ First, perform scraping to your cold storage disk. This script is optimized for 
 python3 polygon_contract_events_v2/scrape_events_rpc.py --parallel 25
 # python3 -m pytest polygon_contract_events_v2/assertions/ -v
 ```
+
+Other explorations
+
+```sh
+python3 explorations/polynode_inclusion_test.py
+```
