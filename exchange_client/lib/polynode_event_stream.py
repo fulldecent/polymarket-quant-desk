@@ -1,7 +1,12 @@
-"""Polynode low-latency trade stream implementation.
+"""Polynode pre-confirmation settlement stream.
 
-Subscribes to Polynode's low-latency trades feed and emits TradeEvent
-objects from both initial snapshots and live messages.
+Subscribes to Polynode's ``settlements`` channel, which emits a
+``settlement`` event the moment a matchOrders tx is decoded from the
+mempool (pre-confirmation) and again when the block is confirmed.
+
+Only the pending-status event is yielded, so ``polynode_seen[tx]``
+captures the mempool detection timestamp -- the correct reference for a
+lead-time comparison against an on-chain confirmation feed.
 """
 
 from __future__ import annotations
@@ -71,7 +76,7 @@ class PolynodeMempoolEventStream:
 
                     subscribe_msg = {
                         "action": "subscribe",
-                        "type": "trades",
+                        "type": "settlements",
                     }
                     await ws.send(json.dumps(subscribe_msg))
 
@@ -97,18 +102,18 @@ class PolynodeMempoolEventStream:
     def _extract_trade_messages(self, msg: dict) -> list[dict]:
         out: list[dict] = []
 
-        # Live message shape: {"type":"trade","data":{...}}
-        if msg.get("type") == "trade" and isinstance(msg.get("data"), dict):
+        # Live message shape: {"type":"settlement","data":{...}}
+        if msg.get("type") == "settlement" and isinstance(msg.get("data"), dict):
             out.append(msg)
             return out
 
-        # Snapshot shape: {"count":N,"events":[{"type":"trade","data":...}, ...]}
+        # Snapshot shape: {"count":N,"events":[{"type":"settlement","data":...}, ...]}
         events = msg.get("events")
         if isinstance(events, list):
             for item in events:
                 if not isinstance(item, dict):
                     continue
-                if item.get("type") != "trade":
+                if item.get("type") != "settlement":
                     continue
                 if not isinstance(item.get("data"), dict):
                     continue
@@ -117,10 +122,17 @@ class PolynodeMempoolEventStream:
         return out
 
     def _to_trade_event(self, data: dict) -> TradeEvent | None:
-        block_number = data.get("block_number")
-        log_index = data.get("log_index")
-        side = str(data.get("side", "")).upper()
-        token_id = str(data.get("token_id", "0"))
+        tx_hash = str(data.get("tx_hash", ""))
+        if not tx_hash:
+            return None
+
+        # Only emit on the pending detection so polynode_seen captures the
+        # pre-confirmation timestamp. The confirmed status_update is ignored.
+        if str(data.get("status", "")).lower() != "pending":
+            return None
+
+        side = str(data.get("taker_side", "")).upper()
+        token_id = str(data.get("taker_token", "0"))
 
         if side == "BUY":
             maker_asset_id = "0"
@@ -129,21 +141,22 @@ class PolynodeMempoolEventStream:
             maker_asset_id = token_id
             taker_asset_id = "0"
         else:
-            return None
+            maker_asset_id = "0"
+            taker_asset_id = token_id
 
         return TradeEvent(
-            block_number=int(block_number) if block_number is not None else None,
-            tx_hash=str(data.get("tx_hash", "")),
-            log_index=int(log_index) if log_index is not None else None,
-            contract_address=str(data.get("exchange", "")).lower(),
-            event_type="OrderFilled",
-            maker=str(data.get("maker", "")).lower(),
-            taker=str(data.get("taker", "")).lower(),
+            block_number=None,
+            tx_hash=tx_hash,
+            log_index=None,
+            contract_address="",
+            event_type="Settlement",
+            maker="",
+            taker=str(data.get("taker_wallet", "")).lower(),
             maker_asset_id=maker_asset_id,
             taker_asset_id=taker_asset_id,
-            maker_amount=str(data.get("maker_amount", "0")),
-            taker_amount=str(data.get("taker_amount", "0")),
-            fee=str(data.get("fee", "0")),
+            maker_amount="0",
+            taker_amount=str(data.get("taker_size", "0")),
+            fee="0",
         )
 
 
