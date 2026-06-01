@@ -91,6 +91,7 @@ from _internal.event_decoders import (
 from _internal.parquet_sink import (
     PartitionWriteResult,
     cleanup_temp_dirs_after_frontier,
+    get_sunk_frontier as get_manifest_frontier,
     remove_orphan_temp_files,
     roll_forward_manifests_to_exhaustion,
     write_partition_files,
@@ -889,6 +890,7 @@ def _print_banner(
     *,
     db_path: str,
     cold_root: str,
+    manifest_frontier: int,
     sunk_frontier: int,
     loaded_frontier: int,
     chain_head: int,
@@ -916,6 +918,10 @@ def _print_banner(
         banner_lines.append("sunk parquet to:      none")
     else:
         banner_lines.append(f"sunk parquet to:      {sunk_frontier:,}")
+    if manifest_frontier < 0:
+        banner_lines.append("manifest frontier:    none")
+    else:
+        banner_lines.append(f"manifest frontier:    {manifest_frontier:,}")
     if loaded_frontier < 0:
         banner_lines.append("loaded hot frontier:  none")
     else:
@@ -953,6 +959,7 @@ def _print_banner(
 def _print_summary(
     *,
     store: HotStore | None,
+    manifest_frontier: int,
     chain_head: int,
     blocks_done: int,
     events_inserted: int,
@@ -988,6 +995,11 @@ def _print_summary(
         summary_lines.append("")
         summary_lines.append("progress")
         summary_lines.append(f"  sunk parquet to:      {sunk:,}" if sunk >= 0 else "  sunk parquet to:      none")
+        summary_lines.append(
+            f"  manifest frontier:    {manifest_frontier:,}"
+            if manifest_frontier >= 0
+            else "  manifest frontier:    none"
+        )
         summary_lines.append(f"  hot database:         {hot_db_blocks:,} blocks")
         summary_lines.append(f"  chain head:           {chain_head:,}")
         summary_lines.append(f"  blocks processed:     +{blocks_done:,} this run")
@@ -1184,6 +1196,9 @@ def main() -> None:
         if published_manifests:
             print(f"Rolled manifests forward by {published_manifests:,} partition(s).")
 
+        manifest_frontier = get_manifest_frontier(env["cold_root"])
+        _live["manifest_to"] = manifest_frontier if manifest_frontier >= 0 else -1
+
         # --- Reconcile hot DB progress with cold tier ----------------
         # If we crashed between a sink worker's rename and the orchestrator's commit_sink, the
         # Parquet files reached disk but the hot DB still has the rows. Reconcile fixes that
@@ -1264,6 +1279,7 @@ def main() -> None:
         _print_banner(
             db_path=env["db_path"],
             cold_root=env["cold_root"],
+            manifest_frontier=manifest_frontier,
             sunk_frontier=sunk_frontier,
             loaded_frontier=loaded_frontier,
             chain_head=chain_head,
@@ -1726,6 +1742,7 @@ def main() -> None:
             elapsed = time.monotonic() - run_start
             _print_summary(
                 store=store,
+                manifest_frontier=manifest_frontier,
                 chain_head=chain_head,
                 blocks_done=blocks_done,
                 events_inserted=events_inserted,
