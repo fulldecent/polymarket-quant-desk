@@ -1,12 +1,12 @@
 """Polynode pre-confirmation settlement stream.
 
-Subscribes to Polynode's ``settlements`` channel, which emits a
-``settlement`` event the moment a matchOrders tx is decoded from the
-mempool (pre-confirmation) and again when the block is confirmed.
+Subscribes to Polynode's ``settlements`` channel, which emits a ``settlement`` event the moment a
+matchOrders tx is decoded from the mempool (pre-confirmation) and again
+when the block is confirmed.
 
-Only the pending-status event is yielded, so ``polynode_seen[tx]``
-captures the mempool detection timestamp -- the correct reference for a
-lead-time comparison against an on-chain confirmation feed.
+Only the pending-status event is yielded, so ``polynode_seen[tx]`` captures the
+mempool detection timestamp -- the correct reference for a lead-time comparison
+against an on-chain confirmation feed.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from .event_stream import TradeEvent
 
 
 class PolynodeMempoolEventStream:
-    """Stream low-latency trade fills from Polynode WebSocket."""
+    """Stream low-latency trade fills from Polynode WebSocket in real time."""
 
     def __init__(
         self,

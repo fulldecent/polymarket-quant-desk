@@ -1,12 +1,10 @@
 """Trade event streaming protocol and shared types.
 
-Defines TradeEvent (the common data shape for on-chain trade fills) and
-EventStream (the async iterator protocol that all event stream
-implementations conform to).
+Defines TradeEvent (the common data shape for on-chain trade fills) and EventStream (the async
+iterator protocol that all event stream implementations conform to).
 
-The RPC implementation decodes raw EVM OrderFilled/OrdersMatched logs.
-The Polynode implementation (future) consumes pre-decoded settlement or
-trade events from the Polynode WebSocket API.
+The RPC implementation decodes raw EVM OrderFilled/OrdersMatched logs. The Polynode implementation
+(future) consumes pre-decoded settlement or trade events from the Polynode WebSocket API.
 """
 
 from __future__ import annotations
@@ -40,15 +38,13 @@ WANTED_TOPICS = list(TOPIC0_MAP.keys())
 class TradeEvent:
     """A single Polymarket trade fill.
 
-    This is the common representation produced by both RPC log decoding
-    and Polynode settlement/trade events.  Field semantics follow the
-    on-chain OrderFilled event:
+    This is the common representation produced by both RPC log decoding and Polynode
+    settlement/trade events. Field semantics follow the on-chain OrderFilled event:
 
     - maker/taker are lowercase 0x-prefixed addresses.
-    - maker_asset_id/taker_asset_id are decimal-string token IDs.
-      "0" means the USDC side.
-    - amount fields are decimal-string raw uint256 values (6 decimals
-      for USDC, 6 decimals for conditional tokens).
+    - maker_asset_id/taker_asset_id are decimal-string token IDs ("0" means USDC).
+    - amount fields are decimal-string raw uint256 values (6 decimals for USDC, 6 decimals for
+      conditional tokens).
     """
 
     block_number: int | None  # None for Polynode pending settlements
@@ -70,8 +66,8 @@ class TradeEvent:
 class EventStream(Protocol):
     """Async iterator of TradeEvent objects.
 
-    Implementations handle connection, subscription, reconnection, and
-    decoding internally.  Callers consume events with ``async for``.
+    Implementations handle connection, subscription, reconnection, and decoding internally. Callers
+    consume events with ``async for``.
     """
 
     async def connect(self) -> None: ...
@@ -114,8 +110,7 @@ def decode_log_data(types: list[str], data_hex: str) -> tuple:
 def decode_event(log: dict) -> TradeEvent | None:
     """Decode a raw EVM log dict into a TradeEvent.
 
-    Returns None if the log is not an OrderFilled or OrdersMatched event,
-    or if decoding fails.
+    Returns None if the log is not an OrderFilled or OrdersMatched event, or if decoding fails.
     """
     topics = log.get("topics", [])
     if not topics:
@@ -185,10 +180,8 @@ def decode_event(log: dict) -> TradeEvent | None:
 def ws_url_from_env(ws_url: str, http_url: str) -> str:
     """Derive a WebSocket URL from environment variables.
 
-    Prefers ws_url if non-empty.  Falls back to converting http_url
-    (with special handling for Infura endpoints).
-
-    Raises SystemExit if neither is usable.
+    Prefers ws_url if non-empty. Falls back to converting http_url (with special handling for
+    Infura endpoints). Raises SystemExit if neither is usable.
     """
     if ws_url:
         return ws_url

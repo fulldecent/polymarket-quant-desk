@@ -1,8 +1,8 @@
 """RPC WebSocket implementation of TradeEventStream.
 
-Connects to a Polygon JSON-RPC WebSocket endpoint, subscribes to
-OrderFilled and OrdersMatched logs from the Polymarket exchange
-contracts, and yields decoded TradeEvent objects.
+Connects to a Polygon JSON-RPC WebSocket endpoint, subscribes to OrderFilled and
+OrdersMatched logs from the Polymarket exchange contracts, and yields decoded
+TradeEvent objects.
 
 Usage:
     from exchange_client.lib.event_stream import TradeEvent
@@ -32,9 +32,8 @@ from .event_stream import (
 class RpcSettledEventStream:
     """Stream Polymarket trade events from a Polygon RPC WebSocket.
 
-    Handles connection, eth_subscribe, automatic reconnection with
-    exponential backoff, and decoding of raw EVM log data into
-    TradeEvent objects.
+    Handles connection, eth_subscribe, automatic reconnection with exponential
+    backoff, and decoding of raw EVM log data into TradeEvent objects.
     """
 
     def __init__(self, ws_url: str) -> None:
