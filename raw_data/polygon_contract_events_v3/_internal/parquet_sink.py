@@ -472,29 +472,22 @@ def cleanup_temp_dirs_after_frontier(
         )
     return removed
 
-def get_sunk_frontier(cold_root: str) -> int:
-    """Return the sunk frontier inferred only from manifest ``_SUCCESS`` files.
 
-    The frontier is the highest block ``N`` for which
-    ``manifests/1M={M}/10K={K}/_SUCCESS`` exists for every consecutive partition
-    starting at ``floor(SCRAPE_START_BLOCK / 10_000) * 10_000``.
-
-    Returns ``SCRAPE_START_BLOCK - 1`` if no manifest partition exists.
-
-    Args:
-        cold_root: Cold-tier root directory.
-
-    Raises:
-        ValueError: ``cold_root`` does not exist or is not a directory.
-        V3Error: manifest folders violate the v3 data dictionary contract.
-    """
+def read_manifest_frontier(
+    cold_root: str,
+    *,
+    progress_cb: ProgressCallback | None = None,
+) -> tuple[int, int]:
+    """Read and validate manifest contiguity, returning (frontier, partition_count)."""
     cold_path = Path(cold_root)
     if not cold_path.is_dir():
         raise ValueError(f"cold_root does not exist or is not a directory: {cold_root}")
 
     manifests_root = cold_path / "manifests"
     if not manifests_root.exists():
-        return SCRAPE_START_BLOCK - 1
+        if progress_cb:
+            progress_cb(op="manifest", phase="read", rows_done=0, message="no manifests/ directory")
+        return SCRAPE_START_BLOCK - 1, 0
     if not manifests_root.is_dir():
         raise V3Error(f"manifests path exists but is not a directory: {manifests_root}")
 
@@ -525,19 +518,48 @@ def get_sunk_frontier(cold_root: str) -> int:
         existing_partitions.append(partition_start)
 
     if not existing_partitions:
-        return SCRAPE_START_BLOCK - 1
+        if progress_cb:
+            progress_cb(op="manifest", phase="read", rows_done=0, message="no manifest partitions")
+        return SCRAPE_START_BLOCK - 1, 0
 
     existing_partitions = sorted(set(existing_partitions))
     expected = _first_partition_start()
-    for partition_start in existing_partitions:
+    for idx, partition_start in enumerate(existing_partitions, start=1):
         if partition_start != expected:
             raise V3Error(
                 "non-contiguous manifest frontier: "
                 f"expected manifests for 10K={expected} before 10K={partition_start}"
             )
         expected += PARTITION_SIZE_10K
+        if progress_cb and (idx % 50 == 0 or idx == len(existing_partitions)):
+            progress_cb(
+                op="manifest",
+                phase="read",
+                rows_done=partition_start,
+                rows_total=len(existing_partitions),
+                message=f"10K={partition_start}",
+            )
 
-    return existing_partitions[-1] + PARTITION_SIZE_10K - 1
+    return existing_partitions[-1] + PARTITION_SIZE_10K - 1, len(existing_partitions)
+
+def get_sunk_frontier(cold_root: str) -> int:
+    """Return the sunk frontier inferred only from manifest ``_SUCCESS`` files.
+
+    The frontier is the highest block ``N`` for which
+    ``manifests/1M={M}/10K={K}/_SUCCESS`` exists for every consecutive partition
+    starting at ``floor(SCRAPE_START_BLOCK / 10_000) * 10_000``.
+
+    Returns ``SCRAPE_START_BLOCK - 1`` if no manifest partition exists.
+
+    Args:
+        cold_root: Cold-tier root directory.
+
+    Raises:
+        ValueError: ``cold_root`` does not exist or is not a directory.
+        V3Error: manifest folders violate the v3 data dictionary contract.
+    """
+    frontier, _count = read_manifest_frontier(cold_root)
+    return frontier
 
 def write_partition_files(
     db_path: str,

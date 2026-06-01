@@ -92,6 +92,7 @@ from _internal.parquet_sink import (
     PartitionWriteResult,
     cleanup_temp_dirs_after_frontier,
     get_sunk_frontier as get_manifest_frontier,
+    read_manifest_frontier,
     remove_orphan_temp_files,
     roll_forward_manifests_to_exhaustion,
     write_partition_files,
@@ -168,7 +169,7 @@ _stop_event = threading.Event()
 # Environment loading
 # ---------------------------------------------------------------------------
 
-def _load_environment() -> dict[str, str]:
+def _load_environment(*, allow_dirty: bool = False) -> dict[str, str]:
     """Read every required env var from the root ``.env`` and validate it.
 
     Exits the process with a clear message on any missing or invalid value. The returned dict has
@@ -176,7 +177,7 @@ def _load_environment() -> dict[str, str]:
     """
     project_root = Path(__file__).resolve().parent.parent.parent
 
-    _assert_git_clean(project_root)
+    _assert_git_clean(project_root, allow_dirty=allow_dirty)
 
     load_dotenv(project_root / ".env")
 
@@ -242,11 +243,11 @@ def _load_environment() -> dict[str, str]:
     }
 
 
-def _assert_git_clean(project_root: Path) -> None:
+def _assert_git_clean(project_root: Path, *, allow_dirty: bool = False) -> None:
     """Fail fast when the repository has uncommitted changes.
 
     Metadata embeds ``git_commit``. To keep provenance strict, we refuse to write if the working
-    tree is dirty.
+    tree is dirty unless the caller explicitly opts in via ``--run-dirty``.
     """
     try:
         result = subprocess.run(
@@ -263,6 +264,14 @@ def _assert_git_clean(project_root: Path) -> None:
 
     lines = [line for line in result.stdout.splitlines() if line.strip()]
     if lines:
+        if allow_dirty:
+            preview = "\n".join(lines[:20])
+            suffix = "\n..." if len(lines) > 20 else ""
+            print(
+                "WARNING: git working tree is dirty, but --run-dirty was set. Proceeding anyway.\n"
+                f"Dirty entries:\n{preview}{suffix}"
+            )
+            return
         preview = "\n".join(lines[:20])
         suffix = "\n..." if len(lines) > 20 else ""
         sys.exit(
@@ -465,7 +474,8 @@ def _print_message(text: str) -> None:
 
 def _build_status_line() -> str:
     s = _live
-    run_start = float(s.get("run_start", 0) or 0)
+    run_start_value = s.get("run_start", 0)
+    run_start = float(run_start_value) if isinstance(run_start_value, (int, float)) else 0.0
     if not run_start:
         return ""
     elapsed = time.monotonic() - run_start
@@ -476,10 +486,12 @@ def _build_status_line() -> str:
     # are waiting on.
     startup_task = s.get("startup_task")
     if startup_task:
-        sunk_to = int(s.get("sunk_to", -1) or -1)
+        sunk_to_value = s.get("sunk_to", -1)
+        sunk_to = int(sunk_to_value) if isinstance(sunk_to_value, int) else -1
+        has_sunk = sunk_to > (SCRAPE_START_BLOCK - 1)
         parts = [
             f"[{_format_duration(elapsed)}]",
-            f"sunk: {sunk_to:,}" if sunk_to >= 0 else "sunk: none",
+            f"sunk: {sunk_to:,}" if has_sunk else "sunk: none",
             f"phase:{phase}",
         ]
         startup_done = s.get("startup_done")
@@ -493,12 +505,18 @@ def _build_status_line() -> str:
             parts.append(str(startup_detail))
         return "  ".join(parts)
 
-    blocks_done = int(s.get("blocks_done", 0) or 0)
-    events_inserted = int(s.get("events_inserted", 0) or 0)
-    calls = int(s.get("calls", 0) or 0)
-    chain_head = int(s.get("chain_head", 0) or 0)
-    sunk_to = int(s.get("sunk_to", -1) or -1)
+    blocks_done_value = s.get("blocks_done", 0)
+    events_inserted_value = s.get("events_inserted", 0)
+    calls_value = s.get("calls", 0)
+    chain_head_value = s.get("chain_head", 0)
+    sunk_to_value = s.get("sunk_to", -1)
+    blocks_done = int(blocks_done_value) if isinstance(blocks_done_value, int) else 0
+    events_inserted = int(events_inserted_value) if isinstance(events_inserted_value, int) else 0
+    calls = int(calls_value) if isinstance(calls_value, int) else 0
+    chain_head = int(chain_head_value) if isinstance(chain_head_value, int) else 0
+    sunk_to = int(sunk_to_value) if isinstance(sunk_to_value, int) else -1
     next_pct = s.get("next_pct")
+    has_sunk = sunk_to > (SCRAPE_START_BLOCK - 1)
 
     blk_s = blocks_done / elapsed if elapsed > 1 and blocks_done > 0 else 0.0
     ev_s = events_inserted / elapsed if elapsed > 1 else 0.0
@@ -523,7 +541,7 @@ def _build_status_line() -> str:
 
     parts = [
         f"[{_format_duration(elapsed)}]",
-        f"sunk: {sunk_to:,}" if sunk_to >= 0 else "sunk: none",
+        f"sunk: {sunk_to:,}" if has_sunk else "sunk: none",
         f"next: {next_text}",
         f"head: {head_text}",
         f"eta: {eta}",
@@ -842,7 +860,7 @@ class _SinkOrchestrator:
         n_committed = 0
         while self._completed:
             sunk_frontier = self._store.get_sunk_frontier()
-            if sunk_frontier < 0:
+            if sunk_frontier <= SCRAPE_START_BLOCK - 1:
                 expected_next = (SCRAPE_START_BLOCK // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
             else:
                 expected_next = ((sunk_frontier + 1) // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
@@ -914,7 +932,7 @@ def _print_banner(
         f"cold root:            {cold_root}",
         "",
     ]
-    if sunk_frontier < 0:
+    if sunk_frontier <= SCRAPE_START_BLOCK - 1:
         banner_lines.append("sunk parquet to:      none")
     else:
         banner_lines.append(f"sunk parquet to:      {sunk_frontier:,}")
@@ -961,6 +979,7 @@ def _print_summary(
     store: HotStore | None,
     manifest_frontier: int,
     chain_head: int,
+    caught_up_confirmed: bool,
     blocks_done: int,
     events_inserted: int,
     rate_limiter: RateLimiter,
@@ -977,24 +996,53 @@ def _print_summary(
         summary_lines.append("")
         summary_lines.append("status")
         summary_lines.append(f"  FATAL: {fatal_reason}")
-    elif blocks_done == 0:
+    elif caught_up_confirmed:
         summary_lines.append("")
         summary_lines.append("status")
         summary_lines.append("  CAUGHT UP - no new blocks to scrape")
+    elif blocks_done == 0:
+        summary_lines.append("")
+        summary_lines.append("status")
+        summary_lines.append("  NO PROGRESS - run ended without confirmed caught-up state")
     else:
         summary_lines.append("")
         summary_lines.append("status")
         summary_lines.append("  OK")
 
+    sunk = None
+    loaded = None
+    lag = chain_head - SCRAPE_START_BLOCK
     if store is not None:
         sunk = store.get_sunk_frontier()
+        loaded = store.get_loaded_frontier()
+        summary_lines.append("")
+        summary_lines.append("frontier evidence")
+        summary_lines.append(
+            f"  manifest frontier:   {manifest_frontier:,}"
+            if manifest_frontier >= 0
+            else "  manifest frontier:   none"
+        )
+        summary_lines.append(
+            f"  sunk parquet to:     {sunk:,}"
+            if sunk is not None and sunk > (SCRAPE_START_BLOCK - 1)
+            else "  sunk parquet to:     none"
+        )
+        summary_lines.append(
+            f"  loaded hot frontier:  {loaded:,}" if loaded is not None and loaded >= 0 else "  loaded hot frontier: none"
+        )
+
+    if store is not None:
         hot_db_blocks = sum(
             (to_b - from_b + 1)
             for from_b, to_b, _ in store.list_loaded_ranges(include_sunk=False)
         )
         summary_lines.append("")
         summary_lines.append("progress")
-        summary_lines.append(f"  sunk parquet to:      {sunk:,}" if sunk >= 0 else "  sunk parquet to:      none")
+        summary_lines.append(
+            f"  sunk parquet to:      {sunk:,}"
+            if sunk is not None and sunk > (SCRAPE_START_BLOCK - 1)
+            else "  sunk parquet to:      none"
+        )
         summary_lines.append(
             f"  manifest frontier:    {manifest_frontier:,}"
             if manifest_frontier >= 0
@@ -1057,6 +1105,11 @@ def main() -> None:
         help="concurrent Parquet sink workers (default: 1)",
     )
     parser.add_argument(
+        "--run-dirty",
+        action="store_true",
+        help="allow startup even when git working tree is dirty",
+    )
+    parser.add_argument(
         "--max-calls", type=int, default=None,
         help="stop after this many RPC calls (default: no limit)",
     )
@@ -1075,7 +1128,7 @@ def main() -> None:
     if args.lag_tolerance < 0:
         sys.exit(f"--lag-tolerance must be >= 0; got {args.lag_tolerance}")
 
-    env = _load_environment()
+    env = _load_environment(allow_dirty=args.run_dirty)
     max_block_span = int(env["max_block_span"])
     max_rps = int(env["max_rps"])
 
@@ -1117,6 +1170,11 @@ def main() -> None:
     rpc_futures: dict[Future[dict], tuple[int, int]] = {}
 
     fatal_reason: str | None = None
+    system_exit_requested = False
+    manifest_frontier = SCRAPE_START_BLOCK - 1
+    sunk_frontier = SCRAPE_START_BLOCK - 1
+    loaded_frontier = SCRAPE_START_BLOCK - 1
+    caught_up_confirmed = False
     blocks_done = 0
     events_inserted = 0
     chain_head = 0
@@ -1140,7 +1198,27 @@ def main() -> None:
 
         # Seed status line with current sunk frontier so startup phases can show it.
         start_sunk_frontier = store.get_sunk_frontier()
-        _live["sunk_to"] = start_sunk_frontier if start_sunk_frontier >= 0 else -1
+        _live["sunk_to"] = (
+            start_sunk_frontier if start_sunk_frontier > (SCRAPE_START_BLOCK - 1) else -1
+        )
+
+        # --- Chain head and gap discovery ---------------------------
+        # Read the chain head early so startup can prove whether the cold tier is already caught
+        # up even if later startup phases return early.
+        _set_phase("querying chain head")
+        try:
+            chain_head = rpc_client.get_block_number()
+        except (RPCError, RuntimeError) as e:
+            sys.exit(f"FATAL: could not read chain head: {type(e).__name__}: {e}")
+
+        if chain_head < SCRAPE_START_BLOCK:
+            sys.exit(
+                f"FATAL: RPC returned chain head {chain_head:,}, which is before "
+                f"SCRAPE_START_BLOCK {SCRAPE_START_BLOCK:,}. The RPC endpoint may be "
+                f"returning incorrect data or is in a failed state."
+            )
+
+        _print_message(f"Chain head query complete: {chain_head:,}.")
 
         # --- Clean orphan temp files left over from prior crashes ----
         _live["startup_task"] = "cleaning"
@@ -1152,10 +1230,45 @@ def main() -> None:
         _live["startup_task"] = None
         _live["startup_detail"] = None
         if orphans:
-            print(f"Removed {orphans} orphaned ``.tmp-*`` file(s) from prior runs.")
+            _print_message(f"Removed {orphans} orphaned ``.tmp-*`` file(s) from prior runs.")
 
-        # --- Manifest frontier cleanup + roll-forward ---------------
-        _set_phase("rolling manifests")
+        # --- Read manifest frontier --------------------------------
+        _set_phase("reading frontier")
+
+        def _frontier_progress(*, op, phase, rows_done=None, rows_total=None,
+                               elapsed_ms=None, message=""):
+            _live["startup_task"] = "frontier"
+            if rows_total is not None and rows_done is not None:
+                _live["startup_detail"] = f"{phase}:{rows_done:,}/{rows_total:,}"
+            elif rows_done is not None:
+                _live["startup_detail"] = f"{phase}:{rows_done:,}"
+            else:
+                _live["startup_detail"] = phase
+            if message:
+                _live["startup_detail"] = f"{_live['startup_detail']} {message}"
+            _live["startup_done"] = rows_done
+            _live["startup_total"] = rows_total
+
+        try:
+            manifest_frontier, manifest_partition_count = read_manifest_frontier(
+                env["cold_root"],
+                progress_cb=_frontier_progress,
+            )
+        except V3Error as e:
+            sys.exit(f"FATAL: manifest frontier read failed: {e}")
+        finally:
+            _live["startup_task"] = None
+            _live["startup_done"] = None
+            _live["startup_total"] = None
+            _live["startup_detail"] = None
+
+        _print_message(
+            "Manifest frontier read complete: "
+            f"frontier={manifest_frontier:,}, partitions={manifest_partition_count:,}."
+        )
+
+        # --- Roll manifest frontier forward -------------------------
+        _set_phase("rolling forward frontier")
 
         def _manifest_progress(*, op, phase, rows_done=None, rows_total=None,
                                elapsed_ms=None, message=""):
@@ -1172,10 +1285,6 @@ def main() -> None:
             _live["startup_total"] = rows_total
 
         try:
-            cleaned_manifest = cleanup_temp_dirs_after_frontier(
-                env["cold_root"],
-                progress_cb=_manifest_progress,
-            )
             published_manifests = roll_forward_manifests_to_exhaustion(
                 env["cold_root"],
                 progress_cb=_manifest_progress,
@@ -1191,10 +1300,32 @@ def main() -> None:
             _live["startup_total"] = None
             _live["startup_detail"] = None
 
-        if cleaned_manifest:
-            print(f"Cleaned {cleaned_manifest:,} manifest/temp partition folder(s) after frontier.")
-        if published_manifests:
-            print(f"Rolled manifests forward by {published_manifests:,} partition(s).")
+        _print_message(
+            "Manifest roll-forward complete: "
+            f"published={published_manifests:,} partition(s)."
+        )
+
+        # --- Cleanup after frontier ---------------------------------
+        _set_phase("cleanup after frontier")
+        _live["startup_task"] = "cleanup"
+        _live["startup_detail"] = "post-frontier temp cleanup"
+        try:
+            cleaned_manifest = cleanup_temp_dirs_after_frontier(
+                env["cold_root"],
+                progress_cb=_manifest_progress,
+            )
+        except V3Error as e:
+            sys.exit(f"FATAL: post-frontier cleanup failed: {e}")
+        finally:
+            _live["startup_task"] = None
+            _live["startup_done"] = None
+            _live["startup_total"] = None
+            _live["startup_detail"] = None
+
+        _print_message(
+            "Post-frontier cleanup complete: "
+            f"removed={cleaned_manifest:,} path(s)."
+        )
 
         manifest_frontier = get_manifest_frontier(env["cold_root"])
         _live["manifest_to"] = manifest_frontier if manifest_frontier >= 0 else -1
@@ -1220,13 +1351,14 @@ def main() -> None:
             _live["startup_total"] = rows_total
             # Keep sunk frontier live during reconcile so startup status reflects progress.
             current_sunk = store.get_sunk_frontier()
-            _live["sunk_to"] = current_sunk if current_sunk >= 0 else -1
+            _live["sunk_to"] = current_sunk if current_sunk > (SCRAPE_START_BLOCK - 1) else -1
 
         try:
             newly_sunk = store.reconcile_with_cold_tier(
                 env["cold_root"],
                 progress_cb=_reconcile_progress,
                 stop_event=_stop_event,
+                manifest_frontier=manifest_frontier,
             )
         except OperationCancelled:
             raise KeyboardInterrupt
@@ -1238,7 +1370,7 @@ def main() -> None:
             _live["startup_total"] = None
             _live["startup_detail"] = None
         if newly_sunk:
-            print(f"Reconciled {newly_sunk:,} partition(s) from existing cold-tier files.")
+            _print_message(f"Reconciled {newly_sunk:,} partition(s) from existing cold-tier files.")
 
         # --- Sink orchestrator --------------------------------------
         sink = _SinkOrchestrator(
@@ -1254,21 +1386,7 @@ def main() -> None:
         for p in backlog:
             sink.submit(p)
         if backlog:
-            print(f"Submitted {len(backlog):,} pre-existing ready partition(s) to the sink pool.")
-
-        # --- Chain head and gap discovery ---------------------------
-        _set_phase("querying chain head")
-        try:
-            chain_head = rpc_client.get_block_number()
-        except (RPCError, RuntimeError) as e:
-            sys.exit(f"FATAL: could not read chain head: {type(e).__name__}: {e}")
-
-        if chain_head < SCRAPE_START_BLOCK:
-            sys.exit(
-                f"FATAL: RPC returned chain head {chain_head:,}, which is before "
-                f"SCRAPE_START_BLOCK {SCRAPE_START_BLOCK:,}. The RPC endpoint may be "
-                f"returning incorrect data or is in a failed state."
-            )
+            _print_message(f"Submitted {len(backlog):,} pre-existing ready partition(s) to the sink pool.")
 
         gaps = store.find_gaps(SCRAPE_START_BLOCK, chain_head)
         total_gap_blocks = sum(t - f + 1 for f, t in gaps)
@@ -1308,12 +1426,34 @@ def main() -> None:
         _set_phase("running")
 
         if not gaps and sink.in_flight == 0 and sink.pending_commit == 0:
+            caught_up_confirmed = True
             lag = chain_head - loaded_frontier if loaded_frontier >= 0 else chain_head - SCRAPE_START_BLOCK
+            _print_banner(
+                db_path=env["db_path"],
+                cold_root=env["cold_root"],
+                manifest_frontier=manifest_frontier,
+                sunk_frontier=sunk_frontier,
+                loaded_frontier=loaded_frontier,
+                chain_head=chain_head,
+                gaps=[],
+                total_gap_blocks=0,
+                unsunk_ranges=unsunk_ranges,
+            )
+            print(
+                "caught-up proof: "
+                f"manifest_frontier={manifest_frontier:,} "
+                f"sunk_frontier={sunk_frontier:,} "
+                f"loaded_frontier={loaded_frontier:,} "
+                f"chain_head={chain_head:,} "
+                f"lag={lag:,} blocks",
+                flush=True,
+            )
             print()
             print("=" * 70)
             print("ALREADY CAUGHT UP")
             print("=" * 70)
             print(f"  loaded frontier:  {loaded_frontier:,}")
+            print(f"  manifest frontier: {manifest_frontier:,}")
             print(f"  chain head:       {chain_head:,}")
             print(f"  lag:              {lag:,} blocks (tolerance: {args.lag_tolerance})")
             print()
@@ -1439,11 +1579,6 @@ def main() -> None:
                     elapsed_s = float(result["elapsed_sec"])
                     rows_by_target: dict[tuple[str, str], list[dict]] = result["rows_by_target"]
                     wid = int(result["wid"])
-                    _print_message(
-                        f"  -> blks: {chunk_span:,}"
-                        f"  evts: {raw_log_count:,}"
-                        f"  {elapsed_s:.1f}s"
-                    )
 
                     # Persist into the hot DB. Single atomic transaction.
                     try:
@@ -1479,6 +1614,30 @@ def main() -> None:
 
                     events_inserted += persist_result.rows_inserted
                     blocks_done += chunk_span
+
+                    # Refresh next_pct for accurate status line display
+                    sf = store.get_sunk_frontier()
+                    _live["next_pct"] = _next_partition_fill_pct(
+                        store=store,
+                        sunk_frontier=sf,
+                        chain_head=chain_head,
+                    )
+
+                    # Compute how many blocks in this range fall beyond the next sink partition
+                    next_partition_start = (
+                        (max(sf, SCRAPE_START_BLOCK - 1) + 1) // PARTITION_SIZE_10K
+                    ) * PARTITION_SIZE_10K
+                    next_partition_end = next_partition_start + PARTITION_SIZE_10K - 1
+                    beyond_blks = max(0, to_b - next_partition_end)
+
+                    # Print after persist succeeds
+                    _suffix = f" (beyond next: {beyond_blks:,} blks)" if beyond_blks > 0 else ""
+                    _print_message(
+                        f"  -> blks: {chunk_span:,}"
+                        f"  evts: {raw_log_count:,}"
+                        f"  {elapsed_s:.1f}s"
+                        f"{_suffix}"
+                    )
 
                     for p in persist_result.ready_partitions:
                         sink.submit(p)
@@ -1640,6 +1799,7 @@ def main() -> None:
                         # Avoid a busy loop by sleeping a beat.
                         time.sleep(0.5)
                         continue
+                    caught_up_confirmed = True
                     chain_head = new_head
                     _print_message(
                         f"  Within lag tolerance ({new_gap_blocks:,} <= "
@@ -1680,7 +1840,11 @@ def main() -> None:
         # cleanly.
         _stop_event.set()
 
-    except SystemExit:
+    except SystemExit as e:
+        system_exit_requested = True
+        if e.code not in (None, 0):
+            fatal_reason = str(e.code)
+            print(f"FATAL: {fatal_reason}", flush=True)
         raise
 
     except BaseException as e:  # noqa: BLE001
@@ -1739,17 +1903,28 @@ def main() -> None:
 
         # 5. Print the summary.
         try:
-            elapsed = time.monotonic() - run_start
-            _print_summary(
-                store=store,
-                manifest_frontier=manifest_frontier,
-                chain_head=chain_head,
-                blocks_done=blocks_done,
-                events_inserted=events_inserted,
-                rate_limiter=rate_limiter,
-                elapsed=elapsed,
-                fatal_reason=fatal_reason,
-            )
+            if system_exit_requested:
+                pass
+            else:
+                final_chain_head: int | None = None
+                try:
+                    final_chain_head = rpc_client.get_block_number()
+                except Exception:
+                    final_chain_head = None
+
+                head_for_output = final_chain_head if final_chain_head is not None else chain_head
+                elapsed = time.monotonic() - run_start
+                _print_summary(
+                    store=store,
+                    manifest_frontier=manifest_frontier,
+                    chain_head=head_for_output,
+                    caught_up_confirmed=caught_up_confirmed,
+                    blocks_done=blocks_done,
+                    events_inserted=events_inserted,
+                    rate_limiter=rate_limiter,
+                    elapsed=elapsed,
+                    fatal_reason=fatal_reason,
+                )
         except Exception as e:  # noqa: BLE001
             print(f"\n(summary print failed: {type(e).__name__}: {e})")
 

@@ -975,6 +975,7 @@ class HotStore:
         *,
         progress_cb: ProgressCallback | None = None,
         stop_event: threading.Event | None = None,
+        manifest_frontier: int | None = None,
     ) -> int:
         """Mark partitions as sunk based on Parquet files already on disk.
 
@@ -987,45 +988,20 @@ class HotStore:
         tier, but the hot DB was not yet updated. Calling this at
         scraper startup re-syncs the two stores.
 
-        Long-running: a full reconcile walks every partition directory
-        under ``cold_tier_root`` (tens of thousands of directories at
-        the current frontier) and issues one DB update per newly
-        discovered sunk partition. The ``progress_cb`` argument receives
-        events with ``op=\"reconcile\"`` and phases ``\"scan\"`` (filesystem
-        walk progress) and ``\"update\"`` (DB update progress) so the
-        caller can show meaningful output during startup.
+        If ``manifest_frontier`` is provided, reconcile only scans forward
+        from that point, avoiding a full recursive glob of the cold tier.
 
-        Returns the number of partitions newly marked as sunk (existing
-        sunk rows are not double-counted).
+        Returns the number of partitions newly marked as sunk.
 
         Args:
-            cold_tier_root: Absolute path to the cold-tier root, the
-                directory immediately containing one subdirectory per
-                contract.
-            progress_cb: Optional progress callback. Receives events with
-                ``op=\"reconcile\"``.
+            cold_tier_root: Absolute path to the cold-tier root.
+            progress_cb: Optional progress callback with ``op=\"reconcile\"``.
             stop_event: Optional cancellation flag.
-
-        Preconditions:
-            * The store is open.
-            * ``cold_tier_root`` points at the cold-tier root, the
-              directory immediately containing one subdirectory per
-              contract.
-
-        Postconditions:
-            * For every partition whose
-              ``{contract}/{event}/1M=N/10K=K/data.parquet`` files for
-              every eligible ``(contract, event)`` are all on disk, the
-              corresponding block range is covered by a sunk row in
-              ``loaded_block_ranges``.
-            * The invariants on ``loaded_block_ranges`` documented in
-              ``schema.sql`` hold.
-            * Only partitions whose files actually exist are marked sunk.
-              If earlier partitions are missing from the cold tier, a gap
-              remains (the sunk frontier does not jump forward).
+            manifest_frontier: Optional hint (highest block in manifest).
+                Enables optimized scanning forward instead of full glob.
 
         Raises:
-            OperationCancelled: ``stop_event`` was set during the walk.
+            OperationCancelled: ``stop_event`` was set.
         """
         import glob
         from pathlib import Path
@@ -1036,21 +1012,36 @@ class HotStore:
         if not cold_root.is_dir():
             raise FileNotFoundError(f"cold_tier_root does not exist: {cold_tier_root}")
 
-        # Discover every 10K partition directory that has at least one data.parquet
-        pattern = str(cold_root / "**" / "**" / "10K=*" / "data.parquet")
-        parquet_files = glob.glob(pattern, recursive=True)
-
+        # Discover partitions on disk. Optimized scan if manifest_frontier known.
         partitions_on_disk: set[int] = set()
-        for f in parquet_files:
-            try:
-                part_dir = Path(f).parent.name
-                if not part_dir.startswith("10K="):
-                    continue
-                p = int(part_dir.split("=", 1)[1])
-                if p >= SCRAPE_START_BLOCK:
+
+        if manifest_frontier is not None and manifest_frontier >= SCRAPE_START_BLOCK - 1:
+            # Optimized: scan forward from manifest frontier
+            scan_start = ((manifest_frontier + 1) // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
+            scan_limit = scan_start + 1_000_000
+
+            for p in range(scan_start, scan_limit, PARTITION_SIZE_10K):
+                k1m = (p // 1_000_000) * 1_000_000
+                # Targeted glob within 1M partition boundaries
+                pattern = str(cold_root / "**" / f"1M={k1m}" / f"10K={p}" / "data.parquet")
+                matches = glob.glob(pattern, recursive=False)
+                if matches:
                     partitions_on_disk.add(p)
-            except (ValueError, IndexError):
-                continue
+        else:
+            # Fallback: full recursive glob (backward compat)
+            pattern = str(cold_root / "**" / "**" / "10K=*" / "data.parquet")
+            parquet_files = glob.glob(pattern, recursive=True)
+
+            for f in parquet_files:
+                try:
+                    part_dir = Path(f).parent.name
+                    if not part_dir.startswith("10K="):
+                        continue
+                    p = int(part_dir.split("=", 1)[1])
+                    if p + PARTITION_SIZE_10K - 1 >= SCRAPE_START_BLOCK:
+                        partitions_on_disk.add(p)
+                except (ValueError, IndexError):
+                    continue
 
         if progress_cb:
             progress_cb(
@@ -1061,7 +1052,12 @@ class HotStore:
             )
 
         sunk_frontier = self.get_sunk_frontier()
-        newly_sunk = sorted(p for p in partitions_on_disk if p > sunk_frontier)
+        if sunk_frontier <= SCRAPE_START_BLOCK - 1:
+            expected_next = (SCRAPE_START_BLOCK // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
+        else:
+            expected_next = ((sunk_frontier + 1) // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
+
+        newly_sunk = sorted(p for p in partitions_on_disk if p >= expected_next)
 
         if not newly_sunk:
             if progress_cb:
