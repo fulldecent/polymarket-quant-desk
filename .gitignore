@@ -15,6 +15,7 @@ dist/
 # Data files (stored externally)
 *.db
 *.parquet
+logs
 
 # IDE
 .vscode/

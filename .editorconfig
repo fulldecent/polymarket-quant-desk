@@ -1,0 +1,14 @@
+# EditorConfig is awesome: https://EditorConfig.org
+
+root = true
+
+# Default for all files
+[*]
+max_line_length = 100
+insert_final_newline = true
+trim_trailing_whitespace = true
+charset = utf-8
+
+# Markdown files - no line length limit
+[*.md]
+max_line_length = off
