@@ -344,7 +344,7 @@ def precompute_token_ids_for_1m(
                         unhex('{USDC_E_HEX}') AS collateral_token,
                         {col_parent},
                         {col_cond},
-                        json_extract_string(json_array_element({col_indices}, 0))::UINTEGER AS idx
+                        TRY_CAST(json_extract_string({col_indices}, '$[0]') AS UINTEGER) AS idx
                     FROM read_parquet('{pf}')
                     WHERE {col_indices} IS NOT NULL
                 """)
