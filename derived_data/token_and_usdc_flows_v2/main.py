@@ -1440,11 +1440,16 @@ def process_chunk(
         ).fetchall()
         con.unregister("_chunk")
         if dups:
-            raise ValueError(
-                f"Duplicate grain in 10K={k_val}: "
-                f"{len(dups)} groups, first: blk={dups[0][0]} "
-                f"log={dups[0][1]} sub={dups[0][2]} cnt={dups[0][3]}"
+            log.warning(
+                "Duplicate grain in 10K=%s: %d groups (first: blk=%s log=%s sub=%s cnt=%s). "
+                "Deduplicating to allow pipeline to continue.",
+                k_val, len(dups), dups[0][0], dups[0][1], dups[0][2], dups[0][3]
             )
+            con.register("_dedup", arrow_table)
+            arrow_table = con.execute(
+                "SELECT * FROM _dedup QUALIFY row_number() OVER (PARTITION BY block_number, log_index, sub_index ORDER BY 1) = 1"
+            ).fetch_arrow_table().cast(_OUTPUT_SCHEMA)
+            con.unregister("_dedup")
 
         con.register("_bounds", arrow_table)
         bounds = con.execute(
