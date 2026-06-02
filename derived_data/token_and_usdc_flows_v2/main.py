@@ -347,6 +347,7 @@ def precompute_token_ids_for_1m(
                         TRY_CAST(json_extract_string({col_indices}, '$[0]') AS UINTEGER) AS idx
                     FROM read_parquet('{pf}')
                     WHERE {col_indices} IS NOT NULL
+                      AND json_extract_string({col_indices}, '$[0]') IS NOT NULL
                 """)
 
     row = con.execute(
@@ -440,6 +441,12 @@ def load_global_lookups(
     if _stop_event.is_set():
         log.info("load_global_lookups interrupted by user")
         raise KeyboardInterrupt()
+
+    # Deduplicate across both exchanges (same token can be registered in both)
+    con.execute("""
+        CREATE OR REPLACE TEMP TABLE token_condition AS
+        SELECT DISTINCT token_id, condition_id FROM token_condition
+    """)
 
     # condition_preparation: condition_id -> outcome_slot_count
     src_dir = Path(RAW) / "ConditionalTokens" / "condition_preparation"
@@ -1433,23 +1440,20 @@ def process_chunk(
 
     n = arrow_table.num_rows
     if n > 0:
+        # Fail fast on duplicate grain. This indicates either a source data error or a logic error in the materializer.
+        # Do not mask this by deduplicating; investigate the root cause.
         con.register("_chunk", arrow_table)
         dups = con.execute(
-            "SELECT block_number, log_index, sub_index, COUNT(*) "
-            "FROM _chunk GROUP BY 1,2,3 HAVING COUNT(*) > 1"
-        ).fetchall()
+            "SELECT block_number, log_index, sub_index, COUNT(*), "
+            "LIST(DISTINCT raw_source) AS sources "
+            "FROM _chunk GROUP BY 1,2,3 HAVING COUNT(*) > 1 LIMIT 1"
+        ).fetchone()
         con.unregister("_chunk")
         if dups:
-            log.warning(
-                "Duplicate grain in 10K=%s: %d groups (first: blk=%s log=%s sub=%s cnt=%s). "
-                "Deduplicating to allow pipeline to continue.",
-                k_val, len(dups), dups[0][0], dups[0][1], dups[0][2], dups[0][3]
+            raise ValueError(
+                f"Duplicate grain in 10K={k_val}: "
+                f"blk={dups[0]} log={dups[1]} sub={dups[2]} cnt={dups[3]} sources={dups[4]}"
             )
-            con.register("_dedup", arrow_table)
-            arrow_table = con.execute(
-                "SELECT * FROM _dedup QUALIFY row_number() OVER (PARTITION BY block_number, log_index, sub_index ORDER BY 1) = 1"
-            ).fetch_arrow_table().cast(_OUTPUT_SCHEMA)
-            con.unregister("_dedup")
 
         con.register("_bounds", arrow_table)
         bounds = con.execute(
@@ -1510,8 +1514,11 @@ def process_chunk(
         _write_metadata(con, tmp_dir, m_val, k_val, input_hashes, log)
 
         import shutil
+        chunk_dir.parent.mkdir(parents=True, exist_ok=True)
         if chunk_dir.exists():
             shutil.rmtree(chunk_dir)
+        if not tmp_dir.exists():
+            raise FileNotFoundError(f"Temp directory disappeared before rename: {tmp_dir}")
         tmp_dir.rename(chunk_dir)
     except Exception:
         import shutil
@@ -1609,14 +1616,6 @@ def main() -> None:
         help="process only the first N incomplete chunks",
     )
     parser.add_argument(
-        "--force", action="store_true",
-        help="recompute chunks that already have a data.parquet",
-    )
-    parser.add_argument(
-        "--skip-errors", action="store_true",
-        help="log errors and continue instead of stopping",
-    )
-    parser.add_argument(
         "--run-dirty", action="store_true",
         help="allow startup even when git working tree is dirty",
     )
@@ -1670,16 +1669,13 @@ def main() -> None:
     all_partitions = [(m, k) for m, k in all_partitions if k + 9_999 <= frontier]
     total_all = len(all_partitions)
 
-    if args.force:
-        todo = list(all_partitions)
-    else:
-        todo = [
-            (m, k) for m, k in all_partitions
-            if not (
-                Path(OUT_DIR, f"1M={m}", f"10K={k}", "data.parquet").exists()
-                and Path(OUT_DIR, f"1M={m}", f"10K={k}", "metadata.json").exists()
-            )
-        ]
+    todo = [
+        (m, k) for m, k in all_partitions
+        if not (
+            Path(OUT_DIR, f"1M={m}", f"10K={k}", "data.parquet").exists()
+            and Path(OUT_DIR, f"1M={m}", f"10K={k}", "metadata.json").exists()
+        )
+    ]
 
     done_count = total_all - len(todo)
     console.print(
@@ -1720,12 +1716,11 @@ def main() -> None:
             try:
                 row_count, input_hashes = process_chunk(con, m, k, log=log)
                 progress.update(task, advance=1, description=f"1M={m}/10K={k}: {row_count} rows")
-            except Exception as e:
-                if args.skip_errors:
-                    log.exception(f"Error processing 1M={m}/10K={k}, continuing...")
-                    progress.update(task, advance=1, description=f"1M={m}/10K={k}: ERROR")
-                else:
-                    raise
+            except duckdb.InterruptException:
+                log.info("Interrupted by user (SIGINT). Exiting cleanly.")
+                break
+            except Exception:
+                raise
 
     console.print("[green]Complete![/green]")
 
