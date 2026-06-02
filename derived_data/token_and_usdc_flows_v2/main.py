@@ -1464,19 +1464,19 @@ def process_chunk(
         con.register("_hex", arrow_table)
         bad_hex = con.execute("""
             SELECT 'transaction_hash' AS col FROM _hex
-                WHERE length(transaction_hash) != 32
+                WHERE octet_length(transaction_hash) != 32
             UNION ALL
             SELECT 'account' FROM _hex
-                WHERE length(account) != 20
+                WHERE octet_length(account) != 20
             UNION ALL
             SELECT 'token_id' FROM _hex
-                WHERE token_id IS NOT NULL AND length(token_id) != 32
+                WHERE token_id IS NOT NULL AND octet_length(token_id) != 32
             UNION ALL
             SELECT 'condition_id' FROM _hex
-                WHERE length(condition_id) != 32
+                WHERE octet_length(condition_id) != 32
             UNION ALL
             SELECT 'collateral_token' FROM _hex
-                WHERE length(collateral_token) != 20
+                WHERE octet_length(collateral_token) != 20
             LIMIT 1
         """).fetchone()
         con.unregister("_hex")
