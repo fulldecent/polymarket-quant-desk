@@ -79,7 +79,7 @@ Producers are long-running and must be observable (see also `.github/copilot-ins
 
 - Show a single sticky progress bar with ETA (rich `Progress`). Route log lines through a `RichHandler` bound to the SAME `Console` as the `Progress` so the bar stays pinned at the bottom while logs scroll above it.
 - Progress reflects only real work. Do not list already-landed partitions.
-- Write a `main.log` to the dataset's output directory on every run.
+- Write one log file per run to a `logs/` folder next to the producer script. Name it `main-{timestamp}.log` where the timestamp is the run start time in ISO 8601 zulu, basic format (no colons): `datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")` → `logs/main-2026-06-09T175739Z.log`. Never share or append across runs; each run gets its own file. The `logs/` folder is gitignored.
 - Update visible output at least once per second; a stall over ~2s reads as broken.
 - Handle `SIGINT` cleanly: stop after the current partition, leave only immutable landed partitions behind (atomic publish guarantees no partial partition is ever visible).
 

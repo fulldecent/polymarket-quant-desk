@@ -55,6 +55,7 @@ import signal
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import duckdb
@@ -62,6 +63,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from dotenv import load_dotenv
 from rich.console import Console
+from rich.logging import RichHandler
 from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
@@ -167,8 +169,13 @@ TEMP_DIR = _require_env("TEMP_DIR")
 # ============================================================================
 
 def _setup_logging() -> logging.Logger:
-    os.makedirs(OUT_DIR, exist_ok=True)
-    log_path = Path(OUT_DIR) / "main.log"
+    # One timestamped log file per run, under a logs/ folder next to this script.
+    # Filename embeds the run start time in ISO 8601 zulu (basic format, no colons
+    # so it is filesystem-safe).
+    log_dir = Path(__file__).resolve().parent / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
+    log_path = log_dir / f"main-{ts}.log"
 
     fmt = logging.Formatter(
         "%(asctime)s  %(levelname)-7s  %(message)s",
@@ -178,9 +185,16 @@ def _setup_logging() -> logging.Logger:
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
 
-    ch = logging.StreamHandler()
+    # Route console logs through the shared rich Console so they cooperate with
+    # the live Progress display (log lines scroll above a pinned progress bar).
+    ch = RichHandler(
+        console=console,
+        show_path=False,
+        rich_tracebacks=True,
+        omit_repeated_times=False,
+    )
     ch.setLevel(logging.INFO)
-    ch.setFormatter(fmt)
+    ch.setFormatter(logging.Formatter("%(message)s", datefmt="%Y-%m-%dT%H:%M:%S"))
 
     log = logging.getLogger("token_and_usdc_flows_v2")
     log.setLevel(logging.DEBUG)
@@ -1550,6 +1564,7 @@ def main() -> None:
         MofNCompleteColumn(),
         TimeElapsedColumn(),
         TimeRemainingColumn(),
+        console=console,
     ) as progress:
         task = progress.add_task("Processing partitions", total=len(todo))
         

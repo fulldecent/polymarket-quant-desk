@@ -28,7 +28,7 @@ The flags `--force`, `--skip-errors`, and `--run-dirty` must never exist in this
 
 - Programs never delete or modify finalized data. This is a production environment. See data guarantees for each product.
 - Programs are considered broken if they fail to update their output for more than 2 seconds. Ensure output is updated every second and shows accurate progress updates.
-- Long-running producers show a single sticky progress bar with ETA and write a `main.log` on every run. Route logs through a rich `RichHandler` bound to the same `Console` as the progress bar so the bar stays pinned while logs scroll above it. Progress reflects only real work — never list already-landed partitions.
+- Long-running producers show a single sticky progress bar with ETA and write one timestamped log file per run to a `logs/` folder next to the script, named `main-{ISO8601-zulu}.log` (e.g. `main-2026-06-09T175739Z.log` from `strftime("%Y-%m-%dT%H%M%SZ")`). Route logs through a rich `RichHandler` bound to the same `Console` as the progress bar so the bar stays pinned while logs scroll above it. Progress reflects only real work — never list already-landed partitions.
 
 ## Queries
 
