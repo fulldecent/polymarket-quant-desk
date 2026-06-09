@@ -272,7 +272,13 @@ def _process_ct_partition(con: duckdb.DuckDBPyConnection, m_val: int, k_val: int
 
 
 def _process_nr_partition(con: duckdb.DuckDBPyConnection, m_val: int, k_val: int) -> list[dict]:
-    """Emit (USDC_E, ZERO32, condition, 1/2, token0/token1) from NegRiskCtfExchange/token_registered in this partition."""
+    """Emit (USDC_E, ZERO32, condition, 1/2, token0/token1) from NegRiskCtfExchange/token_registered in this partition.
+
+    Deduplicates at the 4-tuple level to ensure each (collateral_token, parent_collection_id,
+    condition_id, index_set) appears only once in the output. This is necessary because the
+    NegRiskCtfExchange/token_registered source may contain duplicate (token0, token1, condition_id)
+    rows, which would otherwise result in duplicate 4-tuples in the output.
+    """
     path = _src_path("NegRiskCtfExchange/token_registered", m_val, k_val)
     if not path:
         return []
@@ -280,23 +286,25 @@ def _process_nr_partition(con: duckdb.DuckDBPyConnection, m_val: int, k_val: int
         SELECT DISTINCT token0, token1, condition_id
         FROM read_parquet('{path}')
     """).fetchall()
-    result = []
+    # Deduplicate at the 4-tuple level: use a dict keyed by (collateral, parent, condition, index_set).
+    tuples: dict[tuple[bytes, bytes, bytes, int], dict] = {}
     for token0, token1, cond in rows:
-        result.append({
+        cond_bytes = bytes(cond)
+        tuples[(USDC_E, ZERO32, cond_bytes, 1)] = {
             "collateral_token": USDC_E,
             "parent_collection_id": ZERO32,
-            "condition_id": bytes(cond),
+            "condition_id": cond_bytes,
             "index_set": 1,
             "token_id": bytes(token0),
-        })
-        result.append({
+        }
+        tuples[(USDC_E, ZERO32, cond_bytes, 2)] = {
             "collateral_token": USDC_E,
             "parent_collection_id": ZERO32,
-            "condition_id": bytes(cond),
+            "condition_id": cond_bytes,
             "index_set": 2,
             "token_id": bytes(token1),
-        })
-    return result
+        }
+    return list(tuples.values())
 
 
 def _rows_to_table(rows: list[dict]) -> pa.Table:
