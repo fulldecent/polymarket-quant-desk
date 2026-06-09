@@ -35,6 +35,7 @@ import signal
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import duckdb
@@ -136,8 +137,13 @@ TEMP_DIR = _require_env("TEMP_DIR")
 # ============================================================================
 
 def _setup_logging() -> logging.Logger:
-    os.makedirs(OUT_DIR, exist_ok=True)
-    log_path = Path(OUT_DIR) / "main.log"
+    # One timestamped log file per run, under a logs/ folder next to this script.
+    # Filename embeds the run start time in ISO 8601 zulu (basic format, no colons
+    # so it is filesystem-safe).
+    log_dir = Path(__file__).resolve().parent / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
+    log_path = log_dir / f"main-{ts}.log"
 
     fmt = logging.Formatter(
         "%(asctime)s  %(levelname)-7s  %(message)s",
