@@ -42,6 +42,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from dotenv import load_dotenv
 from rich.console import Console
+from rich.logging import RichHandler
 from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
@@ -142,9 +143,16 @@ def _setup_logging() -> logging.Logger:
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
 
-    ch = logging.StreamHandler()
+    # Route console logs through the shared rich Console so they cooperate with
+    # the live Progress display (log lines scroll above a pinned progress bar).
+    ch = RichHandler(
+        console=console,
+        show_path=False,
+        rich_tracebacks=True,
+        omit_repeated_times=False,
+    )
     ch.setLevel(logging.INFO)
-    ch.setFormatter(fmt)
+    ch.setFormatter(logging.Formatter("%(message)s", datefmt="%Y-%m-%dT%H:%M:%S"))
 
     log = logging.getLogger("token_id_map_v1")
     log.setLevel(logging.DEBUG)
@@ -493,6 +501,7 @@ def main() -> None:
         MofNCompleteColumn(),
         TimeElapsedColumn(),
         TimeRemainingColumn(),
+        console=console,
     ) as progress:
         task = progress.add_task("Materializing token_id_map_v1", total=len(todo))
 
