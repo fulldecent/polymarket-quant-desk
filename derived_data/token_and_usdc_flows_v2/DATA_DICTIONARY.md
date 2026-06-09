@@ -310,7 +310,7 @@ Each partition's `metadata.json` follows the specification in `docs/Metadata fil
 
 ## Reproducibility
 
-Fully deterministic data given identical source data. Metadata embeds `git_commit` and the producer rejects startup if the working tree is dirty (unless `--run-dirty` flag is set).
+Fully deterministic data given identical source data. Metadata embeds `git_commit` and the producer rejects startup if the working tree is dirty.
 
 ## Contract accounts to exclude
 

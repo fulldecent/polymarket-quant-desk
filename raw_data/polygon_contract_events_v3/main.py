@@ -173,7 +173,7 @@ _stop_event = threading.Event()
 # Environment loading
 # ---------------------------------------------------------------------------
 
-def _load_environment(*, allow_dirty: bool = False) -> dict[str, str]:
+def _load_environment() -> dict[str, str]:
     """Read every required env var from the root ``.env`` and validate it.
 
     Exits the process with a clear message on any missing or invalid value. The returned dict has
@@ -181,8 +181,7 @@ def _load_environment(*, allow_dirty: bool = False) -> dict[str, str]:
     """
     project_root = Path(__file__).resolve().parent.parent.parent
 
-    if not allow_dirty:
-        assert_git_clean(project_root)
+    assert_git_clean(project_root)
 
     load_dotenv(project_root / ".env")
 
@@ -1053,11 +1052,6 @@ def main() -> None:
         help="concurrent Parquet sink workers (default: 1)",
     )
     parser.add_argument(
-        "--run-dirty",
-        action="store_true",
-        help="allow startup even when git working tree is dirty",
-    )
-    parser.add_argument(
         "--max-calls", type=int, default=None,
         help="stop after this many RPC calls (default: no limit)",
     )
@@ -1076,7 +1070,7 @@ def main() -> None:
     if args.lag_tolerance < 0:
         sys.exit(f"--lag-tolerance must be >= 0; got {args.lag_tolerance}")
 
-    env = _load_environment(allow_dirty=args.run_dirty)
+    env = _load_environment()
     max_block_span = int(env["max_block_span"])
     max_rps = int(env["max_rps"])
 

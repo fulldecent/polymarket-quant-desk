@@ -8,6 +8,7 @@ This project scrapes Polymarket event logs from Polygon blockchain and exports t
 - Use `python-dotenv` for environment configuration
 - All environment variables are required and validated at startup
 - Do not use "baskwards compatibility aliases" or other BC features unless specifically requested
+- You are welcome to propose and implement test assertions about the raw data, and then rely on these assumptions (with fail fast) in the code to improve readability, maintainability and performance.
 
 ## Program functionality
 

@@ -5,7 +5,8 @@ This file documents the gaps and tasks remaining to make main.py fully functiona
 ## Current status
 
 main.py is 70% complete. It has:
-- ✅ Git-clean check with `--run-dirty`
+
+- ✅ Git-clean check
 - ✅ Frontier loading and frontier-bounded partition enumeration
 - ✅ V2 exchanges added to enumerate_partitions
 - ✅ BLOB output schema
@@ -14,6 +15,7 @@ main.py is 70% complete. It has:
 - ✅ Ordered partition processing loop
 
 Remaining:
+
 - ❌ process_chunk: Full SQL generators for splits, merges, redeems, converts
 - ❌ process_chunk: Atomic folder write logic
 - ❌ Per-1M token ID precomputation (looping and caching)
@@ -22,17 +24,21 @@ Remaining:
 ## SQL generators to complete
 
 ### 1. _ct_split_sql(m_val, k_val) -> str
+
 Generate split rows from ConditionalTokens/position_split.
 
 **Output:**
+
 - Row 0 (sub_index=0): stakeholder, 0 net_usdc, 0 net_tokens, NULL token_id, 'split'
 - Rows 1..N: stakeholder, 0 net_usdc, +amount net_tokens, computed token_id per partition[i]
 
 **Key logic:**
+
 - USDC row: net_usdc = -amount (collateral locked)
 - Token rows: one per partition index; compute token_id via keccak (already cached)
 
 **SQL template:**
+
 ```sql
 SELECT ... sub_index=0, net_usdc = -amount, net_tokens = 0, token_id = NULL
 UNION ALL
@@ -41,42 +47,52 @@ SELECT ... (unnest partition array), sub_index = row_number, net_tokens = +amoun
 ```
 
 ### 2. _nr_split_sql(m_val, k_val) -> str
+
 Generate split rows from NegRiskAdapter/position_split (simpler: always YES/NO pair).
 
 **Output:**
+
 - Row 0: 0 net_usdc, 0 net_tokens, NULL token_id
 - Row 1: 0 net_usdc, +amount net_tokens, YES token_id (index_set=1)
 - Row 2: 0 net_usdc, +amount net_tokens, NO token_id (index_set=2)
 
 ### 3. _ct_merge_sql(m_val, k_val) -> str
+
 Inverse of CT split (net amounts negated).
 
 ### 4. _nr_merge_sql(m_val, k_val) -> str
+
 Inverse of NR split.
 
 ### 5. _ct_redeem_sql(m_val, k_val) -> str
+
 Generate redeem rows from ConditionalTokens/payout_redemption.
 
 **Output:**
+
 - Row 0: stakeholder, +payout net_usdc, 0 net_tokens, NULL token_id
 - Rows 1..N: stakeholder, 0 net_usdc, **NULL** net_tokens (not -amount!), computed token_id per index_sets[i]
 
 **Critical:** NR redeem token rows have NULL net_tokens (unknown burn), not explicit amounts.
 
 ### 6. _nr_redeem_sql(m_val, k_val) -> str
+
 Generate redeem rows from NegRiskAdapter/payout_redemption.
 
 **Difference from CT:** NR redeem token rows have explicit `-amounts[i]` for non-zero amounts (not NULL).
 
 ### 7. _convert_rows_python(con, m_val, k_val) -> list[dict]
+
 Process NegRiskAdapter/positions_converted in Python (expensive logic).
 
 **For each convert event:**
+
 - Lookup market_id in question_to_condition to get all conditions in that market
 - For each condition: if index_set bit is set → YES minted (+amount); else NO consumed (-amount)
 - Return one row per condition
 
 **Key fields:**
+
 ```python
 {
     "block_number": int,

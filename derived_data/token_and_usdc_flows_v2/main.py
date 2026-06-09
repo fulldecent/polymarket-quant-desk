@@ -35,6 +35,7 @@ REQUIRED ENV VARS
 -----------------
     POLYGON_CONTRACT_EVENTS_V3_DIR   root of raw {contract}/{event}/... parquet
     TOKEN_AND_USDC_FLOWS_V2_DIR      output directory
+    TOKEN_ID_MAP_V1_DIR              token ID lookup table (derived)
     TEMP_DIR                         DuckDB spill directory
 
 USAGE
@@ -45,7 +46,6 @@ USAGE
     --sample N      process only the first N incomplete chunks
     --force         recompute chunks that already have a data.parquet
     --skip-errors   log errors and continue instead of stopping
-    --run-dirty     allow startup even if git working tree is dirty
 """
 
 import argparse
@@ -77,7 +77,6 @@ _project_root = Path(__file__).resolve().parent.parent.parent
 load_dotenv(_project_root / ".env")
 
 sys.path.insert(0, str(_project_root))
-from lib.ct_helpers import get_collection_id, get_position_id  # noqa: E402
 from lib.git_utils import assert_git_clean  # noqa: E402
 from lib.metadata_utils import create_parquet_metadata_json, parquet_content_hash  # noqa: E402
 from lib.partition_utils import (
@@ -159,6 +158,7 @@ def _require_env(name: str) -> str:
 
 RAW      = _require_env("POLYGON_CONTRACT_EVENTS_V3_DIR")
 OUT_DIR  = _require_env("TOKEN_AND_USDC_FLOWS_V2_DIR")
+TOKEN_ID_MAP_DIR = _require_env("TOKEN_ID_MAP_V1_DIR")
 TEMP_DIR = _require_env("TEMP_DIR")
 
 
@@ -227,96 +227,10 @@ def _write_metadata(
 
 
 # ============================================================================
-# token ID computation
-# ============================================================================
+# token ID lookup is now provided by TOKEN_ID_MAP_V1_DIR (loaded at startup)
+# No per-1M keccak computation or in-memory cache in this job.
+# See load_global_lookups() for the read_parquet of the map.
 
-_token_id_cache: dict[tuple[bytes, bytes, bytes, int], bytes] = {}
-_precomputed_1m: dict[int, bool] = {}
-
-
-def compute_token_id(
-    collateral_token: bytes,
-    parent_collection_id: bytes,
-    condition_id: bytes,
-    index_set: int,
-) -> bytes:
-    """Compute CTF ERC-1155 token ID. Results are cached."""
-    key = (collateral_token, parent_collection_id, condition_id, index_set)
-    cached = _token_id_cache.get(key)
-    if cached is not None:
-        return cached
-    coll = get_collection_id(parent_collection_id, condition_id, index_set)
-    pos_int = get_position_id(collateral_token, coll)
-    result = pos_int.to_bytes(32, "big")
-    _token_id_cache[key] = result
-    return result
-
-# TODO: instead of looking for 1M groups, it should stream partitions (of opaque size) and slice
-# 100 of them at a time. The current approach relies on understanding 1M vs 10K and that should be
-# an implementation detail of the libraries.
-
-def precompute_token_ids_for_1m(
-    con: duckdb.DuckDBPyConnection,
-    m_val: int,
-    log: logging.Logger,
-) -> None:
-    """Pre-compute token IDs for all conditions appearing in this 1M range."""
-    t0 = time.monotonic()
-
-    tables = [
-        ("ConditionalTokens/position_split", "collateral_token", "parent_collection_id", "condition_id", "partition"),
-        ("ConditionalTokens/positions_merge", "collateral_token", "parent_collection_id", "condition_id", "partition"),
-        ("ConditionalTokens/payout_redemption", "collateral_token", "parent_collection_id", "condition_id", "index_sets"),
-    ]
-
-    for table, col_coll, col_parent, col_cond, col_indices in tables:
-        base = Path(RAW) / table
-        if not base.exists():
-            continue
-        for m_dir in sorted(base.iterdir()):
-            if not m_dir.name.startswith(f"{PARTITION_1M_LABEL}="):
-                continue
-            m_val_dir = int(m_dir.name.split("=")[1])
-            if m_val_dir != m_val:
-                continue
-
-            for k_dir in sorted(m_dir.iterdir()):
-                if not k_dir.name.startswith(f"{PARTITION_10K_LABEL}="):
-                    continue
-                pf = k_dir / "data.parquet"
-                if not pf.exists():
-                    continue
-
-                con.execute(f"""
-                    INSERT INTO _token_id_precompute
-                    SELECT DISTINCT
-                        unhex('{USDC_E_HEX}') AS collateral_token,
-                        {col_parent},
-                        {col_cond},
-                        TRY_CAST(json_extract_string({col_indices}, '$[0]') AS UINTEGER) AS idx
-                    FROM read_parquet('{pf}')
-                    WHERE {col_indices} IS NOT NULL
-                      AND json_extract_string({col_indices}, '$[0]') IS NOT NULL
-                """)
-
-    row = con.execute(
-        "SELECT COUNT(*) FROM _token_id_precompute"
-    ).fetchone()
-    rows_precomp = row[0] if row is not None else 0
-
-    for row in con.execute(
-        "SELECT * FROM _token_id_precompute"
-    ).fetchall():
-        coll, parent, cond, idx = row
-        compute_token_id(bytes(coll), bytes(parent), bytes(cond), int(idx))
-
-    elapsed = time.monotonic() - t0
-    log.debug(f"precompute_token_ids_for_1m(1M={m_val}): {rows_precomp} tuples, {len(_token_id_cache)} cached in {elapsed:.1f}s")
-
-
-def _loaded_token_ids_to_table(con: duckdb.DuckDBPyConnection) -> None:
-    """Load cached token IDs into a temp table for SQL joins."""
-    rows = [
         {
             "collateral": coll,
             "parent": parent,
@@ -436,6 +350,14 @@ def load_global_lookups(
             FROM read_parquet('{RAW}/ConditionalTokens/condition_preparation/**/data.parquet')
         ) prep ON qp.question_id = prep.question_id
     """)
+
+    # Load the token_id_map_v1 derived table (replaces per-1M keccak computation)
+    token_id_map_glob = f"{TOKEN_ID_MAP_DIR}/**/*.parquet"
+    con.execute(f"""
+        CREATE OR REPLACE TEMP TABLE computed_token_ids AS
+        SELECT * FROM read_parquet('{token_id_map_glob}')
+    """)
+    log.debug("loaded token_id_map_v1 into computed_token_ids")
 
     log.info("global lookups loaded in %.1fs total", time.monotonic() - t0)
 
@@ -1277,11 +1199,10 @@ def process_chunk(
     chunk_dir = Path(OUT_DIR) / partition_dir(k_val)
     chunk_dir.parent.mkdir(parents=True, exist_ok=True)
 
-    # Precompute token IDs once per 1M block range.
-    if not _precomputed_1m.get(m_val):
-        precompute_token_ids_for_1m(con, m_val, log)
-        _precomputed_1m[m_val] = True
-    _loaded_token_ids_to_table(con)
+    # Load token ID map (global, not per-1M).
+    # The map is loaded once at startup in load_global_lookups(); here we ensure the temp table exists.
+    if "computed_token_ids" not in [r[0] for r in con.execute("SHOW TABLES").fetchall()]:
+        _load_token_id_map(con, log)
 
     sql_parts: list[str] = []
 
@@ -1533,17 +1454,12 @@ def main() -> None:
         "--sample", type=int, default=0, metavar="N",
         help="process only the first N incomplete chunks",
     )
-    parser.add_argument(
-        "--run-dirty", action="store_true",
-        help="allow startup even when git working tree is dirty",
-    )
     args = parser.parse_args()
 
     log = _setup_logging()
     
     # Git check before anything else
-    if not args.run_dirty:
-        assert_git_clean(_project_root)
+    assert_git_clean(_project_root)
     
     log.info("starting  RAW=%s  OUT_DIR=%s", RAW, OUT_DIR)
     console.print(f"starting  RAW={RAW}  OUT_DIR={OUT_DIR}")

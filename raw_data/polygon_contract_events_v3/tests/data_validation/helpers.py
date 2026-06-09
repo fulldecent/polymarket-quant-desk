@@ -179,6 +179,32 @@ def complete_1m_ranges_for(event: str) -> set[int]:
 V1_EXCHANGE_CONTRACTS = frozenset({"CTFExchange", "NegRiskCtfExchange"})
 
 
+def glob_complete_contract_prefix(prefix: str, ranges: list[int]) -> str:
+    """Read only complete 1M partitions for events whose contract path starts with a prefix.
+
+    Example: prefix="ConditionalTokens" matches ConditionalTokens/position_split,
+    ConditionalTokens/positions_merge, etc., but not NegRiskAdapter/*.
+    """
+    # Build a synthetic event map filtered by prefix
+    all_locs = _event_locations()
+    # The values are lists of "contract/event" paths; filter those starting with the prefix
+    filtered_paths = [p for p in sum(all_locs.values(), []) if p == prefix or p.startswith(prefix + "/")]
+    if not filtered_paths:
+        raise ValueError(f"no data found for contract prefix {prefix!r}")
+
+    all_parquet = []
+    for p in filtered_paths:
+        for v in ranges:
+            d = os.path.join(RAW, p, f"1M={v}")
+            if os.path.isdir(d):
+                all_parquet.append(f"'{RAW}/{p}/1M={v}/**/*.parquet'")
+    if not all_parquet:
+        raise ValueError(f"no complete partitions found for contract prefix {prefix!r}")
+    if len(all_parquet) == 1:
+        return f"read_parquet({all_parquet[0]})"
+    return f"read_parquet([{', '.join(all_parquet)}])"
+
+
 def glob_complete_v1(event: str, ranges: list[int]) -> str:
     """Like glob_complete but restricted to V1 exchange contracts only.
 

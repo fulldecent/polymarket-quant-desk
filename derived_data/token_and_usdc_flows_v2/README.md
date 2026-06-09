@@ -18,8 +18,8 @@ python derived_data/token_and_usdc_flows_v2/main.py [options]
 ```
 
 Options:
+
 - `--dry-run` — print work plan without writing
-- `--run-dirty` — allow startup if git working tree is dirty
 - `--partitions N` — stop after processing N partitions
 
 ## How to test it
@@ -32,9 +32,7 @@ python -m pytest derived_data/token_and_usdc_flows_v2/tests/data_validation -v
 
 ## Fee semantics
 
-Polymarket applies fees to some trades. You can identify if a fee has occured if 
-
-
+Polymarket applies fees to some trades. You can identify if a fee has occured if
 
 ## Fee semantics: Polymarket V1 vs V2
 
@@ -43,11 +41,13 @@ The net fee visible in the output depends on the exchange and version.
 ### Polymarket V1 (CTFExchange / NegRiskCtfExchange)
 
 **Upstream structure:**
+
 - `OrderFilled` event carries a **gross fee** (debited, total going to protocol)
 - A matching `FeeModule.FeeRefunded` event carries the **actual net fee** (what the taker really pays; maker is refunded)
 - The materializer uses `COALESCE(fee_refunded.fee_charged, order_filled.fee)` to get the net actual
 
 **Fee placement** (deducted from the receiving asset):
+
 - **BUY order** (`maker_asset_id == 0`): Maker pays USDC (collateral), receives tokens. Fee is deducted from tokens received.
   - Buyer (sub_index=0): `net_tokens = taker_amount_filled - actual_fee`; `net_usdc = -maker_amount_filled`
   - Seller (sub_index=1): `net_tokens = -taker_amount_filled`; `net_usdc = +maker_amount_filled` (no fee)
@@ -56,6 +56,7 @@ The net fee visible in the output depends on the exchange and version.
   - Buyer (sub_index=0): `net_usdc = -taker_amount_filled`; `net_tokens = +maker_amount_filled` (no fee)
 
 **Example: V1 BUY order** (binary market, USDC.e × tokens)
+
 ```
 Raw upstream (CTFExchange/order_filled):
   maker=0xAlice, taker=0xBob
@@ -81,15 +82,18 @@ Output rows:
 ### Polymarket V2 (CTFExchangeV2 / NegRiskCtfExchangeV2)
 
 **Upstream structure:**
+
 - `OrderFilled` event carries `side` (0=BUY, 1=SELL) + a direct `fee` field
 - No fee module; `fee` in the event is the net actual fee
 - Side semantics: `side=0` → taker buys outcome token (pays USDC), `side=1` → taker sells outcome token (receives USDC)
 
 **Fee placement** (same logic as V1: deducted from the receiving asset):
+
 - **BUY** (`side=0`): Fee deducted from tokens.
 - **SELL** (`side=1`): Fee deducted from USDC.
 
 **Example: V2 SELL order** (binary market, USDC.e × tokens)
+
 ```
 Raw upstream (CTFExchangeV2/order_filled):
   maker=0xCarol, taker=0xDave
@@ -127,7 +131,7 @@ To compute a trader's current token holdings for a specific `token_id`:
 
 ## Architecture
 
-1. **Startup**: Git-clean check (exit unless `--run-dirty`); load frontier from upstream manifest; enumerate partitions in block order.
+1. **Startup**: Git-clean check (exit if working tree is dirty); load frontier from upstream manifest; enumerate partitions in block order.
 2. **Recovery**: Clean up any incomplete (temp-named) partition folders from prior interrupted runs.
 3. **Per-1M precomputation**: Scan all splits/merges/redeems in the 1M range; compute CTF keccak/ECC token IDs; cache for all 10K chunks in that range.
 4. **Per-10K chunk processing**:
@@ -141,6 +145,7 @@ To compute a trader's current token holdings for a specific `token_id`:
 ## Data types
 
 **Blob columns** (raw bytes, not hex strings):
+
 - `transaction_hash`: 32 bytes
 - `account`: 20 bytes
 - `token_id`: 32 bytes (nullable)
@@ -148,6 +153,7 @@ To compute a trader's current token holdings for a specific `token_id`:
 - `collateral_token`: 20 bytes
 
 **Numeric types**:
+
 - `net_usdc`: signed int64 (micro-USDC, clamped ±100M)
 - `net_tokens`: signed int64 (nullable; NULL means "unknown negative burn")
 - `price_1e18`: unsigned int64 (on trades only; NULL elsewhere)
@@ -155,6 +161,7 @@ To compute a trader's current token holdings for a specific `token_id`:
 ## Dependencies
 
 Raw data from `polygon_contract_events_v3`:
+
 - `CTFExchange/order_filled`, `{CTFExchangeV2,NegRiskCtfExchange,NegRiskCtfExchangeV2}/order_filled`
 - `{ConditionalTokens,NegRiskAdapter}/position_split`, `positions_merge`, `payout_redemption`
 - `NegRiskAdapter/positions_converted`
