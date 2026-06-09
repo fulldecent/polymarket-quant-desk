@@ -103,26 +103,35 @@ orchestrator's ``HotStore`` connection):
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
-import subprocess
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from functools import lru_cache
 from pathlib import Path
 import threading
 
 import duckdb
+
+from lib.metadata_utils import create_parquet_metadata_json
+from lib.partition_utils import (
+    PARTITION_10K_LABEL,
+    PARTITION_1M_LABEL,
+    partition_dir,
+    partition_end,
+    partition_start,
+)
+from lib.atomic_publish import (
+    create_temp_location,
+    publish_atomically,
+    cleanup_old_temp_artifacts,
+)
 
 from .errors import DuplicateRowError, OperationCancelled, V3Error
 from .persistence import ProgressCallback
 from .tables import (
     SCRAPE_START_BLOCK,
     PARTITION_SIZE_10K,
-    PARTITION_SIZE_1M,
     CONTRACTS_BY_NAME,
     all_columns,
     all_targets,
@@ -159,16 +168,8 @@ class PartitionWriteResult:
 # Public API
 # ---------------------------------------------------------------------------
 
-def _first_partition_start() -> int:
-    return (SCRAPE_START_BLOCK // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
-
-
-def _partition_1m(partition_start: int) -> int:
-    return (partition_start // PARTITION_SIZE_1M) * PARTITION_SIZE_1M
-
-
 def _manifest_dir(cold_path: Path, partition_start: int) -> Path:
-    return cold_path / "manifests" / f"1M={_partition_1m(partition_start)}" / f"10K={partition_start}"
+    return cold_path / "manifests" / partition_dir(partition_start)
 
 
 def _expected_targets_for_partition(partition_start: int) -> list[tuple[str, str]]:
@@ -203,93 +204,27 @@ def _validate_manifest_partition_dir(manifest_partition_dir: Path) -> None:
         )
 
 
-def _repo_root() -> Path:
-    # _internal/parquet_sink.py -> polygon_contract_events_v3 -> raw_data -> repo root
-    return Path(__file__).resolve().parents[3]
-
-
-@lru_cache(maxsize=1)
-def _current_git_commit() -> str:
-    """Return the current HEAD commit hash, or 'unknown' if unavailable."""
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            cwd=str(_repo_root()),
-        )
-        commit = result.stdout.strip()
-        return commit if commit else "unknown"
-    except Exception:
-        return "unknown"
-
-
-def _parquet_content_hash(parquet_path: Path) -> str:
-    """Compute SHA256 hash of parquet file."""
-    import hashlib
-    sha256_hash = hashlib.sha256()
-    try:
-        with open(parquet_path, "rb") as f:
-            for chunk in iter(lambda: f.read(8192), b""):
-                sha256_hash.update(chunk)
-        return f"sha256:{sha256_hash.hexdigest()}"
-    except Exception as e:
-        raise V3Error(f"could not compute content hash for {parquet_path}: {e}") from e
-
-
 def _create_metadata_json_for_single_parquet(
     parquet_path: str | Path,
     *,
     dataset: str = "polygon_contract_events_v3",
     source_script: str = "raw_data/polygon_contract_events_v3/_internal/parquet_sink.py",
-    overwrite: bool = True,
     input_hashes: dict[str, str] | None = None,
     parameters: dict[str, object] | None = None,
 ) -> Path:
     """Internal helper to write one spec-compliant ``metadata.json`` for one parquet file."""
-    parquet = Path(parquet_path)
-    if not parquet.is_file():
-        raise V3Error(f"data.parquet does not exist: {parquet}")
-
-    metadata_path = parquet.parent / "metadata.json"
-    if metadata_path.exists() and not overwrite:
-        return metadata_path
-
-    # Compute content hash and row count.
-    content_hash = _parquet_content_hash(parquet)
-    con = duckdb.connect()
     try:
-        row = con.execute(
-            "SELECT COUNT(*) FROM read_parquet(?)",
-            [parquet.as_posix()],
-        ).fetchone()
-        if row is None:
-            raise V3Error(f"could not count parquet rows for metadata.json at {parquet}: empty result")
-        row_count = int(row[0])
+        return create_parquet_metadata_json(
+            parquet_path,
+            dataset=dataset,
+            source_script=source_script,
+            input_hashes=input_hashes,
+            parameters=parameters,
+        )
+    except FileNotFoundError as e:
+        raise V3Error(str(e)) from e
     except Exception as e:
-        raise V3Error(f"could not count parquet rows for metadata.json at {parquet}: {e}") from e
-    finally:
-        con.close()
-
-    payload: dict[str, object] = {
-        "dataset": dataset,
-        "created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-        "source_script": source_script,
-        "git_commit": _current_git_commit(),
-        "row_count": row_count,
-        "file_size_bytes": parquet.stat().st_size,
-        "content_hash": content_hash,
-    }
-    if input_hashes is not None:
-        payload["input_hashes"] = input_hashes
-    if parameters is not None:
-        payload["parameters"] = parameters
-
-    try:
-        metadata_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
-    except OSError as e:
-        raise V3Error(f"could not write metadata.json for {parquet}: {e}") from e
-    return metadata_path
+        raise V3Error(f"could not write metadata.json for {parquet_path}: {e}") from e
 
 
 def create_metadata_json_for_parquet(parquet_path: str | Path) -> Path:
@@ -327,34 +262,49 @@ def _validate_or_prepare_partition_data_dir(partition_dir: Path) -> bool:
 
 
 def _publish_manifest_success_atomically(cold_path: Path, partition_start: int) -> None:
+    """Publish a manifest _SUCCESS folder atomically, using shared publish primitives.
+    
+    Raises V3Error if the final location already exists (immutability protection).
+    """
     final_dir = _manifest_dir(cold_path, partition_start)
-    tmp_dir = final_dir.parent / f"10K={partition_start}.tmp"
+    manifests_parent = final_dir.parent
+    final_name = final_dir.name
 
+    # Check immutability before creating temp
     if final_dir.exists():
         raise V3Error(
             f"refusing to overwrite immutable manifest partition folder: {final_dir}"
         )
 
-    tmp_dir.parent.mkdir(parents=True, exist_ok=True)
-    if tmp_dir.exists():
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-    tmp_dir.mkdir(parents=False)
+    # Create temp location using shared primitive
+    temp_location = create_temp_location(
+        parent_dir=manifests_parent,
+        final_name=final_name,
+        temp_suffix=".tmp",
+    )
 
-    success_tmp = tmp_dir / "_SUCCESS"
-    success_tmp.write_bytes(b"")
-    os.replace(tmp_dir, final_dir)
+    # Write _SUCCESS marker
+    success_file = temp_location.path / "_SUCCESS"
+    success_file.write_bytes(b"")
+
+    # Publish atomically (raises FileExistsError if immutability violated)
+    publish_atomically(temp_location, allow_overwrite=False)
 
 
 def _cleanup_tmp_partition_dirs(cold_path: Path, partition_start: int) -> int:
+    """Clean up temp partition directories for a specific partition.
+    
+    Removes all .tmp directories matching the partition pattern across all
+    contract/event combinations. Uses shared cleanup primitives.
+    """
     removed = 0
-    k1m = _partition_1m(partition_start)
+    k_tmp_dir = f"10K={partition_start}.tmp"
     for contract, event in all_targets():
         tmp_dir = (
             cold_path
             / contract
             / event
-            / f"1M={k1m}"
-            / f"10K={partition_start}.tmp"
+            / partition_dir(partition_start).replace(f"10K={partition_start}", k_tmp_dir)
         )
         if tmp_dir.exists():
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -380,27 +330,26 @@ def roll_forward_manifests_to_exhaustion(
 
     written = 0
     frontier = get_sunk_frontier(cold_root)
-    partition_start = _first_partition_start() if frontier < SCRAPE_START_BLOCK else frontier + 1
-    partition_start = (partition_start // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
+    pstart = partition_start(SCRAPE_START_BLOCK) if frontier < SCRAPE_START_BLOCK else frontier + 1
+    pstart = (pstart // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
 
     while True:
         if stop_event and stop_event.is_set():
             raise OperationCancelled("manifest roll-forward interrupted")
 
-        partition_end = partition_start + PARTITION_SIZE_10K - 1
-        k1m = _partition_1m(partition_start)
-        expected_targets = _expected_targets_for_partition(partition_start)
+        partition_end_val = partition_end(pstart)
+        rel_path = partition_dir(pstart)
+        expected_targets = _expected_targets_for_partition(pstart)
 
         all_exist = True
         for contract, event in expected_targets:
-            partition_dir = (
+            partition_data_dir = (
                 cold_path
                 / contract
                 / event
-                / f"1M={k1m}"
-                / f"10K={partition_start}"
+                / rel_path
             )
-            exists_and_valid = _validate_or_prepare_partition_data_dir(partition_dir)
+            exists_and_valid = _validate_or_prepare_partition_data_dir(partition_data_dir)
             if not exists_and_valid:
                 all_exist = False
                 break
@@ -411,12 +360,12 @@ def roll_forward_manifests_to_exhaustion(
                     op="manifest",
                     phase="stop",
                     rows_done=written,
-                    message=f"stopped before 10K={partition_start} (incomplete)",
+                    message=f"stopped before 10K={pstart} (incomplete)",
                 )
             break
 
-        _publish_manifest_success_atomically(cold_path, partition_start)
-        removed_tmp = _cleanup_tmp_partition_dirs(cold_path, partition_start)
+        _publish_manifest_success_atomically(cold_path, pstart)
+        removed_tmp = _cleanup_tmp_partition_dirs(cold_path, pstart)
         written += 1
         if progress_cb:
             progress_cb(
@@ -424,13 +373,13 @@ def roll_forward_manifests_to_exhaustion(
                 phase="publish",
                 rows_done=written,
                 message=(
-                    f"published manifests/1M={k1m}/10K={partition_start} "
-                    f"for blocks [{partition_start}, {partition_end}] "
+                        f"published manifests/{rel_path} "
+                    f"for blocks [{pstart}, {partition_end_val}] "
                     f"tmp_removed={removed_tmp}"
                 ),
             )
 
-        partition_start += PARTITION_SIZE_10K
+        pstart += PARTITION_SIZE_10K
 
     return written
 
@@ -450,13 +399,13 @@ def cleanup_temp_dirs_after_frontier(
         raise ValueError(f"cold_root does not exist or is not a directory: {cold_root}")
 
     frontier = get_sunk_frontier(cold_root)
-    partition_start = _first_partition_start() if frontier < SCRAPE_START_BLOCK else frontier + 1
-    partition_start = (partition_start // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
+    pstart = partition_start(SCRAPE_START_BLOCK) if frontier < SCRAPE_START_BLOCK else frontier + 1
+    pstart = (pstart // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
 
-    removed = _cleanup_tmp_partition_dirs(cold_path, partition_start)
-    manifest_k1m = _partition_1m(partition_start)
-    manifest_tmp = cold_path / "manifests" / f"1M={manifest_k1m}" / f"10K={partition_start}.tmp"
-    manifest_final = cold_path / "manifests" / f"1M={manifest_k1m}" / f"10K={partition_start}"
+    removed = _cleanup_tmp_partition_dirs(cold_path, pstart)
+    manifest_rel = partition_dir(pstart)
+    manifest_tmp = cold_path / "manifests" / f"{manifest_rel}.tmp"
+    manifest_final = cold_path / "manifests" / manifest_rel
 
     for path in (manifest_tmp, manifest_final):
         if path.exists():
@@ -468,7 +417,7 @@ def cleanup_temp_dirs_after_frontier(
             op="manifest",
             phase="cleanup",
             rows_done=removed,
-            message=f"cleaned temp dirs for 10K={partition_start}",
+            message=f"cleaned temp dirs for 10K={pstart}",
         )
     return removed
 
@@ -497,25 +446,25 @@ def read_manifest_frontier(
             continue
         if partition_dir.name.endswith(".tmp"):
             continue
-        if not partition_dir.name.startswith("10K="):
+        if not partition_dir.name.startswith(f"{PARTITION_10K_LABEL}="):
             continue
 
         try:
-            partition_start = int(partition_dir.name.split("=", 1)[1])
+            pval = int(partition_dir.name.split("=", 1)[1])
         except ValueError as e:
             raise V3Error(f"invalid manifest partition folder name: {partition_dir}") from e
 
-        if partition_start % PARTITION_SIZE_10K != 0:
+        if pval % PARTITION_SIZE_10K != 0:
             raise V3Error(f"manifest partition is not 10K-aligned: {partition_dir}")
 
-        if partition_start < _first_partition_start():
+        if pval < partition_start(SCRAPE_START_BLOCK):
             raise V3Error(
-                f"manifest partition is before first allowed partition {_first_partition_start()}: "
+                f"manifest partition is before first allowed partition {partition_start(SCRAPE_START_BLOCK)}: "
                 f"{partition_dir}"
             )
 
         _validate_manifest_partition_dir(partition_dir)
-        existing_partitions.append(partition_start)
+        existing_partitions.append(pval)
 
     if not existing_partitions:
         if progress_cb:
@@ -523,24 +472,24 @@ def read_manifest_frontier(
         return SCRAPE_START_BLOCK - 1, 0
 
     existing_partitions = sorted(set(existing_partitions))
-    expected = _first_partition_start()
-    for idx, partition_start in enumerate(existing_partitions, start=1):
-        if partition_start != expected:
+    expected = partition_start(SCRAPE_START_BLOCK)
+    for idx, pstart in enumerate(existing_partitions, start=1):
+        if pstart != expected:
             raise V3Error(
                 "non-contiguous manifest frontier: "
-                f"expected manifests for 10K={expected} before 10K={partition_start}"
+                f"expected manifests for 10K={expected} before 10K={pstart}"
             )
         expected += PARTITION_SIZE_10K
         if progress_cb and (idx % 50 == 0 or idx == len(existing_partitions)):
             progress_cb(
                 op="manifest",
                 phase="read",
-                rows_done=partition_start,
+                rows_done=pstart,
                 rows_total=len(existing_partitions),
-                message=f"10K={partition_start}",
+                message=f"10K={pstart}",
             )
 
-    return existing_partitions[-1] + PARTITION_SIZE_10K - 1, len(existing_partitions)
+    return partition_end(existing_partitions[-1]), len(existing_partitions)
 
 def get_sunk_frontier(cold_root: str) -> int:
     """Return the sunk frontier inferred only from manifest ``_SUCCESS`` files.
@@ -661,7 +610,7 @@ def write_partition_files(
     # partition's *end* block is at or above ``SCRAPE_START_BLOCK`` —
     # otherwise the partition lies entirely in pre-scrape history and
     # cannot contain any rows.
-    if partition_start + PARTITION_SIZE_10K - 1 < SCRAPE_START_BLOCK:
+    if partition_end(partition_start) < SCRAPE_START_BLOCK:
         raise ValueError(
             f"partition_start {partition_start} ends before "
             f"SCRAPE_START_BLOCK {SCRAPE_START_BLOCK}"
@@ -672,8 +621,8 @@ def write_partition_files(
     if not Path(db_path).is_file():
         raise ValueError(f"db_path does not exist: {db_path}")
 
-    p_end = partition_start + PARTITION_SIZE_10K - 1
-    k1m = (partition_start // PARTITION_SIZE_1M) * PARTITION_SIZE_1M
+    p_end = partition_end(partition_start)
+    rel_path = partition_dir(partition_start)
     targets = targets_active_at(p_end)
 
     t0 = time.monotonic()
@@ -729,7 +678,7 @@ def write_partition_files(
             cols = all_columns(contract, event)
             col_list = ", ".join(cols)
 
-            dst_dir = cold_path / contract / event / f"1M={k1m}" / f"10K={partition_start}"
+            dst_dir = cold_path / contract / event / rel_path
             dst_dir.mkdir(parents=True, exist_ok=True)
             dst = dst_dir / "data.parquet"
             # Immutability guard: the cold tier is append-only. A

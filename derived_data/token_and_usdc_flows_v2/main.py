@@ -49,17 +49,12 @@ USAGE
 """
 
 import argparse
-import hashlib
-import json
 import logging
 import os
 import signal
-import subprocess
 import sys
-import tempfile
 import threading
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 import duckdb
@@ -83,6 +78,22 @@ load_dotenv(_project_root / ".env")
 
 sys.path.insert(0, str(_project_root))
 from lib.ct_helpers import get_collection_id, get_position_id  # noqa: E402
+from lib.git_utils import assert_git_clean  # noqa: E402
+from lib.metadata_utils import create_parquet_metadata_json, parquet_content_hash  # noqa: E402
+from lib.partition_utils import (
+    PARTITION_10K_LABEL,
+    PARTITION_1M_LABEL,
+    partition_dir,
+    partition_end,
+)
+from derived_data.common.partition_planner import plan_partitions
+from lib.atomic_publish import (  # noqa: E402
+    create_temp_location,
+    publish_atomically,
+    cleanup_old_temp_artifacts,
+    cleanup_on_failure,
+    cleanup_temp,
+)
 from raw_data.polygon_contract_events_v3 import get_sunk_frontier  # noqa: E402
 
 # ============================================================================
@@ -152,48 +163,6 @@ TEMP_DIR = _require_env("TEMP_DIR")
 
 
 # ============================================================================
-# git validation
-# ============================================================================
-
-def _assert_git_clean(project_root: Path, *, allow_dirty: bool = False) -> None:
-    """Fail fast when the repository has uncommitted changes.
-
-    Metadata embeds `git_commit`. To keep provenance strict, we refuse to write if the working
-    tree is dirty unless the caller explicitly opts in via `--run-dirty`.
-    """
-    try:
-        result = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=project_root,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except FileNotFoundError:
-        sys.exit("git executable was not found; cannot verify clean working tree")
-    except subprocess.CalledProcessError as e:
-        sys.exit(f"failed to check git status: {e}")
-
-    lines = [line for line in result.stdout.splitlines() if line.strip()]
-    if lines:
-        if allow_dirty:
-            preview = "\n".join(lines[:20])
-            suffix = "\n..." if len(lines) > 20 else ""
-            print(
-                "WARNING: git working tree is dirty, but --run-dirty was set. Proceeding anyway.\n"
-                f"Dirty entries:\n{preview}{suffix}"
-            )
-            return
-        preview = "\n".join(lines[:20])
-        suffix = "\n..." if len(lines) > 20 else ""
-        sys.exit(
-            "Refusing to start because git working tree is dirty. "
-            "Commit or stash changes first.\n"
-            f"Dirty entries:\n{preview}{suffix}"
-        )
-
-
-# ============================================================================
 # logging
 # ============================================================================
 
@@ -219,25 +188,6 @@ def _setup_logging() -> logging.Logger:
 # provenance helpers
 # ============================================================================
 
-def _git_commit() -> str:
-    try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        ).strip()
-    except Exception:
-        return "unknown"
-
-
-def _sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for block in iter(lambda: f.read(1 << 20), b""):
-            h.update(block)
-    return "sha256:" + h.hexdigest()
-
-
 def _write_metadata(
     con: duckdb.DuckDBPyConnection,
     chunk_dir: Path,
@@ -247,7 +197,7 @@ def _write_metadata(
     log: logging.Logger,
 ) -> None:
     """Write metadata.json per docs/Metadata files.md schema.
-    
+
     No 'version' field; includes 'input_hashes' (map of input paths to content hashes).
     """
     part = chunk_dir / "data.parquet"
@@ -255,29 +205,20 @@ def _write_metadata(
         log.warning(f"data.parquet not found at {part}")
         return
 
-    stat = part.stat()
-    row = con.execute(
-        f"SELECT COUNT(*) FROM read_parquet('{part}')"
-    ).fetchone()
-    row_count = row[0] if row is not None else 0
-
-    meta = {
-        "dataset": "token_and_usdc_flows_v2",
-        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "source_script": "derived_data/token_and_usdc_flows_v2/main.py",
-        "git_commit": _git_commit(),
-        "row_count": row_count,
-        "file_size_bytes": stat.st_size,
-        "content_hash": _sha256_file(part),
-        "input_hashes": input_hashes,
-        "parameters": {
+    create_parquet_metadata_json(
+        part,
+        dataset="token_and_usdc_flows_v2",
+        source_script="derived_data/token_and_usdc_flows_v2/main.py",
+        input_hashes=input_hashes,
+        parameters={
             "1M": m_val,
             "10K": k_val,
             "min_block": k_val,
-            "max_block": k_val + 9_999,
+            "max_block": partition_end(k_val),
         },
-    }
-    (chunk_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
+        row_count_connection=con,
+        created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    )
 
 
 # ============================================================================
@@ -305,6 +246,9 @@ def compute_token_id(
     _token_id_cache[key] = result
     return result
 
+# TODO: instead of looking for 1M groups, it should stream partitions (of opaque size) and slice
+# 100 of them at a time. The current approach relies on understanding 1M vs 10K and that should be
+# an implementation detail of the libraries.
 
 def precompute_token_ids_for_1m(
     con: duckdb.DuckDBPyConnection,
@@ -325,14 +269,14 @@ def precompute_token_ids_for_1m(
         if not base.exists():
             continue
         for m_dir in sorted(base.iterdir()):
-            if not m_dir.name.startswith("1M="):
+            if not m_dir.name.startswith(f"{PARTITION_1M_LABEL}="):
                 continue
             m_val_dir = int(m_dir.name.split("=")[1])
             if m_val_dir != m_val:
                 continue
 
             for k_dir in sorted(m_dir.iterdir()):
-                if not k_dir.name.startswith("10K="):
+                if not k_dir.name.startswith(f"{PARTITION_10K_LABEL}="):
                     continue
                 pf = k_dir / "data.parquet"
                 if not pf.exists():
@@ -493,7 +437,7 @@ def load_global_lookups(
 
 def _src_path(contract_event: str, m_val: int, k_val: int) -> str | None:
     """Return parquet path for a 10K partition, or None if missing."""
-    p = Path(RAW) / contract_event / f"1M={m_val}" / f"10K={k_val}" / "data.parquet"
+    p = Path(RAW) / contract_event / partition_dir(k_val) / "data.parquet"
     if p.exists():
         return str(p)
     return None
@@ -1310,7 +1254,7 @@ def _compute_input_hashes(m_val: int, k_val: int) -> dict[str, str]:
         path = _src_path(table, m_val, k_val)
         if not path:
             continue
-        h = _sha256_file(Path(path))
+        h = parquet_content_hash(Path(path))
         rel = os.path.relpath(path, RAW)
         hashes[rel] = h
 
@@ -1325,7 +1269,7 @@ def process_chunk(
     log: logging.Logger,
 ) -> tuple[int, dict[str, str]]:
     """Process one 10K partition: generate rows, validate, and write atomically."""
-    chunk_dir = Path(OUT_DIR, f"1M={m_val}", f"10K={k_val}")
+    chunk_dir = Path(OUT_DIR) / partition_dir(k_val)
     chunk_dir.parent.mkdir(parents=True, exist_ok=True)
 
     # Precompute token IDs once per 1M block range.
@@ -1498,12 +1442,19 @@ def process_chunk(
 
     input_hashes = _compute_input_hashes(m_val, k_val)
 
-    tmp_parent = Path(OUT_DIR, f"1M={m_val}")
-    tmp_parent.mkdir(parents=True, exist_ok=True)
-    tmp_dir = Path(tempfile.mkdtemp(prefix=f".tmp_10K={k_val}_", dir=tmp_parent))
+    # Create temp location using shared atomic publish primitive
+    chunk_dir = Path(OUT_DIR) / partition_dir(k_val)
+    chunk_parent = chunk_dir.parent
+    chunk_name = chunk_dir.name
+
+    temp_location = create_temp_location(
+        parent_dir=chunk_parent,
+        final_name=chunk_name,
+        temp_suffix=".tmp",
+    )
 
     try:
-        out = tmp_dir / "data.parquet"
+        out = temp_location.path / "data.parquet"
         pq.write_table(
             arrow_table,
             str(out),
@@ -1511,18 +1462,13 @@ def process_chunk(
             use_dictionary=True,
             write_statistics=True,
         )
-        _write_metadata(con, tmp_dir, m_val, k_val, input_hashes, log)
+        _write_metadata(con, temp_location.path, m_val, k_val, input_hashes, log)
 
-        import shutil
-        chunk_dir.parent.mkdir(parents=True, exist_ok=True)
-        if chunk_dir.exists():
-            shutil.rmtree(chunk_dir)
-        if not tmp_dir.exists():
-            raise FileNotFoundError(f"Temp directory disappeared before rename: {tmp_dir}")
-        tmp_dir.rename(chunk_dir)
+        # Atomically publish to final location
+        publish_atomically(temp_location, allow_overwrite=False)
     except Exception:
-        import shutil
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        # Clean up temp on any error
+        cleanup_temp(temp_location)
         raise
 
     elapsed = time.monotonic() - t0
@@ -1544,58 +1490,22 @@ def setup(con: duckdb.DuckDBPyConnection, log: logging.Logger) -> None:
     log.info("setup complete")
 
 
-def enumerate_partitions(con: duckdb.DuckDBPyConnection) -> list[tuple[int, int]]:
-    """Find all 10K partitions that have data in any source table, up to frontier."""
-    source_tables = [
-        "CTFExchange/order_filled",
-        "NegRiskCtfExchange/order_filled",
-        "CTFExchangeV2/order_filled",
-        "NegRiskCtfExchangeV2/order_filled",
-        "ConditionalTokens/position_split",
-        "ConditionalTokens/positions_merge",
-        "ConditionalTokens/payout_redemption",
-        "NegRiskAdapter/position_split",
-        "NegRiskAdapter/positions_merge",
-        "NegRiskAdapter/payout_redemption",
-        "NegRiskAdapter/positions_converted",
-    ]
-
-    all_partitions: set[tuple[int, int]] = set()
-    for table in source_tables:
-        base = Path(RAW) / table
-        if not base.exists():
-            continue
-        for m_dir in sorted(base.iterdir()):
-            if not m_dir.name.startswith("1M="):
-                continue
-            m_val = int(m_dir.name.split("=")[1])
-            for k_dir in sorted(m_dir.iterdir()):
-                if not k_dir.name.startswith("10K="):
-                    continue
-                k_val = int(k_dir.name.split("=")[1])
-                if (k_dir / "data.parquet").exists():
-                    all_partitions.add((m_val, k_val))
-
-    return sorted(all_partitions)
-
-
 def cleanup_temp_partitions(log: logging.Logger) -> None:
-    """Remove any incomplete temp-named partition folders on startup."""
+    """Remove any incomplete temp-named partition folders on startup.
+    
+    Uses shared cleanup primitives to remove .tmp directories that may be
+    left from interrupted runs.
+    """
     out_path = Path(OUT_DIR)
     if not out_path.exists():
         return
     
-    for m_dir in out_path.iterdir():
-        if not m_dir.is_dir() or not m_dir.name.startswith("1M="):
-            continue
-        for k_dir in m_dir.iterdir():
-            if not k_dir.is_dir():
-                continue
-            # Check if this looks like a temp folder (should start with .tmp or similar)
-            if k_dir.name.startswith(".") or "_tmp_" in k_dir.name:
-                log.info(f"Removing incomplete temp partition: {k_dir}")
-                import shutil
-                shutil.rmtree(k_dir)
+    removed = cleanup_old_temp_artifacts(
+        root_dir=out_path,
+        temp_suffix=".tmp",
+    )
+    if removed > 0:
+        log.info(f"Removed {removed} incomplete temp partitions")
 
 
 # ============================================================================
@@ -1624,7 +1534,8 @@ def main() -> None:
     log = _setup_logging()
     
     # Git check before anything else
-    _assert_git_clean(_project_root, allow_dirty=args.run_dirty)
+    if not args.run_dirty:
+        assert_git_clean(_project_root)
     
     log.info("starting  RAW=%s  OUT_DIR=%s", RAW, OUT_DIR)
     console.print(f"starting  RAW={RAW}  OUT_DIR={OUT_DIR}")
@@ -1656,28 +1567,38 @@ def main() -> None:
     log.info("cleaning up incomplete partitions...")
     cleanup_temp_partitions(log)
 
-    # Get frontier and enumerate partitions
+    # Get frontier and plan partitions
     frontier = get_sunk_frontier(RAW)
     log.info(f"frontier from upstream: block {frontier}")
     console.print(f"frontier from upstream: block {frontier}")
 
-    log.info("enumerating 10K block partitions...")
-    console.print("enumerating 10K block partitions...")
-    all_partitions = enumerate_partitions(con)
-    
-    # Filter to frontier
-    all_partitions = [(m, k) for m, k in all_partitions if k + 9_999 <= frontier]
-    total_all = len(all_partitions)
+    log.info("planning partitions from sources...")
+    console.print("planning partitions from sources...")
 
-    todo = [
-        (m, k) for m, k in all_partitions
-        if not (
-            Path(OUT_DIR, f"1M={m}", f"10K={k}", "data.parquet").exists()
-            and Path(OUT_DIR, f"1M={m}", f"10K={k}", "metadata.json").exists()
-        )
+    source_tables = [
+        "CTFExchange/order_filled",
+        "NegRiskCtfExchange/order_filled",
+        "CTFExchangeV2/order_filled",
+        "NegRiskCtfExchangeV2/order_filled",
+        "ConditionalTokens/position_split",
+        "ConditionalTokens/positions_merge",
+        "ConditionalTokens/payout_redemption",
+        "NegRiskAdapter/position_split",
+        "NegRiskAdapter/positions_merge",
+        "NegRiskAdapter/payout_redemption",
+        "NegRiskAdapter/positions_converted",
     ]
 
-    done_count = total_all - len(todo)
+    plan = plan_partitions(
+        source_bases=["manifests"],
+        source_root=RAW,
+        output_root=OUT_DIR,
+        frontier=frontier,
+    )
+
+    total_all = len(plan.all_partitions)
+    todo = plan.todo_partitions
+    done_count = len(plan.completed_partitions)
     console.print(
         f"  {total_all:,} total  |  [green]{done_count:,} already done[/green]"
         f"  |  [yellow]{len(todo):,} to process[/yellow]"
