@@ -1649,7 +1649,15 @@ def main() -> None:
             except duckdb.InterruptException:
                 log.info("Interrupted by user (SIGINT). Exiting cleanly.")
                 break
-            except Exception:
+            except duckdb.InvalidInputException as e:
+                # Upstream parquet file has invalid encoding (corrupt data).
+                # Log and skip so the run can complete; the bad partition can be
+                # re-scraped later from the raw source.
+                log.error("Invalid data in upstream parquet for 1M=%d/10K=%d: %s", m, k, e)
+                console.print(f"[red]Skipping corrupt partition 1M={m}/10K={k}[/red]")
+                progress.update(task, advance=1, description=f"1M={m}/10K={k}: SKIPPED (corrupt)")
+            except Exception as e:
+                log.error("Unexpected error processing 1M=%d/10K=%d: %s", m, k, e)
                 raise
 
     console.print("[green]Complete![/green]")
