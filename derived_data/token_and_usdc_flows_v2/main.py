@@ -178,9 +178,14 @@ def _setup_logging() -> logging.Logger:
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
 
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt)
+
     log = logging.getLogger("token_and_usdc_flows_v2")
     log.setLevel(logging.DEBUG)
     log.addHandler(fh)
+    log.addHandler(ch)
     return log
 
 
@@ -1486,6 +1491,9 @@ def setup(con: duckdb.DuckDBPyConnection, log: logging.Logger) -> None:
     con.execute("SET memory_limit = '8GB'")
     con.execute("SET threads = 4")
     con.execute("SET preserve_insertion_order = false")
+    # Enable DuckDB's native progress bar for long-running SQL operations
+    con.execute("SET enable_progress_bar = true")
+    con.execute("SET enable_progress_bar_print = true")
     con.execute("CREATE OR REPLACE TEMP TABLE _token_id_precompute (collateral_token BLOB, parent_collection_id BLOB, condition_id BLOB, index_set UINTEGER)")
     log.info("setup complete")
 
@@ -1633,7 +1641,8 @@ def main() -> None:
             if _stop_event.is_set():
                 log.info("interrupted by user")
                 break
-            
+
+            log.info("processing 1M=%d/10K=%d", m, k)
             try:
                 row_count, input_hashes = process_chunk(con, m, k, log=log)
                 progress.update(task, advance=1, description=f"1M={m}/10K={k}: {row_count} rows")
