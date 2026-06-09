@@ -49,6 +49,7 @@ from rich.progress import (
     MofNCompleteColumn,
     Progress,
     SpinnerColumn,
+    TaskID,
     TaskProgressColumn,
     TextColumn,
     TimeElapsedColumn,
@@ -248,6 +249,10 @@ def _existing_partition_files(contract_event: str, partitions: list[tuple[int, i
 def _load_nr_collateral_candidates(
     con: duckdb.DuckDBPyConnection,
     partitions: list[tuple[int, int]],
+    *,
+    log: logging.Logger,
+    progress: Progress | None = None,
+    task_id: TaskID | None = None,
 ) -> None:
     """Load candidate CT collateral tokens for each Polymarket condition.
 
@@ -269,39 +274,44 @@ def _load_nr_collateral_candidates(
         )
     """)
 
-    selects: list[str] = []
-    if split_files:
-        selects.append(
-            f"""
-            SELECT DISTINCT condition_id, collateral_token
-            FROM read_parquet({_sql_blob_list(split_files)})
-            WHERE parent_collection_id = unhex('{ZERO32_HEX}')
-              AND condition_id IN (SELECT condition_id FROM polymarket_conditions)
-            """
-        )
-    if merge_files:
-        selects.append(
-            f"""
-            SELECT DISTINCT condition_id, collateral_token
-            FROM read_parquet({_sql_blob_list(merge_files)})
-            WHERE parent_collection_id = unhex('{ZERO32_HEX}')
-              AND condition_id IN (SELECT condition_id FROM polymarket_conditions)
-            """
-        )
-    if redeem_files:
-        selects.append(
-            f"""
-            SELECT DISTINCT condition_id, collateral_token
-            FROM read_parquet({_sql_blob_list(redeem_files)})
-            WHERE parent_collection_id = unhex('{ZERO32_HEX}')
-              AND condition_id IN (SELECT condition_id FROM polymarket_conditions)
-            """
-        )
+    source_files = [
+        ("position_split", split_files),
+        ("positions_merge", merge_files),
+        ("payout_redemption", redeem_files),
+    ]
+    total_files = sum(len(files) for _, files in source_files)
+    if total_files == 0:
+        log.info("No CT files found for NR collateral candidate resolution")
+        return
 
-    if selects:
-        con.execute(
-            "INSERT INTO nr_collateral_candidates " + " UNION ".join(selects)
-        )
+    loaded = 0
+    for label, files in source_files:
+        if not files:
+            continue
+        log.info(f"Loading NR collateral candidates from {label}: {len(files)} partitions")
+        for path in files:
+            con.execute(f"""
+                INSERT INTO nr_collateral_candidates
+                SELECT DISTINCT condition_id, collateral_token
+                FROM read_parquet('{path.replace("'", "''")}')
+                WHERE parent_collection_id = unhex('{ZERO32_HEX}')
+                  AND condition_id IN (SELECT condition_id FROM polymarket_conditions)
+            """)
+            loaded += 1
+            if progress is not None and task_id is not None:
+                progress.update(
+                    task_id,
+                    advance=1,
+                    description=f"Resolving NR collateral candidates ({loaded}/{total_files})",
+                )
+
+    con.execute("""
+        CREATE OR REPLACE TEMP TABLE nr_collateral_candidates AS
+        SELECT DISTINCT condition_id, collateral_token
+        FROM nr_collateral_candidates
+    """)
+    row_count = con.execute("SELECT COUNT(*) FROM nr_collateral_candidates").fetchone()[0]
+    log.info(f"Loaded {row_count} NR collateral candidate rows")
 
 
 def _resolve_nr_collateral(
@@ -673,10 +683,6 @@ def main() -> None:
     # Load the first-seen set once; process_chunk maintains it incrementally.
     _load_seen_tuples(con)
 
-    # Resolve NR collateral by matching token_registered rows against CT-derived
-    # token ids using candidate collaterals observed up to the raw-data frontier.
-    _load_nr_collateral_candidates(con, all_partitions)
-
     console.print(
         f"frontier={frontier}  |  total={len(all_partitions):,}  |  "
         f"[green]{len(all_partitions) - len(todo):,} already landed[/green]  |  "
@@ -686,6 +692,37 @@ def main() -> None:
     if not todo:
         console.print("[green]Nothing to do.[/green]")
         return
+
+    preload_total = sum(
+        len(_existing_partition_files(contract_event, all_partitions))
+        for contract_event in (
+            "ConditionalTokens/position_split",
+            "ConditionalTokens/positions_merge",
+            "ConditionalTokens/payout_redemption",
+        )
+    )
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    ) as preload_progress:
+        preload_task = preload_progress.add_task(
+            "Resolving NR collateral candidates",
+            total=preload_total,
+        )
+        _load_nr_collateral_candidates(
+            con,
+            all_partitions,
+            log=log,
+            progress=preload_progress,
+            task_id=preload_task,
+        )
 
     with Progress(
         SpinnerColumn(),
