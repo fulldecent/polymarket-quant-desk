@@ -22,7 +22,7 @@ graph TD
 
 ## Data types
 
-Data types are chosen carefully to make joining easy. See the logical Parquet types in `polygon_contract_events` as a starting point. 
+Data types are chosen carefully to make joining easy. See the logical Parquet types in `polygon_contract_events` as a starting point. Mirror them exactly: `BLOB` is Parquet `BYTE_ARRAY` (variable length, no logical type) — never `FIXED_LEN_BYTE_ARRAY`. The full rule is in [data-storage-policies](../.github/instructions/data-storage-policies.md).
 
 ## Raw data
 
@@ -40,4 +40,4 @@ Data types are chosen carefully to make joining easy. See the logical Parquet ty
 
 1. Add a row to the appropriate table above (including `Producer`, `Mutability`, and `Sort order`)
 2. Create a `DATA_DICTIONARY.md` alongside the materializer script
-3. Follow the partitioning, naming, metadata, and sorting rules in [data-storage-policies](../../.github/instructions/data-storage-policies.md)
+3. Follow the partitioning, naming, metadata, and sorting rules in [data-storage-policies](../.github/instructions/data-storage-policies.md)

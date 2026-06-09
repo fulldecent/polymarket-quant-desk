@@ -23,6 +23,17 @@ One row per unique `(collateral_token, parent_collection_id, condition_id, index
 | `index_set` | `INT(bitWidth=32, isSigned=false)` | no | Outcome index set (bit position, > 0) |
 | `token_id` | `"BLOB"` (32 bytes) | no | Computed ERC-1155 token ID |
 
+## Physical sort order
+
+Within each partition file, rows are sorted ascending by the full grain key, in this column order:
+
+1. `collateral_token` (byte-wise ascending)
+2. `parent_collection_id` (byte-wise ascending)
+3. `condition_id` (byte-wise ascending)
+4. `index_set` (numeric ascending)
+
+`token_id` is functionally determined by the grain key and is not part of the sort. This total ordering over the grain key makes each partition file row-for-row reproducible from identical source data.
+
 ## Partitioning
 
 **1M/10K nested partitioning** (same scheme as other derived tables).

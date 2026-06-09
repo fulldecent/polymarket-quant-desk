@@ -348,6 +348,11 @@ def process_chunk(
              AND c.condition_id = s.condition_id
              AND c.index_set = s.index_set
             WHERE s.condition_id IS NULL
+            ORDER BY
+                c.collateral_token,
+                c.parent_collection_id,
+                c.condition_id,
+                c.index_set
         """).fetch_arrow_table().cast(_OUTPUT_SCHEMA)
         con.unregister("candidates")
     else:
