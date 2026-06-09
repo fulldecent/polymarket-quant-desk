@@ -255,6 +255,9 @@ def _load_nr_collateral_candidates(
     by matching token0/token1 against CT-derived token ids for candidate
     collateral tokens observed in root CT split/merge/redeem events.
     """
+    if "polymarket_conditions" not in [r[0] for r in con.execute("SHOW TABLES").fetchall()]:
+        _load_polymarket_conditions(con)
+
     split_files = _existing_partition_files("ConditionalTokens/position_split", partitions)
     merge_files = _existing_partition_files("ConditionalTokens/positions_merge", partitions)
     redeem_files = _existing_partition_files("ConditionalTokens/payout_redemption", partitions)
