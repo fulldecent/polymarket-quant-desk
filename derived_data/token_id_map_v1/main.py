@@ -283,8 +283,20 @@ def _process_nr_partition(con: duckdb.DuckDBPyConnection, m_val: int, k_val: int
     if not path:
         return []
     rows = con.execute(f"""
-        SELECT DISTINCT token0, token1, condition_id
-        FROM read_parquet('{path}')
+        WITH ranked AS (
+            SELECT
+                token0,
+                token1,
+                condition_id,
+                ROW_NUMBER() OVER (
+                    PARTITION BY condition_id
+                    ORDER BY block_number, log_index, transaction_hash
+                ) AS rn
+            FROM read_parquet('{path}')
+        )
+        SELECT token0, token1, condition_id
+        FROM ranked
+        WHERE rn = 1
     """).fetchall()
     # Deduplicate at the 4-tuple level: use a dict keyed by (collateral, parent, condition, index_set).
     tuples: dict[tuple[bytes, bytes, bytes, int], dict] = {}
