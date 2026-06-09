@@ -6,7 +6,7 @@ Maps `(collateral_token, parent_collection_id, condition_id, index_set)` → `to
 
 - All conditions registered in `CTFExchange/token_registered` or `NegRiskCtfExchange/token_registered`.
 - CT rows: varying `collateral_token` from `ConditionalTokens/position_split`, `positions_merge`, `payout_redemption`.
-- NR rows: `(resolved_collateral_token, ZERO32, condition, 1/2)` where the collateral is resolved by matching `token_registered.token0/token1` against CT-derived token IDs from raw CT activity.
+- NR rows: `(resolved_collateral_token, ZERO32, condition, 1/2)`, where the collateral is resolved by matching `token_registered.token0/token1` against position IDs derived from the three known Polymarket collaterals (USDC.e, the NegRisk wrapped collateral, and the v2 base collateral). Exactly one must match, else the producer fails fast. Seven known orphan conditions (no preparation, never traded) whose token pairs match none of the three are skipped.
 
 ## Schema
 

@@ -49,7 +49,6 @@ from rich.progress import (
     MofNCompleteColumn,
     Progress,
     SpinnerColumn,
-    TaskID,
     TaskProgressColumn,
     TextColumn,
     TimeElapsedColumn,
@@ -87,6 +86,35 @@ ZERO32 = b"\x00" * 32
 ZERO32_HEX = "00" * 32
 USDC_E = bytes.fromhex("2791bca1f2de4661ed88a30c99a7a9449aa84174")
 USDC_E_HEX = "2791bca1f2de4661ed88a30c99a7a9449aa84174"
+
+# Collateral tokens Polymarket uses for CTF position-ID derivation. NR
+# token_registered rows do not carry collateral, so each row's token0/token1 is
+# matched against position IDs derived from exactly these addresses. Native USDC
+# is intentionally excluded: it is not used directly as CTF collateral.
+NR_COLLATERAL_ALLOWLIST = (
+    bytes.fromhex("2791bca1f2de4661ed88a30c99a7a9449aa84174"),  # USDC.e
+    bytes.fromhex("3a3bd7bb9528e159577f7c2e685cc81a765002e2"),  # NegRisk wrapped collateral
+    bytes.fromhex("c011a7e12a19f7b1f670d46f03b03f3342e82dfb"),  # v2 base collateral
+)
+
+# NR token_registered emissions whose token pair derives from none of the
+# allowlisted collaterals. Each of these conditions has no usable
+# condition_preparation and never trades on any exchange (v1 or v2), so its
+# collateral cannot be recovered and no consumer needs the mapping. They are
+# enumerated here so the producer skips exactly these and still fails fast on any
+# unexpected new occurrence. Verified to be exactly these 7 across the dataset.
+KNOWN_UNRESOLVABLE_NR_CONDITIONS = frozenset(
+    bytes.fromhex(c)
+    for c in (
+        "56e19c50b8e331920e7d478c86a3b75bfeb8c25ff3983a43c91bb6583c6ada90",
+        "83ab1bdb51a33e8db5ee90e10ec41c257db70bfd934b754bf40a4e38039c0b8c",
+        "dfc651dc0729a0c0ee68b527de751c999feb663fb607f248426b3ba87adc653b",
+        "31aefa5220364f6018345c9669e84121706a110aa08395b6656da66a30a2d5f1",
+        "3681f4dd6cd0c3d7bf1e93a8ea47a089ff449b4804362c3e106f1a0642d70b78",
+        "a20c16b74869ec592c6a59996d086d39ceec761a0ce6ea2f36f3b078a79bc5cd",
+        "3ca6ed50230248a69317dd8b77465029ee5a9a808cbf6e16fd7f36e31b01a0b6",
+    )
+)
 
 # The first 10K partition Polymarket data can occupy. Every consecutive 10K
 # partition from here up to the frontier is materialized, with no gaps. Even a
@@ -232,121 +260,21 @@ def _load_polymarket_conditions(con: duckdb.DuckDBPyConnection) -> None:
     """)
 
 
-def _sql_blob_list(paths: list[str]) -> str:
-    quoted = [f"'{path.replace("'", "''")}'" for path in paths]
-    return f"[{', '.join(quoted)}]"
-
-
-def _existing_partition_files(contract_event: str, partitions: list[tuple[int, int]]) -> list[str]:
-    paths: list[str] = []
-    for m_val, k_val in partitions:
-        path = _src_path(contract_event, m_val, k_val)
-        if path:
-            paths.append(path)
-    return paths
-
-
-def _load_nr_collateral_candidates(
-    con: duckdb.DuckDBPyConnection,
-    partitions: list[tuple[int, int]],
-    *,
-    log: logging.Logger,
-    progress: Progress | None = None,
-    task_id: TaskID | None = None,
-) -> None:
-    """Load candidate CT collateral tokens for each Polymarket condition.
-
-    NR token_registered rows do not carry collateral. We infer the CTF collateral
-    by matching token0/token1 against CT-derived token ids for candidate
-    collateral tokens observed in root CT split/merge/redeem events.
-    """
-    if "polymarket_conditions" not in [r[0] for r in con.execute("SHOW TABLES").fetchall()]:
-        _load_polymarket_conditions(con)
-
-    split_files = _existing_partition_files("ConditionalTokens/position_split", partitions)
-    merge_files = _existing_partition_files("ConditionalTokens/positions_merge", partitions)
-    redeem_files = _existing_partition_files("ConditionalTokens/payout_redemption", partitions)
-
-    con.execute("""
-        CREATE OR REPLACE TEMP TABLE nr_collateral_candidates (
-            condition_id BLOB,
-            collateral_token BLOB
-        )
-    """)
-
-    source_files = [
-        ("position_split", split_files),
-        ("positions_merge", merge_files),
-        ("payout_redemption", redeem_files),
-    ]
-    total_files = sum(len(files) for _, files in source_files)
-    if total_files == 0:
-        log.info("No CT files found for NR collateral candidate resolution")
-        return
-
-    loaded = 0
-    for label, files in source_files:
-        if not files:
-            continue
-        log.info(f"Loading NR collateral candidates from {label}: {len(files)} partitions")
-        for path in files:
-            con.execute(f"""
-                INSERT INTO nr_collateral_candidates
-                SELECT DISTINCT condition_id, collateral_token
-                FROM read_parquet('{path.replace("'", "''")}')
-                WHERE parent_collection_id = unhex('{ZERO32_HEX}')
-                  AND condition_id IN (SELECT condition_id FROM polymarket_conditions)
-            """)
-            loaded += 1
-            if progress is not None and task_id is not None:
-                progress.update(
-                    task_id,
-                    advance=1,
-                    description="Resolving NR collateral candidates",
-                )
-
-    con.execute("""
-        CREATE OR REPLACE TEMP TABLE nr_collateral_candidates AS
-        SELECT DISTINCT condition_id, collateral_token
-        FROM nr_collateral_candidates
-    """)
-    con.execute("""
-        CREATE OR REPLACE TEMP TABLE nr_global_collateral_candidates AS
-        SELECT DISTINCT collateral_token
-        FROM nr_collateral_candidates
-    """)
-    row_count = con.execute("SELECT COUNT(*) FROM nr_collateral_candidates").fetchone()[0]
-    log.info(f"Loaded {row_count} NR collateral candidate rows")
-
-
 def _resolve_nr_collateral(
-    con: duckdb.DuckDBPyConnection,
     condition_id: bytes,
     token0: bytes,
     token1: bytes,
     *,
     k_val: int,
 ) -> bytes:
-    condition_candidates = [
-        bytes(row[0])
-        for row in con.execute(
-            "SELECT collateral_token FROM nr_collateral_candidates WHERE condition_id = ?",
-            [condition_id],
-        ).fetchall()
-    ]
-    candidates = condition_candidates
-    candidate_scope = "condition"
-    if not candidates:
-        candidates = [
-            bytes(row[0])
-            for row in con.execute(
-                "SELECT collateral_token FROM nr_global_collateral_candidates"
-            ).fetchall()
-        ]
-        candidate_scope = "global"
+    """Resolve the collateral backing an NR token pair from the fixed allowlist.
 
+    NR token_registered rows do not carry collateral. Each row's token0/token1 is
+    matched against position IDs derived from the three known Polymarket
+    collaterals. Exactly one must match; anything else is a fatal error.
+    """
     matches: list[bytes] = []
-    for collateral_token in candidates:
+    for collateral_token in NR_COLLATERAL_ALLOWLIST:
         expected_token0 = get_position_id(
             collateral_token,
             get_collection_id(ZERO32, condition_id, 1),
@@ -363,15 +291,14 @@ def _resolve_nr_collateral(
 
     if not matches:
         raise ValueError(
-            "Could not resolve NR collateral from raw CT events: "
+            "NR token pair does not match any allowlisted collateral: "
             f"10K={k_val} condition_id={condition_id.hex()} "
             f"token0={token0.hex()} token1={token1.hex()} "
-            f"candidate_scope={candidate_scope} "
-            f"candidate_collaterals={[c.hex() for c in candidates]}"
+            f"allowlist={[c.hex() for c in NR_COLLATERAL_ALLOWLIST]}"
         )
 
     raise ValueError(
-        "Ambiguous NR collateral resolution from raw CT events: "
+        "NR token pair matches multiple allowlisted collaterals: "
         f"10K={k_val} condition_id={condition_id.hex()} "
         f"token0={token0.hex()} token1={token1.hex()} "
         f"matching_collaterals={[c.hex() for c in matches]}"
@@ -444,7 +371,11 @@ def _process_nr_partition(con: duckdb.DuckDBPyConnection, m_val: int, k_val: int
     tuples: dict[tuple[bytes, bytes, bytes, int], dict] = {}
     for token0, token1, cond in rows:
         cond_bytes = bytes(cond)
-        collateral_token = _resolve_nr_collateral(con, cond_bytes, bytes(token0), bytes(token1), k_val=k_val)
+        # Known orphan registrations: no preparation, never traded, collateral
+        # unrecoverable. Skip exactly these; anything else fails fast in resolve.
+        if cond_bytes in KNOWN_UNRESOLVABLE_NR_CONDITIONS:
+            continue
+        collateral_token = _resolve_nr_collateral(cond_bytes, bytes(token0), bytes(token1), k_val=k_val)
         tuples[(collateral_token, ZERO32, cond_bytes, 1)] = {
             "collateral_token": collateral_token,
             "parent_collection_id": ZERO32,
@@ -708,37 +639,6 @@ def main() -> None:
     if not todo:
         console.print("[green]Nothing to do.[/green]")
         return
-
-    preload_total = sum(
-        len(_existing_partition_files(contract_event, all_partitions))
-        for contract_event in (
-            "ConditionalTokens/position_split",
-            "ConditionalTokens/positions_merge",
-            "ConditionalTokens/payout_redemption",
-        )
-    )
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        console=console,
-    ) as preload_progress:
-        preload_task = preload_progress.add_task(
-            "Resolving NR collateral candidates",
-            total=preload_total,
-        )
-        _load_nr_collateral_candidates(
-            con,
-            all_partitions,
-            log=log,
-            progress=preload_progress,
-            task_id=preload_task,
-        )
 
     with Progress(
         SpinnerColumn(),
