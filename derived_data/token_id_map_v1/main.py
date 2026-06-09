@@ -302,7 +302,7 @@ def _load_nr_collateral_candidates(
                 progress.update(
                     task_id,
                     advance=1,
-                    description=f"Resolving NR collateral candidates ({loaded}/{total_files})",
+                    description="Resolving NR collateral candidates",
                 )
 
     con.execute("""
