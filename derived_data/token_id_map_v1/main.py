@@ -310,6 +310,11 @@ def _load_nr_collateral_candidates(
         SELECT DISTINCT condition_id, collateral_token
         FROM nr_collateral_candidates
     """)
+    con.execute("""
+        CREATE OR REPLACE TEMP TABLE nr_global_collateral_candidates AS
+        SELECT DISTINCT collateral_token
+        FROM nr_collateral_candidates
+    """)
     row_count = con.execute("SELECT COUNT(*) FROM nr_collateral_candidates").fetchone()[0]
     log.info(f"Loaded {row_count} NR collateral candidate rows")
 
@@ -322,13 +327,23 @@ def _resolve_nr_collateral(
     *,
     k_val: int,
 ) -> bytes:
-    candidates = [
+    condition_candidates = [
         bytes(row[0])
         for row in con.execute(
             "SELECT collateral_token FROM nr_collateral_candidates WHERE condition_id = ?",
             [condition_id],
         ).fetchall()
     ]
+    candidates = condition_candidates
+    candidate_scope = "condition"
+    if not candidates:
+        candidates = [
+            bytes(row[0])
+            for row in con.execute(
+                "SELECT collateral_token FROM nr_global_collateral_candidates"
+            ).fetchall()
+        ]
+        candidate_scope = "global"
 
     matches: list[bytes] = []
     for collateral_token in candidates:
@@ -351,6 +366,7 @@ def _resolve_nr_collateral(
             "Could not resolve NR collateral from raw CT events: "
             f"10K={k_val} condition_id={condition_id.hex()} "
             f"token0={token0.hex()} token1={token1.hex()} "
+            f"candidate_scope={candidate_scope} "
             f"candidate_collaterals={[c.hex() for c in candidates]}"
         )
 
