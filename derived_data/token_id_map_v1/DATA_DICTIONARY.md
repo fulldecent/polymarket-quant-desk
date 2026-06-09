@@ -7,7 +7,7 @@ Lookup table: `(collateral_token, parent_collection_id, condition_id, index_set)
 Every condition that appears in `CTFExchange/token_registered` or `NegRiskCtfExchange/token_registered`.
 
 - **CT rows:** `collateral_token` varies (from `ConditionalTokens/position_split`, `positions_merge`, `payout_redemption`).
-- **NR rows:** Always `(USDC_E, ZERO32, condition, 1)` and `(USDC_E, ZERO32, condition, 2)` sourced directly from `token_registered` (no keccak).
+- **NR rows:** `(resolved_collateral_token, ZERO32, condition, 1)` and `(resolved_collateral_token, ZERO32, condition, 2)`, where `resolved_collateral_token` is inferred by matching `NegRiskCtfExchange/token_registered.token0/token1` against CT-derived token IDs for candidate collateral tokens seen in root CT split/merge/redeem activity for that condition.
 
 ## Grain
 
@@ -62,7 +62,7 @@ This design allows incremental materialization while preserving the immutability
 | `positions_merge` | `ConditionalTokens` | Same as split (inverse operation) |
 | `payout_redemption` | `ConditionalTokens` | Same as split (from `index_sets` array) |
 
-NR rows are sourced directly from `NegRiskCtfExchange/token_registered` (token0/token1 for index_set 1/2).
+NR rows are sourced from `NegRiskCtfExchange/token_registered` (token0/token1 for index_set 1/2), with collateral resolved by matching those token IDs against CT-derived token IDs from raw CT events for the same condition.
 
 ## Lookup tables (used but not row contributors)
 

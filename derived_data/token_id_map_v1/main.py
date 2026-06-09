@@ -231,6 +231,124 @@ def _load_polymarket_conditions(con: duckdb.DuckDBPyConnection) -> None:
     """)
 
 
+def _sql_blob_list(paths: list[str]) -> str:
+    quoted = [f"'{path.replace("'", "''")}'" for path in paths]
+    return f"[{', '.join(quoted)}]"
+
+
+def _existing_partition_files(contract_event: str, partitions: list[tuple[int, int]]) -> list[str]:
+    paths: list[str] = []
+    for m_val, k_val in partitions:
+        path = _src_path(contract_event, m_val, k_val)
+        if path:
+            paths.append(path)
+    return paths
+
+
+def _load_nr_collateral_candidates(
+    con: duckdb.DuckDBPyConnection,
+    partitions: list[tuple[int, int]],
+) -> None:
+    """Load candidate CT collateral tokens for each Polymarket condition.
+
+    NR token_registered rows do not carry collateral. We infer the CTF collateral
+    by matching token0/token1 against CT-derived token ids for candidate
+    collateral tokens observed in root CT split/merge/redeem events.
+    """
+    split_files = _existing_partition_files("ConditionalTokens/position_split", partitions)
+    merge_files = _existing_partition_files("ConditionalTokens/positions_merge", partitions)
+    redeem_files = _existing_partition_files("ConditionalTokens/payout_redemption", partitions)
+
+    con.execute("""
+        CREATE OR REPLACE TEMP TABLE nr_collateral_candidates (
+            condition_id BLOB,
+            collateral_token BLOB
+        )
+    """)
+
+    selects: list[str] = []
+    if split_files:
+        selects.append(
+            f"""
+            SELECT DISTINCT condition_id, collateral_token
+            FROM read_parquet({_sql_blob_list(split_files)})
+            WHERE parent_collection_id = unhex('{ZERO32_HEX}')
+              AND condition_id IN (SELECT condition_id FROM polymarket_conditions)
+            """
+        )
+    if merge_files:
+        selects.append(
+            f"""
+            SELECT DISTINCT condition_id, collateral_token
+            FROM read_parquet({_sql_blob_list(merge_files)})
+            WHERE parent_collection_id = unhex('{ZERO32_HEX}')
+              AND condition_id IN (SELECT condition_id FROM polymarket_conditions)
+            """
+        )
+    if redeem_files:
+        selects.append(
+            f"""
+            SELECT DISTINCT condition_id, collateral_token
+            FROM read_parquet({_sql_blob_list(redeem_files)})
+            WHERE parent_collection_id = unhex('{ZERO32_HEX}')
+              AND condition_id IN (SELECT condition_id FROM polymarket_conditions)
+            """
+        )
+
+    if selects:
+        con.execute(
+            "INSERT INTO nr_collateral_candidates " + " UNION ".join(selects)
+        )
+
+
+def _resolve_nr_collateral(
+    con: duckdb.DuckDBPyConnection,
+    condition_id: bytes,
+    token0: bytes,
+    token1: bytes,
+    *,
+    k_val: int,
+) -> bytes:
+    candidates = [
+        bytes(row[0])
+        for row in con.execute(
+            "SELECT collateral_token FROM nr_collateral_candidates WHERE condition_id = ?",
+            [condition_id],
+        ).fetchall()
+    ]
+
+    matches: list[bytes] = []
+    for collateral_token in candidates:
+        expected_token0 = get_position_id(
+            collateral_token,
+            get_collection_id(ZERO32, condition_id, 1),
+        ).to_bytes(32, "big")
+        expected_token1 = get_position_id(
+            collateral_token,
+            get_collection_id(ZERO32, condition_id, 2),
+        ).to_bytes(32, "big")
+        if {expected_token0, expected_token1} == {token0, token1}:
+            matches.append(collateral_token)
+
+    if len(matches) == 1:
+        return matches[0]
+
+    if not matches:
+        raise ValueError(
+            "Could not resolve NR collateral from raw CT events: "
+            f"10K={k_val} condition_id={condition_id.hex()} "
+            f"token0={token0.hex()} token1={token1.hex()} "
+            f"candidate_collaterals={[c.hex() for c in candidates]}"
+        )
+
+    raise ValueError(
+        "Ambiguous NR collateral resolution from raw CT events: "
+        f"10K={k_val} condition_id={condition_id.hex()} "
+        f"token0={token0.hex()} token1={token1.hex()} "
+        f"matching_collaterals={[c.hex() for c in matches]}"
+    )
+
+
 def _process_ct_partition(con: duckdb.DuckDBPyConnection, m_val: int, k_val: int) -> list[dict]:
     """Extract unique (collateral, parent, condition, index_set) from CT events in this 10K partition."""
     # Only process if the partition has CT events
@@ -273,13 +391,7 @@ def _process_ct_partition(con: duckdb.DuckDBPyConnection, m_val: int, k_val: int
 
 
 def _process_nr_partition(con: duckdb.DuckDBPyConnection, m_val: int, k_val: int) -> list[dict]:
-    """Emit (USDC_E, ZERO32, condition, 1/2, token0/token1) from NegRiskCtfExchange/token_registered in this partition.
-
-    Deduplicates at the 4-tuple level to ensure each (collateral_token, parent_collection_id,
-    condition_id, index_set) appears only once in the output. This is necessary because the
-    NegRiskCtfExchange/token_registered source may contain duplicate (token0, token1, condition_id)
-    rows, which would otherwise result in duplicate 4-tuples in the output.
-    """
+    """Emit NR rows by resolving collateral from raw CT activity for each condition."""
     path = _src_path("NegRiskCtfExchange/token_registered", m_val, k_val)
     if not path:
         return []
@@ -303,16 +415,17 @@ def _process_nr_partition(con: duckdb.DuckDBPyConnection, m_val: int, k_val: int
     tuples: dict[tuple[bytes, bytes, bytes, int], dict] = {}
     for token0, token1, cond in rows:
         cond_bytes = bytes(cond)
-        tuples[(USDC_E, ZERO32, cond_bytes, 1)] = {
-            "collateral_token": USDC_E,
+        collateral_token = _resolve_nr_collateral(con, cond_bytes, bytes(token0), bytes(token1), k_val=k_val)
+        tuples[(collateral_token, ZERO32, cond_bytes, 1)] = {
+            "collateral_token": collateral_token,
             "parent_collection_id": ZERO32,
             "condition_id": cond_bytes,
             "index_set": 1,
             "token_id": bytes(token0),
             "source": "nr",
         }
-        tuples[(USDC_E, ZERO32, cond_bytes, 2)] = {
-            "collateral_token": USDC_E,
+        tuples[(collateral_token, ZERO32, cond_bytes, 2)] = {
+            "collateral_token": collateral_token,
             "parent_collection_id": ZERO32,
             "condition_id": cond_bytes,
             "index_set": 2,
@@ -557,6 +670,10 @@ def main() -> None:
     # Load the first-seen set once; process_chunk maintains it incrementally.
     _load_seen_tuples(con)
 
+    # Resolve NR collateral by matching token_registered rows against CT-derived
+    # token ids using candidate collaterals observed up to the raw-data frontier.
+    _load_nr_collateral_candidates(con, all_partitions)
+
     console.print(
         f"frontier={frontier}  |  total={len(all_partitions):,}  |  "
         f"[green]{len(all_partitions) - len(todo):,} already landed[/green]  |  "
@@ -587,7 +704,7 @@ def main() -> None:
 
             row_count, _ = process_chunk(con, m_val, k_val, log=log)
             processed += 1
-            progress.update(task, advance=1, description=f"1M={m_val}/10K={k_val}: {row_count} tokens")
+            progress.update(task, advance=1)
 
     log.info(f"token_id_map_v1 materializer finished. Processed {processed} partitions.")
     console.print(f"[green]Complete! Processed {processed} partitions.[/green]")

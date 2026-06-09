@@ -83,6 +83,12 @@ def _all_data_files(out: Path) -> list[Path]:
     return sorted(files)
 
 
+def _duckdb_file_list(files: list[Path]) -> str:
+    """Return a DuckDB SQL list literal for the exact landed data files."""
+    quoted = [f"'{str(path).replace("'", "''")}'" for path in files]
+    return f"[{', '.join(quoted)}]"
+
+
 def test_physical_types_match_raw_dataset():
     """BLOB columns are BYTE_ARRAY (no logical type); index_set is unsigned INT32."""
     out = _output_dir()
@@ -143,9 +149,8 @@ def test_grain_key_is_globally_unique():
     if not files:
         pytest.skip("no data.parquet files found")
 
-    # Use DuckDB to check uniqueness across all partitions efficiently.
-    # Pattern matches exactly 1M=<int>/10K=<int>/data.parquet (validated by _all_data_files).
-    glob_pattern = str(out / "1M=*" / "10K=*" / "data.parquet")
+    # Use the exact landed files, not a glob, so temporary artifacts are never scanned.
+    file_list = _duckdb_file_list(files)
     summary = duckdb.query(f"""
         WITH grouped AS (
             SELECT
@@ -154,7 +159,7 @@ def test_grain_key_is_globally_unique():
                 condition_id,
                 index_set,
                 COUNT(*) AS c
-            FROM read_parquet('{glob_pattern}')
+            FROM read_parquet({file_list})
             GROUP BY 1, 2, 3, 4
         )
         SELECT
@@ -180,7 +185,7 @@ def test_grain_key_is_globally_unique():
                     condition_id,
                     index_set,
                     COUNT(*) AS c
-                FROM read_parquet('{glob_pattern}', filename=true)
+                FROM read_parquet({file_list}, filename=true)
                 GROUP BY 1, 2, 3, 4, 5
             )
             SELECT
@@ -201,5 +206,64 @@ def test_grain_key_is_globally_unique():
             f"grain key is not globally unique across dataset: "
             f"{total} total rows, {distinct} distinct tuples, "
             f"extra_rows={extra_rows}, duplicated_keys={duplicated_keys}. "
+            f"first offending partition files: {offender_rows}"
+        )
+
+
+def test_token_id_is_globally_unique():
+    """Every token_id appears exactly once across the entire dataset."""
+    out = _output_dir()
+    files = _all_data_files(out)
+    if not files:
+        pytest.skip("no data.parquet files found")
+
+    file_list = _duckdb_file_list(files)
+    summary = duckdb.query(f"""
+        WITH grouped AS (
+            SELECT token_id, COUNT(*) AS c
+            FROM read_parquet({file_list})
+            GROUP BY 1
+        )
+        SELECT
+            SUM(c) AS total_rows,
+            COUNT(*) AS distinct_token_ids,
+            SUM(c) - COUNT(*) AS extra_rows,
+            SUM(CASE WHEN c > 1 THEN 1 ELSE 0 END) AS duplicated_token_ids
+        FROM grouped
+    """).to_df()
+
+    total = int(summary["total_rows"][0])
+    distinct = int(summary["distinct_token_ids"][0])
+    extra_rows = int(summary["extra_rows"][0])
+    duplicated = int(summary["duplicated_token_ids"][0])
+
+    if total != distinct:
+        offenders = duckdb.query(f"""
+            WITH per_file AS (
+                SELECT
+                    filename,
+                    token_id,
+                    COUNT(*) AS c
+                FROM read_parquet({file_list}, filename=true)
+                GROUP BY 1, 2
+            )
+            SELECT
+                regexp_replace(filename, '^.*/derived_data/token_id_map_v1/', '') AS partition_file,
+                SUM(c - 1) AS extra_rows,
+                COUNT(*) FILTER (WHERE c > 1) AS duplicated_token_ids
+            FROM per_file
+            WHERE c > 1
+            GROUP BY 1
+            ORDER BY 1
+            LIMIT 10
+        """).to_df()
+        offender_rows = [
+            f"{row.partition_file} (extra_rows={int(row.extra_rows)}, duplicated_token_ids={int(row.duplicated_token_ids)})"
+            for row in offenders.itertuples(index=False)
+        ]
+        assert False, (
+            f"token_id is not globally unique across dataset: "
+            f"{total} total rows, {distinct} distinct token_ids, "
+            f"extra_rows={extra_rows}, duplicated_token_ids={duplicated}. "
             f"first offending partition files: {offender_rows}"
         )
