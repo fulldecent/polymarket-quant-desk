@@ -94,13 +94,17 @@ START_PARTITION_10K = partition_start(SCRAPE_START_BLOCK)
 _PARTITION_10K_SIZE = 10_000
 _PARTITION_1M_SIZE = 1_000_000
 
-# Output Parquet schema
+# Output Parquet schema. Types MUST match the raw polygon_contract_events_v3
+# logical Parquet types so the columns join cleanly:
+#   BLOB  -> Parquet BYTE_ARRAY (no logical type, variable length) == pa.binary()
+#            (NOT FIXED_LEN_BYTE_ARRAY; do not use pa.binary(20)/pa.binary(32))
+#   UINTEGER -> Parquet INT(bitWidth=32, isSigned=false) == pa.uint32()
 _OUTPUT_SCHEMA = pa.schema([
-    pa.field("collateral_token",      pa.binary(20)),
-    pa.field("parent_collection_id",  pa.binary(32)),
-    pa.field("condition_id",          pa.binary(32)),
+    pa.field("collateral_token",      pa.binary()),
+    pa.field("parent_collection_id",  pa.binary()),
+    pa.field("condition_id",          pa.binary()),
     pa.field("index_set",             pa.uint32()),
-    pa.field("token_id",              pa.binary(32)),
+    pa.field("token_id",              pa.binary()),
 ])
 
 console = Console()
@@ -292,11 +296,11 @@ def _process_nr_partition(con: duckdb.DuckDBPyConnection, m_val: int, k_val: int
 def _rows_to_table(rows: list[dict]) -> pa.Table:
     """Build the output Arrow table (works for an empty list too)."""
     return pa.table({
-        "collateral_token": pa.array([r["collateral_token"] for r in rows], type=pa.binary(20)),
-        "parent_collection_id": pa.array([r["parent_collection_id"] for r in rows], type=pa.binary(32)),
-        "condition_id": pa.array([r["condition_id"] for r in rows], type=pa.binary(32)),
+        "collateral_token": pa.array([r["collateral_token"] for r in rows], type=pa.binary()),
+        "parent_collection_id": pa.array([r["parent_collection_id"] for r in rows], type=pa.binary()),
+        "condition_id": pa.array([r["condition_id"] for r in rows], type=pa.binary()),
         "index_set": pa.array([r["index_set"] for r in rows], type=pa.uint32()),
-        "token_id": pa.array([r["token_id"] for r in rows], type=pa.binary(32)),
+        "token_id": pa.array([r["token_id"] for r in rows], type=pa.binary()),
     }, schema=_OUTPUT_SCHEMA)
 
 

@@ -20,6 +20,10 @@ graph TD
 
 **Legend:** blue = raw data, green = derived immutable, orange = derived mutable (regenerated from scratch)
 
+## Data types
+
+Data types are chosen carefully to make joining easy. See the logical Parquet types in `polygon_contract_events` as a starting point. 
+
 ## Raw data
 
 | Dataset | Path | Producer | Mutability | Description | Dictionary | Sort order |
