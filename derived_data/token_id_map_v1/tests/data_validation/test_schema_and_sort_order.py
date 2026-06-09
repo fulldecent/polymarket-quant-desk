@@ -137,10 +137,6 @@ def test_rows_sorted_by_grain_key():
 def test_grain_key_is_globally_unique():
     """Every 4-tuple (collateral_token, parent_collection_id, condition_id, index_set)
     appears exactly once across the entire dataset.
-
-    This test will fail if the dataset was materialized with the old _process_nr_partition
-    code that did not properly deduplicate 4-tuples. To fix: delete the dataset and
-    regenerate with the corrected code.
     """
     out = _output_dir()
     files = _all_data_files(out)
@@ -150,19 +146,60 @@ def test_grain_key_is_globally_unique():
     # Use DuckDB to check uniqueness across all partitions efficiently.
     # Pattern matches exactly 1M=<int>/10K=<int>/data.parquet (validated by _all_data_files).
     glob_pattern = str(out / "1M=*" / "10K=*" / "data.parquet")
-    result = duckdb.query(f"""
+    summary = duckdb.query(f"""
+        WITH grouped AS (
+            SELECT
+                collateral_token,
+                parent_collection_id,
+                condition_id,
+                index_set,
+                COUNT(*) AS c
+            FROM read_parquet('{glob_pattern}')
+            GROUP BY 1, 2, 3, 4
+        )
         SELECT
-            COUNT(*) as total_rows,
-            COUNT(DISTINCT (collateral_token, parent_collection_id, condition_id, index_set)) as distinct_tuples
-        FROM read_parquet('{glob_pattern}')
+            SUM(c) AS total_rows,
+            COUNT(*) AS distinct_tuples,
+            SUM(c) - COUNT(*) AS extra_rows,
+            SUM(CASE WHEN c > 1 THEN 1 ELSE 0 END) AS duplicated_keys
+        FROM grouped
     """).to_df()
 
-    total = result["total_rows"][0]
-    distinct = result["distinct_tuples"][0]
+    total = int(summary["total_rows"][0])
+    distinct = int(summary["distinct_tuples"][0])
+    extra_rows = int(summary["extra_rows"][0])
+    duplicated_keys = int(summary["duplicated_keys"][0])
 
-    assert total == distinct, (
-        f"grain key is not globally unique across dataset: "
-        f"{total} total rows but only {distinct} distinct tuples. "
-        f"Likely cause: dataset was materialized with buggy _process_nr_partition code. "
-        f"Delete {out} and regenerate."
-    )
+    if total != distinct:
+        offenders = duckdb.query(f"""
+            WITH per_file AS (
+                SELECT
+                    filename,
+                    collateral_token,
+                    parent_collection_id,
+                    condition_id,
+                    index_set,
+                    COUNT(*) AS c
+                FROM read_parquet('{glob_pattern}', filename=true)
+                GROUP BY 1, 2, 3, 4, 5
+            )
+            SELECT
+                regexp_replace(filename, '^.*/derived_data/token_id_map_v1/', '') AS partition_file,
+                SUM(c - 1) AS extra_rows,
+                COUNT(*) FILTER (WHERE c > 1) AS duplicated_keys
+            FROM per_file
+            WHERE c > 1
+            GROUP BY 1
+            ORDER BY 1
+            LIMIT 10
+        """).to_df()
+        offender_rows = [
+            f"{row.partition_file} (extra_rows={int(row.extra_rows)}, duplicated_keys={int(row.duplicated_keys)})"
+            for row in offenders.itertuples(index=False)
+        ]
+        assert False, (
+            f"grain key is not globally unique across dataset: "
+            f"{total} total rows, {distinct} distinct tuples, "
+            f"extra_rows={extra_rows}, duplicated_keys={duplicated_keys}. "
+            f"first offending partition files: {offender_rows}"
+        )

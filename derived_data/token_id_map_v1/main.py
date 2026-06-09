@@ -266,6 +266,7 @@ def _process_ct_partition(con: duckdb.DuckDBPyConnection, m_val: int, k_val: int
             "condition_id": t[2],
             "index_set": t[3],
             "token_id": get_position_id(t[0], get_collection_id(t[1], t[2], t[3])).to_bytes(32, "big"),
+            "source": "ct",
         }
         for t in tuples
     ]
@@ -308,6 +309,7 @@ def _process_nr_partition(con: duckdb.DuckDBPyConnection, m_val: int, k_val: int
             "condition_id": cond_bytes,
             "index_set": 1,
             "token_id": bytes(token0),
+            "source": "nr",
         }
         tuples[(USDC_E, ZERO32, cond_bytes, 2)] = {
             "collateral_token": USDC_E,
@@ -315,6 +317,7 @@ def _process_nr_partition(con: duckdb.DuckDBPyConnection, m_val: int, k_val: int
             "condition_id": cond_bytes,
             "index_set": 2,
             "token_id": bytes(token1),
+            "source": "nr",
         }
     return list(tuples.values())
 
@@ -359,26 +362,62 @@ def process_chunk(
     # First-seen filter via a single SQL anti-join against seen_tuples, plus
     # deduplication within this partition.
     if all_rows:
-        con.register("candidates", _rows_to_table(all_rows))
+        con.register("candidates", pa.table({
+            "collateral_token": pa.array([r["collateral_token"] for r in all_rows], type=pa.binary()),
+            "parent_collection_id": pa.array([r["parent_collection_id"] for r in all_rows], type=pa.binary()),
+            "condition_id": pa.array([r["condition_id"] for r in all_rows], type=pa.binary()),
+            "index_set": pa.array([r["index_set"] for r in all_rows], type=pa.uint32()),
+            "token_id": pa.array([r["token_id"] for r in all_rows], type=pa.binary()),
+            "source": pa.array([r["source"] for r in all_rows], type=pa.string()),
+        }))
         new_table = con.execute("""
-            SELECT DISTINCT
-                c.collateral_token,
-                c.parent_collection_id,
-                c.condition_id,
-                c.index_set,
-                c.token_id
-            FROM candidates c
-            LEFT JOIN seen_tuples s
-              ON c.collateral_token = s.collateral_token
-             AND c.parent_collection_id = s.parent_collection_id
-             AND c.condition_id = s.condition_id
-             AND c.index_set = s.index_set
-            WHERE s.condition_id IS NULL
+            WITH filtered AS (
+                SELECT
+                    c.collateral_token,
+                    c.parent_collection_id,
+                    c.condition_id,
+                    c.index_set,
+                    c.token_id,
+                    c.source
+                FROM candidates c
+                LEFT JOIN seen_tuples s
+                  ON c.collateral_token = s.collateral_token
+                 AND c.parent_collection_id = s.parent_collection_id
+                 AND c.condition_id = s.condition_id
+                 AND c.index_set = s.index_set
+                WHERE s.condition_id IS NULL
+            ),
+            ranked AS (
+                SELECT
+                    collateral_token,
+                    parent_collection_id,
+                    condition_id,
+                    index_set,
+                    token_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY collateral_token, parent_collection_id, condition_id, index_set
+                        ORDER BY
+                            CASE source
+                                WHEN 'nr' THEN 0
+                                ELSE 1
+                            END,
+                            token_id
+                    ) AS rn
+                FROM filtered
+            )
+            SELECT
+                collateral_token,
+                parent_collection_id,
+                condition_id,
+                index_set,
+                token_id
+            FROM ranked
+            WHERE rn = 1
             ORDER BY
-                c.collateral_token,
-                c.parent_collection_id,
-                c.condition_id,
-                c.index_set
+                collateral_token,
+                parent_collection_id,
+                condition_id,
+                index_set
         """).fetch_arrow_table().cast(_OUTPUT_SCHEMA)
         con.unregister("candidates")
     else:
