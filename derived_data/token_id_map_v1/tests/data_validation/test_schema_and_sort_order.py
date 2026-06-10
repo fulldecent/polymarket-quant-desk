@@ -30,8 +30,9 @@ _EXPECTED_COLUMNS = [
     "condition_id",
     "index_set",
     "token_id",
+    "market_id",
 ]
-_BLOB_COLUMNS = {"collateral_token", "parent_collection_id", "condition_id", "token_id"}
+_BLOB_COLUMNS = {"collateral_token", "parent_collection_id", "condition_id", "token_id", "market_id"}
 _SORT_KEY = ["collateral_token", "parent_collection_id", "condition_id", "index_set"]
 
 
@@ -267,3 +268,51 @@ def test_token_id_is_globally_unique():
             f"extra_rows={extra_rows}, duplicated_token_ids={duplicated}. "
             f"first offending partition files: {offender_rows}"
         )
+
+
+def test_market_id_mask_invariant():
+    """Every non-null market_id is 32 bytes with its final byte cleared.
+
+    NegRisk market ids are the question id masked with ~0xFF
+    (NegRiskIdLib.getMarketId), so the low byte is always zero. NULL market_id
+    (standard binary / UMA conditions) is allowed.
+    """
+    out = _output_dir()
+    files = _all_data_files(out)
+    if not files:
+        pytest.skip("no data.parquet files found")
+
+    file_list = _duckdb_file_list(files)
+    bad = duckdb.query(f"""
+        SELECT COUNT(*) AS c
+        FROM read_parquet({file_list})
+        WHERE market_id IS NOT NULL
+          AND (octet_length(market_id) <> 32 OR right(lower(hex(market_id)), 2) <> '00')
+    """).to_df()
+    assert int(bad["c"][0]) == 0, (
+        f"{int(bad['c'][0])} rows have a market_id that is not 32 bytes with a zero "
+        f"final byte (NegRiskIdLib mask invariant)"
+    )
+
+
+def test_market_id_functionally_determined_by_condition():
+    """Each condition_id maps to a single market_id value across the dataset."""
+    out = _output_dir()
+    files = _all_data_files(out)
+    if not files:
+        pytest.skip("no data.parquet files found")
+
+    file_list = _duckdb_file_list(files)
+    offenders = duckdb.query(f"""
+        SELECT lower(hex(condition_id)) AS condition_id,
+               COUNT(DISTINCT COALESCE(lower(hex(market_id)), 'NULL')) AS distinct_market_ids
+        FROM read_parquet({file_list})
+        GROUP BY 1
+        HAVING COUNT(DISTINCT COALESCE(lower(hex(market_id)), 'NULL')) > 1
+        ORDER BY 1
+        LIMIT 10
+    """).to_df()
+    assert offenders.empty, (
+        f"condition_id maps to multiple market_id values: "
+        f"{offenders.to_dict(orient='records')}"
+    )

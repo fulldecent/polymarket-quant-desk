@@ -335,3 +335,58 @@ After resolution, we can see redemptions (via the adapter):
   - the `conditionId` identifies the winning outcome's binary condition
   - the `payout` is how much WrappedCollateral (ultimately convertible to USDC.e) they receive
   - winning YES positions redeem 1:1; all NO positions are worthless
+
+## V2 exchange actions (CTFExchangeV2 and NegRiskCtfExchangeV2)
+
+The v2 exchanges (`CTFExchangeV2` at `0xE111180000d2663C0091e4f400237545B87B996B` and `NegRiskCtfExchangeV2` at `0xe2222d279d744050d28e00520010520000310F59`) replace the separate maker/taker asset IDs with a single `tokenId` plus a `side` flag, and they have no FeeModule — the fee in `OrderFilled` is always the final net fee paid, with no refund event.
+
+### Order semantics
+
+Each signed order carries a nominal rate in its `makerAmount` and `takerAmount` fields: "I will give up at most `makerAmount` of my asset and receive at least `takerAmount` of the other." These are the limits the trader authorizes, not the amounts the contract necessarily transfers. The contract computes how much is actually filled (which may be a partial fill) via:
+
+```
+takingAmount = (makingAmount × order.takerAmount) / order.makerAmount
+```
+
+The values emitted in the event reflect only what was actually filled, not the full order size.
+
+### `order_filled` event fields and net amounts
+
+`emit CTFExchangeV2.OrderFilled(bytes32 orderHash, address maker, address taker, uint8 side, uint256 tokenId, uint256 makerAmountFilled, uint256 takerAmountFilled, uint256 fee, bytes32 builder, bytes32 metadata)`
+
+- `side = 0` (BUY): the order maker is buying outcome tokens with USDC
+- `side = 1` (SELL): the order maker is selling outcome tokens for USDC
+- `fee` is always in USDC (the collateral), regardless of side — confirmed by `AssetOperations._transfer`, which routes asset ID `0` to `_transferCollateral` for every fee transfer
+
+The net amounts actually received by each party are:
+
+| side | tokens transferred to maker | USDC transferred to maker |
+|---|---|---|
+| BUY | `takerAmountFilled` tokens received | `makerAmountFilled + fee` USDC sent |
+| SELL | `makerAmountFilled` tokens sent | `takerAmountFilled − fee` USDC received |
+
+In other words, for a BUY order the fee is an additional outflow on top of `makerAmountFilled`, and for a SELL order the fee is deducted from `takerAmountFilled` before the proceeds are remitted.
+
+### Why a symmetric pair of orders produces unequal filled amounts
+
+When Alice (SELL) and Bob (BUY) are a perfectly symmetric complementary match — each the exact mirror of the other at the same price — the nominal USDC value of the trade is the same for both. But the filled amounts in the two `order_filled` rows will differ whenever a fee applies:
+
+**Example:** 10 outcome tokens at $0.50 each = $5 USDC nominal; 10% fee (500 bps) = $0.50 USDC per party.
+
+| event | `maker` | `side` | `makerAmountFilled` | `takerAmountFilled` | `fee` |
+|---|---|---|---|---|---|
+| `order_filled` for Alice | Alice | 1 (SELL) | 10 tokens | 5 USDC | 0.5 USDC |
+| `order_filled` for Bob | Bob | 0 (BUY) | 5 USDC | 10 tokens | 0.5 USDC |
+
+Alice actually receives `5 − 0.5 = 4.5 USDC`. Bob actually sends `5 + 0.5 = 5.5 USDC`. The 1.0 USDC total fee is collected in a separate `fee_charged` transfer. The `makerAmountFilled` on Alice's row (10) equals the `takerAmountFilled` on Bob's row (10) because the token leg is fee-free, but the USDC legs are asymmetric: 5 on Alice's row versus 5 on Bob's row, with both rows carrying a `fee` of 0.5.
+
+A consumer that wants the true economic flow must apply:
+- **net USDC received by a SELL maker** = `takerAmountFilled − fee`
+- **net USDC paid by a BUY maker** = `makerAmountFilled + fee`
+
+### `orders_matched` and `fee_charged`
+
+- `emit CTFExchangeV2.OrdersMatched(...)` — one per `matchOrders` call; aggregates the taker's view (no `fee` field); contains no information not already in the corresponding `order_filled` rows. Track `order_filled`, not `orders_matched`.
+- `emit CTFExchangeV2.FeeCharged(address receiver, uint256 amount)` — one emission per fee-bearing leg (one for each of the maker and the taker when both pay a fee). The `amount` is in USDC. There is no `token_id` field (unlike v1 `FeeCharged`). The sum of all `fee_charged.amount` values in a transaction equals the sum of all `order_filled.fee` values in the same transaction.
+
+Unlike v1, there is no FeeModule and no `fee_refunded` event — the `fee` in each `order_filled` is the final amount collected.

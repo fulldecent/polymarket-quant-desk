@@ -1,12 +1,14 @@
 # token_id_map_v1
 
-Maps `(collateral_token, parent_collection_id, condition_id, index_set)` → `token_id` for all Polymarket-registered conditions.
+Maps `(collateral_token, parent_collection_id, condition_id, index_set)` → `token_id` for every outcome token that trades on a Polymarket exchange, plus an optional `market_id` for NegRisk conditions.
 
 ## Scope
 
-- All conditions registered in `CTFExchange/token_registered` or `NegRiskCtfExchange/token_registered`.
-- CT rows: varying `collateral_token` from `ConditionalTokens/position_split`, `positions_merge`, `payout_redemption`.
-- NR rows: `(resolved_collateral_token, ZERO32, condition, 1/2)`, where the collateral is resolved by matching `token_registered.token0/token1` against position IDs derived from the three known Polymarket collaterals (USDC.e, the NegRisk wrapped collateral, and the v2 base collateral). Exactly one must match, else the producer fails fast. Seven known orphan conditions (no preparation, never traded) whose token pairs match none of the three are skipped.
+A `ConditionalTokens` split/merge is treated as Polymarket-related only when it shares a transaction with an exchange `orders_matched` event (v1 or v2, standard or NegRisk: `CTFExchange`, `CTFExchangeV2`, `NegRiskCtfExchange`, `NegRiskCtfExchangeV2`). Each such `position_split`/`positions_merge` carries the collateral, parent collection, condition, and `partition` (index sets) that fully determine each `token_id`, which is derived with the same `getCollectionId`/`getPositionId` math as the contract (`lib/ct_helpers.py`). NegRisk markets need no special handling because the adapter splits/merges against the wrapped collateral, so the underlying `ConditionalTokens` event already carries the correct collateral. There is no dependency on `token_registered` and no collateral-resolution heuristic.
+
+Both splits and merges are scanned. On-chain a merge always follows a split, but discovery is filtered to *trade-linked* CT operations, and a token's split can be non-trade-linked while its first trade-linked operation is a merge — scanning splits only would miss 10 such 4-tuples across the dataset. See `DATA_DICTIONARY.md` (assumption 2) for details.
+
+`market_id` is resolved per `condition_id` from `ConditionalTokens/condition_preparation`: NegRisk conditions (oracle = NegRiskAdapter) get `market_id = question_id & ~0xFF` (`NegRiskIdLib.getMarketId`); all other conditions get `NULL`.
 
 ## Schema
 
@@ -17,6 +19,7 @@ Maps `(collateral_token, parent_collection_id, condition_id, index_set)` → `to
 | `condition_id` | `BLOB(32)` | CTF condition ID |
 | `index_set` | `UINT32` | Outcome index set (bit position) |
 | `token_id` | `BLOB(32)` | Computed ERC-1155 token ID |
+| `market_id` | `BLOB(32)`, nullable | NegRisk market identifier; `NULL` for standard binary / UMA conditions |
 
 **Grain:** One row per unique 4-tuple. No duplicates.
 

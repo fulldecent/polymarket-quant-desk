@@ -3,7 +3,18 @@
 Materializes the token_id_map_v1 derived table.
 
 Maps (collateral_token, parent_collection_id, condition_id, index_set) → token_id
-for all Polymarket-registered conditions.
+for every outcome token that trades on a Polymarket exchange.
+
+METHOD
+------
+A ConditionalTokens split/merge is treated as Polymarket-related only when it
+shares a transaction with an exchange ``orders_matched`` event (v1 or v2,
+standard or NegRisk). Such a split/merge carries the collateral, parent
+collection, condition, and partition (index sets) that fully determine each
+token_id, so token IDs are derived directly with no collateral-resolution
+heuristic and no dependency on ``token_registered``. Partitions are processed in
+ascending block order; a 4-tuple is materialized in the first 10K partition in
+which it is discovered and suppressed thereafter.
 
 OUTPUT
 ------
@@ -72,8 +83,6 @@ from lib.partition_utils import (
 from lib.atomic_publish import (  # noqa: E402
     create_temp_location,
     publish_atomically,
-    cleanup_old_temp_artifacts,
-    cleanup_on_failure,
     cleanup_temp,
 )
 from raw_data.polygon_contract_events_v3 import get_sunk_frontier, SCRAPE_START_BLOCK  # noqa: E402
@@ -82,39 +91,41 @@ from raw_data.polygon_contract_events_v3 import get_sunk_frontier, SCRAPE_START_
 # constants
 # ============================================================================
 
-ZERO32 = b"\x00" * 32
-ZERO32_HEX = "00" * 32
-USDC_E = bytes.fromhex("2791bca1f2de4661ed88a30c99a7a9449aa84174")
-USDC_E_HEX = "2791bca1f2de4661ed88a30c99a7a9449aa84174"
-
-# Collateral tokens Polymarket uses for CTF position-ID derivation. NR
-# token_registered rows do not carry collateral, so each row's token0/token1 is
-# matched against position IDs derived from exactly these addresses. Native USDC
-# is intentionally excluded: it is not used directly as CTF collateral.
-NR_COLLATERAL_ALLOWLIST = (
-    bytes.fromhex("2791bca1f2de4661ed88a30c99a7a9449aa84174"),  # USDC.e
-    bytes.fromhex("3a3bd7bb9528e159577f7c2e685cc81a765002e2"),  # NegRisk wrapped collateral
-    bytes.fromhex("c011a7e12a19f7b1f670d46f03b03f3342e82dfb"),  # v2 base collateral
+# Exchange orders_matched event tables (v1 + v2, standard + NegRisk). A
+# ConditionalTokens split/merge is treated as Polymarket-related only when it
+# shares a transaction with one of these matches.
+ORDERS_MATCHED_TABLES = (
+    "CTFExchange/orders_matched",
+    "CTFExchangeV2/orders_matched",
+    "NegRiskCtfExchange/orders_matched",
+    "NegRiskCtfExchangeV2/orders_matched",
 )
 
-# NR token_registered emissions whose token pair derives from none of the
-# allowlisted collaterals. Each of these conditions has no usable
-# condition_preparation and never trades on any exchange (v1 or v2), so its
-# collateral cannot be recovered and no consumer needs the mapping. They are
-# enumerated here so the producer skips exactly these and still fails fast on any
-# unexpected new occurrence. Verified to be exactly these 7 across the dataset.
-KNOWN_UNRESOLVABLE_NR_CONDITIONS = frozenset(
-    bytes.fromhex(c)
-    for c in (
-        "56e19c50b8e331920e7d478c86a3b75bfeb8c25ff3983a43c91bb6583c6ada90",
-        "83ab1bdb51a33e8db5ee90e10ec41c257db70bfd934b754bf40a4e38039c0b8c",
-        "dfc651dc0729a0c0ee68b527de751c999feb663fb607f248426b3ba87adc653b",
-        "31aefa5220364f6018345c9669e84121706a110aa08395b6656da66a30a2d5f1",
-        "3681f4dd6cd0c3d7bf1e93a8ea47a089ff449b4804362c3e106f1a0642d70b78",
-        "a20c16b74869ec592c6a59996d086d39ceec761a0ce6ea2f36f3b078a79bc5cd",
-        "3ca6ed50230248a69317dd8b77465029ee5a9a808cbf6e16fd7f36e31b01a0b6",
-    )
+# ConditionalTokens split/merge event tables. Each row carries the collateral,
+# parent collection, condition, and partition (index sets) needed to derive a
+# token_id directly.
+#
+# Both split AND merge are scanned. On-chain, a merge can only burn tokens that a
+# prior split (or NegRisk conversion) minted, so every merged token was split at
+# some point. That does NOT make merges redundant here: discovery is restricted
+# to CT operations that share a transaction with an exchange match ("trade-linked"),
+# and a token's split can be non-trade-linked (e.g. a market maker calling
+# splitPosition directly) while its first trade-linked CT operation is a merge.
+# Empirically, scanning splits only would miss 10 such 4-tuples (5 conditions x
+# index sets 1/2) across the dataset, so merges are required for complete coverage.
+CT_SPLIT_MERGE_TABLES = (
+    "ConditionalTokens/position_split",
+    "ConditionalTokens/positions_merge",
 )
+
+# NegRiskAdapter address (the oracle of every NegRisk condition). When a condition
+# is prepared via NegRiskAdapter.prepareQuestion it calls
+# ctf.prepareCondition(address(this), questionId, 2), so the ConditionalTokens
+# condition_preparation row carries oracle == this address and question_id == the
+# NegRisk questionId. The market_id is then questionId with its final byte cleared
+# (NegRiskIdLib.getMarketId: questionId & ~0xFF). Non-NegRisk (e.g. UMA) conditions
+# have a different oracle and therefore no market_id.
+NEG_RISK_ADAPTER = bytes.fromhex("d91e80cf2e7be2e162c6513ced06f1dd0da35296")
 
 # The first 10K partition Polymarket data can occupy. Every consecutive 10K
 # partition from here up to the frontier is materialized, with no gaps. Even a
@@ -129,12 +140,15 @@ _PARTITION_1M_SIZE = 1_000_000
 #   BLOB  -> Parquet BYTE_ARRAY (no logical type, variable length) == pa.binary()
 #            (NOT FIXED_LEN_BYTE_ARRAY; do not use pa.binary(20)/pa.binary(32))
 #   UINTEGER -> Parquet INT(bitWidth=32, isSigned=false) == pa.uint32()
+# market_id is nullable: it is populated only for NegRisk conditions and is NULL
+# for standard (binary CTF / UMA) conditions.
 _OUTPUT_SCHEMA = pa.schema([
     pa.field("collateral_token",      pa.binary()),
     pa.field("parent_collection_id",  pa.binary()),
     pa.field("condition_id",          pa.binary()),
     pa.field("index_set",             pa.uint32()),
     pa.field("token_id",              pa.binary()),
+    pa.field("market_id",             pa.binary(), nullable=True),
 ])
 
 console = Console()
@@ -235,174 +249,100 @@ def _write_metadata(
 
 
 # ============================================================================
-# token ID computation (only for CT rows with varying collateral)
+# token ID computation and market_id resolution
 # ============================================================================
 
-def _src_path(contract_event: str, m_val: int, k_val: int) -> str | None:
-    p = Path(RAW) / contract_event / partition_dir(k_val) / "data.parquet"
-    if p.exists():
-        return str(p)
-    return None
+def _load_negrisk_market_lookup(con: duckdb.DuckDBPyConnection) -> dict[bytes, bytes]:
+    """Return condition_id -> market_id for every NegRisk condition.
 
-
-def _load_polymarket_conditions(con: duckdb.DuckDBPyConnection) -> None:
-    """Load the set of Polymarket condition_ids from both token_registered tables."""
-    ctf = _src_path("CTFExchange/token_registered", 0, 0)  # glob across all
-    nr = _src_path("NegRiskCtfExchange/token_registered", 0, 0)
-    # Use full glob for the global condition set
-    ctf_glob = f"{RAW}/CTFExchange/token_registered/**/data.parquet"
-    nr_glob = f"{RAW}/NegRiskCtfExchange/token_registered/**/data.parquet"
-    con.execute(f"""
-        CREATE OR REPLACE TEMP TABLE polymarket_conditions AS
-        SELECT DISTINCT condition_id FROM read_parquet('{ctf_glob}')
-        UNION
-        SELECT DISTINCT condition_id FROM read_parquet('{nr_glob}')
-    """)
-
-
-def _resolve_nr_collateral(
-    condition_id: bytes,
-    token0: bytes,
-    token1: bytes,
-    *,
-    k_val: int,
-) -> bytes:
-    """Resolve the collateral backing an NR token pair from the fixed allowlist.
-
-    NR token_registered rows do not carry collateral. Each row's token0/token1 is
-    matched against position IDs derived from the three known Polymarket
-    collaterals. Exactly one must match; anything else is a fatal error.
+    A condition is NegRisk iff its ConditionalTokens condition_preparation row was
+    emitted with oracle == NegRiskAdapter (set at NegRiskAdapter.sol prepareQuestion
+    via ctf.prepareCondition(address(this), questionId, 2)). For those rows the
+    market_id is the registered questionId with its final byte cleared
+    (NegRiskIdLib.getMarketId: questionId & ~0xFF). condition_preparation has exactly
+    one row per condition_id (verified across the dataset), so this is a function.
+    Non-NegRisk conditions are absent from the result and map to NULL market_id.
     """
-    matches: list[bytes] = []
-    for collateral_token in NR_COLLATERAL_ALLOWLIST:
-        expected_token0 = get_position_id(
-            collateral_token,
-            get_collection_id(ZERO32, condition_id, 1),
-        ).to_bytes(32, "big")
-        expected_token1 = get_position_id(
-            collateral_token,
-            get_collection_id(ZERO32, condition_id, 2),
-        ).to_bytes(32, "big")
-        if {expected_token0, expected_token1} == {token0, token1}:
-            matches.append(collateral_token)
-
-    if len(matches) == 1:
-        return matches[0]
-
-    if not matches:
-        raise ValueError(
-            "NR token pair does not match any allowlisted collateral: "
-            f"10K={k_val} condition_id={condition_id.hex()} "
-            f"token0={token0.hex()} token1={token1.hex()} "
-            f"allowlist={[c.hex() for c in NR_COLLATERAL_ALLOWLIST]}"
-        )
-
-    raise ValueError(
-        "NR token pair matches multiple allowlisted collaterals: "
-        f"10K={k_val} condition_id={condition_id.hex()} "
-        f"token0={token0.hex()} token1={token1.hex()} "
-        f"matching_collaterals={[c.hex() for c in matches]}"
-    )
+    glob = f"{RAW}/ConditionalTokens/condition_preparation/**/data.parquet"
+    rows = con.execute(f"""
+        SELECT condition_id, question_id
+        FROM read_parquet('{glob}')
+        WHERE oracle = ?
+    """, [NEG_RISK_ADAPTER]).fetchall()
+    lookup: dict[bytes, bytes] = {}
+    for condition_id, question_id in rows:
+        q = bytes(question_id)
+        # Clear the final byte: market_id = questionId & ~0xFF.
+        lookup[bytes(condition_id)] = q[:31] + b"\x00"
+    return lookup
 
 
-def _process_ct_partition(con: duckdb.DuckDBPyConnection, m_val: int, k_val: int) -> list[dict]:
-    """Extract unique (collateral, parent, condition, index_set) from CT events in this 10K partition."""
-    # Only process if the partition has CT events
-    tables = [
-        ("ConditionalTokens/position_split", "partition"),
-        ("ConditionalTokens/positions_merge", "partition"),
-        ("ConditionalTokens/payout_redemption", "index_sets"),
-    ]
-    tuples: set[tuple[bytes, bytes, bytes, int]] = set()
-    for table, col in tables:
-        path = _src_path(table, m_val, k_val)
-        if not path:
-            continue
-        # Filter to Polymarket conditions and parent = ZERO32 (per assertion)
-        rows = con.execute(f"""
-            SELECT DISTINCT
+def _existing_partition_paths(tables: tuple[str, ...], k_val: int) -> list[str]:
+    """Return the data.parquet paths that exist for these tables in this 10K partition."""
+    paths: list[str] = []
+    for table in tables:
+        p = Path(RAW) / table / partition_dir(k_val) / "data.parquet"
+        if p.exists():
+            paths.append(str(p))
+    return paths
+
+
+def _parquet_list_literal(paths: list[str]) -> str:
+    """Render a DuckDB list literal of single-quoted, escaped file paths."""
+    quoted = ["'" + p.replace("'", "''") + "'" for p in paths]
+    return "[" + ", ".join(quoted) + "]"
+
+
+def _discover_partition_tuples(
+    con: duckdb.DuckDBPyConnection, k_val: int
+) -> list[tuple[bytes, bytes, bytes, int]]:
+    """Discover the token grain tuples introduced by trades in this 10K partition.
+
+    A ConditionalTokens split/merge is Polymarket-related when it shares a
+    transaction with an exchange ``orders_matched`` event (v1 or v2, standard or
+    NegRisk). Both legs live in the same transaction and therefore the same block
+    and partition, so the join is partition-local. Each qualifying split/merge
+    carries the collateral, parent collection, condition, and partition (index
+    sets) that fully determine a token_id. The returned tuples are distinct and
+    not yet filtered against previously seen tuples.
+    """
+    match_paths = _existing_partition_paths(ORDERS_MATCHED_TABLES, k_val)
+    ct_paths = _existing_partition_paths(CT_SPLIT_MERGE_TABLES, k_val)
+    if not match_paths or not ct_paths:
+        return []
+
+    rows = con.execute(f"""
+        WITH match_txs AS (
+            SELECT DISTINCT transaction_hash
+            FROM read_parquet({_parquet_list_literal(match_paths)})
+        ),
+        ct_ops AS (
+            SELECT
                 collateral_token,
                 parent_collection_id,
                 condition_id,
-                CAST(unnest(CAST(json({col}) AS BIGINT[])) AS UINTEGER) AS index_set
-            FROM read_parquet('{path}')
-            WHERE condition_id IN (SELECT condition_id FROM polymarket_conditions)
-              AND parent_collection_id = unhex('{ZERO32_HEX}')
-              AND {col} IS NOT NULL
-        """).fetchall()
-        for r in rows:
-            if r[3] > 0:  # index_set must be > 0
-                tuples.add((bytes(r[0]), bytes(r[1]), bytes(r[2]), int(r[3])))
-    return [
-        {
-            "collateral_token": t[0],
-            "parent_collection_id": t[1],
-            "condition_id": t[2],
-            "index_set": t[3],
-            "token_id": get_position_id(t[0], get_collection_id(t[1], t[2], t[3])).to_bytes(32, "big"),
-            "source": "ct",
-        }
-        for t in tuples
-    ]
-
-
-def _process_nr_partition(con: duckdb.DuckDBPyConnection, m_val: int, k_val: int) -> list[dict]:
-    """Emit NR rows by resolving collateral from raw CT activity for each condition."""
-    path = _src_path("NegRiskCtfExchange/token_registered", m_val, k_val)
-    if not path:
-        return []
-    rows = con.execute(f"""
-        WITH ranked AS (
-            SELECT
-                token0,
-                token1,
-                condition_id,
-                ROW_NUMBER() OVER (
-                    PARTITION BY condition_id
-                    ORDER BY block_number, log_index, transaction_hash
-                ) AS rn
-            FROM read_parquet('{path}')
+                CAST(unnest(CAST(json(partition) AS BIGINT[])) AS UINTEGER) AS index_set
+            FROM read_parquet({_parquet_list_literal(ct_paths)})
+            WHERE transaction_hash IN (SELECT transaction_hash FROM match_txs)
         )
-        SELECT token0, token1, condition_id
-        FROM ranked
-        WHERE rn = 1
+        SELECT DISTINCT collateral_token, parent_collection_id, condition_id, index_set
+        FROM ct_ops
+        WHERE index_set > 0
     """).fetchall()
-    # Deduplicate at the 4-tuple level: use a dict keyed by (collateral, parent, condition, index_set).
-    tuples: dict[tuple[bytes, bytes, bytes, int], dict] = {}
-    for token0, token1, cond in rows:
-        cond_bytes = bytes(cond)
-        # Known orphan registrations: no preparation, never traded, collateral
-        # unrecoverable. Skip exactly these; anything else fails fast in resolve.
-        if cond_bytes in KNOWN_UNRESOLVABLE_NR_CONDITIONS:
-            continue
-        collateral_token = _resolve_nr_collateral(cond_bytes, bytes(token0), bytes(token1), k_val=k_val)
-        tuples[(collateral_token, ZERO32, cond_bytes, 1)] = {
-            "collateral_token": collateral_token,
-            "parent_collection_id": ZERO32,
-            "condition_id": cond_bytes,
-            "index_set": 1,
-            "token_id": bytes(token0),
-            "source": "nr",
-        }
-        tuples[(collateral_token, ZERO32, cond_bytes, 2)] = {
-            "collateral_token": collateral_token,
-            "parent_collection_id": ZERO32,
-            "condition_id": cond_bytes,
-            "index_set": 2,
-            "token_id": bytes(token1),
-            "source": "nr",
-        }
-    return list(tuples.values())
+    return [(bytes(r[0]), bytes(r[1]), bytes(r[2]), int(r[3])) for r in rows]
 
 
-def _rows_to_table(rows: list[dict]) -> pa.Table:
-    """Build the output Arrow table (works for an empty list too)."""
+def _build_output_table(
+    rows: list[tuple[bytes, bytes, bytes, int, bytes, bytes | None]]
+) -> pa.Table:
+    """Build the output Arrow table from grain-sorted rows (valid for an empty list)."""
     return pa.table({
-        "collateral_token": pa.array([r["collateral_token"] for r in rows], type=pa.binary()),
-        "parent_collection_id": pa.array([r["parent_collection_id"] for r in rows], type=pa.binary()),
-        "condition_id": pa.array([r["condition_id"] for r in rows], type=pa.binary()),
-        "index_set": pa.array([r["index_set"] for r in rows], type=pa.uint32()),
-        "token_id": pa.array([r["token_id"] for r in rows], type=pa.binary()),
+        "collateral_token": pa.array([r[0] for r in rows], type=pa.binary()),
+        "parent_collection_id": pa.array([r[1] for r in rows], type=pa.binary()),
+        "condition_id": pa.array([r[2] for r in rows], type=pa.binary()),
+        "index_set": pa.array([r[3] for r in rows], type=pa.uint32()),
+        "token_id": pa.array([r[4] for r in rows], type=pa.binary()),
+        "market_id": pa.array([r[5] for r in rows], type=pa.binary()),
     }, schema=_OUTPUT_SCHEMA)
 
 
@@ -411,9 +351,10 @@ def process_chunk(
     m_val: int,
     k_val: int,
     *,
+    condition_to_market: dict[bytes, bytes],
     log: logging.Logger,
 ) -> tuple[int, dict[str, str]]:
-    """Process one 10K partition: collect unique new tuples, compute token_ids, write atomically.
+    """Process one 10K partition: discover new tuples, compute token_ids, write atomically.
 
     Every partition ALWAYS produces an output (data.parquet + metadata.json), even
     when there are zero new tokens. The first-seen rule suppresses any 4-tuple that
@@ -424,78 +365,53 @@ def process_chunk(
     chunk_dir = Path(OUT_DIR) / partition_dir(k_val)
     chunk_dir.parent.mkdir(parents=True, exist_ok=True)
 
-    # Ensure Polymarket conditions are loaded
-    if "polymarket_conditions" not in [r[0] for r in con.execute("SHOW TABLES").fetchall()]:
-        _load_polymarket_conditions(con)
-
-    ct_rows = _process_ct_partition(con, m_val, k_val)
-    nr_rows = _process_nr_partition(con, m_val, k_val)
-    all_rows = ct_rows + nr_rows
-
-    # First-seen filter via a single SQL anti-join against seen_tuples, plus
-    # deduplication within this partition.
-    if all_rows:
+    # Discover candidate grain tuples from this partition's trade-linked CT ops,
+    # then keep only those not already materialized in an earlier partition. The
+    # SQL ORDER BY yields the rows already sorted by the grain key (byte-wise for
+    # the BLOB columns, numeric for index_set), matching the output sort contract.
+    candidates = _discover_partition_tuples(con, k_val)
+    new_grain: list[tuple[bytes, bytes, bytes, int]] = []
+    if candidates:
         con.register("candidates", pa.table({
-            "collateral_token": pa.array([r["collateral_token"] for r in all_rows], type=pa.binary()),
-            "parent_collection_id": pa.array([r["parent_collection_id"] for r in all_rows], type=pa.binary()),
-            "condition_id": pa.array([r["condition_id"] for r in all_rows], type=pa.binary()),
-            "index_set": pa.array([r["index_set"] for r in all_rows], type=pa.uint32()),
-            "token_id": pa.array([r["token_id"] for r in all_rows], type=pa.binary()),
-            "source": pa.array([r["source"] for r in all_rows], type=pa.string()),
+            "collateral_token": pa.array([c[0] for c in candidates], type=pa.binary()),
+            "parent_collection_id": pa.array([c[1] for c in candidates], type=pa.binary()),
+            "condition_id": pa.array([c[2] for c in candidates], type=pa.binary()),
+            "index_set": pa.array([c[3] for c in candidates], type=pa.uint32()),
         }))
-        new_table = con.execute("""
-            WITH filtered AS (
-                SELECT
-                    c.collateral_token,
-                    c.parent_collection_id,
-                    c.condition_id,
-                    c.index_set,
-                    c.token_id,
-                    c.source
-                FROM candidates c
-                LEFT JOIN seen_tuples s
-                  ON c.collateral_token = s.collateral_token
-                 AND c.parent_collection_id = s.parent_collection_id
-                 AND c.condition_id = s.condition_id
-                 AND c.index_set = s.index_set
-                WHERE s.condition_id IS NULL
-            ),
-            ranked AS (
-                SELECT
-                    collateral_token,
-                    parent_collection_id,
-                    condition_id,
-                    index_set,
-                    token_id,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY collateral_token, parent_collection_id, condition_id, index_set
-                        ORDER BY
-                            CASE source
-                                WHEN 'nr' THEN 0
-                                ELSE 1
-                            END,
-                            token_id
-                    ) AS rn
-                FROM filtered
-            )
+        new_rows = con.execute("""
             SELECT
-                collateral_token,
-                parent_collection_id,
-                condition_id,
-                index_set,
-                token_id
-            FROM ranked
-            WHERE rn = 1
-            ORDER BY
-                collateral_token,
-                parent_collection_id,
-                condition_id,
-                index_set
-        """).fetch_arrow_table().cast(_OUTPUT_SCHEMA)
+                c.collateral_token,
+                c.parent_collection_id,
+                c.condition_id,
+                c.index_set
+            FROM candidates c
+            LEFT JOIN seen_tuples s
+              ON c.collateral_token = s.collateral_token
+             AND c.parent_collection_id = s.parent_collection_id
+             AND c.condition_id = s.condition_id
+             AND c.index_set = s.index_set
+            WHERE s.condition_id IS NULL
+            ORDER BY 1, 2, 3, 4
+        """).fetchall()
         con.unregister("candidates")
-    else:
-        new_table = _rows_to_table([])
+        new_grain = [(bytes(r[0]), bytes(r[1]), bytes(r[2]), int(r[3])) for r in new_rows]
 
+    # Derive the token_id for each new tuple (cached EC math in ct_helpers) and
+    # attach market_id (NULL for non-NegRisk conditions).
+    out_rows = [
+        (
+            collateral,
+            parent,
+            condition,
+            index_set,
+            get_position_id(
+                collateral, get_collection_id(parent, condition, index_set)
+            ).to_bytes(32, "big"),
+            condition_to_market.get(condition),
+        )
+        for (collateral, parent, condition, index_set) in new_grain
+    ]
+    new_table = _build_output_table(out_rows)
     row_count = new_table.num_rows
 
     # Atomic write — ALWAYS, even for zero rows.
@@ -630,6 +546,11 @@ def main() -> None:
     # Load the first-seen set once; process_chunk maintains it incrementally.
     _load_seen_tuples(con)
 
+    # Load the condition_id -> market_id lookup once. Attached to NegRisk rows;
+    # standard conditions get NULL market_id.
+    condition_to_market = _load_negrisk_market_lookup(con)
+    log.info(f"loaded {len(condition_to_market)} NegRisk condition->market mappings")
+
     console.print(
         f"frontier={frontier}  |  total={len(all_partitions):,}  |  "
         f"[green]{len(all_partitions) - len(todo):,} already landed[/green]  |  "
@@ -658,7 +579,7 @@ def main() -> None:
                 log.info("interrupted by user")
                 break
 
-            row_count, _ = process_chunk(con, m_val, k_val, log=log)
+            row_count, _ = process_chunk(con, m_val, k_val, condition_to_market=condition_to_market, log=log)
             processed += 1
             progress.update(task, advance=1)
 
