@@ -86,6 +86,28 @@ These are enforced on-chain and therefore hold for any data that reaches an exch
 
 No other event tables are read.
 
+## Coverage (the approximation and its limits)
+
+This dataset is an **approximation** of "every outcome token a consumer might encounter". The simplification is the trade-linkage filter described under "Scope": a token enters the map only when its `condition_id`/`index_set` is observed in a `ConditionalTokens` split/merge that **shares a transaction with an exchange `orders_matched` event**. We deliberately do not enumerate every token that could theoretically exist (e.g. by hashing every prepared condition × every index set), because the goal is to cover tokens that actually trade.
+
+Measured across the full dataset, coverage of exchange `order_filled` outcome-token legs is:
+
+- **Row-weighted (trade-volume) coverage: ~99.90%** — of ~1.31 billion order-fill outcome-token legs, ~99.90% reference a `token_id` present in the map.
+- **Distinct-token coverage: ~99.39%** — of ~2.01 million distinct outcome tokens ever traded, ~99.39% are present.
+
+The contract is that **both metrics stay above 99%**, asserted by `tests/data_validation/test_exchange_token_coverage.py`. If a future rebuild drops below this, the test fails and a human must investigate.
+
+### What produces a not-covered outcome token
+
+A traded token is absent from the map only when its grain tuple is never observed in a *trade-linked* split/merge. The known scenarios:
+
+1. **No split/merge co-occurs with a trade in the scanned data.** A token can be minted by a `splitPosition` in a transaction that contains no exchange `orders_matched` event (e.g. a market maker splits collateral directly, then later sells), and if every subsequent split/merge for that tuple is likewise non-trade-linked, the tuple is never discovered. (Note: a token whose split is non-trade-linked but whose *merge* is trade-linked **is** covered — that is exactly why both splits and merges are scanned; see assumption 2.)
+2. **Conversions instead of splits/merges.** NegRisk `positions_converted` mints/burns positions without a `ConditionalTokens` split/merge. A token reachable only via conversion (never via a trade-linked split/merge) is not discovered.
+3. **Trades outside the materialized block range.** Discovery only runs up to the frontier; a token whose only trade-linked split/merge falls after the frontier is not yet present (it will appear when later partitions are materialized).
+4. **Off-exchange-only tokens.** Tokens that are split/merged and transferred but never matched on any of the four exchanges are intentionally out of scope; they are not "traded" by this dataset's definition and their absence is expected, not a defect.
+
+These are inherent to the trade-linkage approximation. The >99% coverage guarantee bounds their aggregate impact: the uncovered tokens are a low-volume long tail (the missing ~0.61% of distinct tokens account for only ~0.10% of trades).
+
 ## Versioning
 
 This is `v1`. The producer shall not make a material breaking change to the schema or guarantees without incrementing the version.

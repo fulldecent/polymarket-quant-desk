@@ -34,6 +34,10 @@ source .venv/bin/activate
 python derived_data/token_id_map_v1/main.py [options]
 ```
 
+## Coverage
+
+This map is an approximation: a token is included only when its split/merge shares a transaction with an exchange `orders_matched` event (the "trade-linkage" simplification). We do not enumerate every theoretically derivable token, only the ones that actually trade. Measured across the full dataset, this resolves **~99.90% of order-fill volume** and **~99.39% of distinct traded tokens**. A token is missing only if it is never seen in a trade-linked split/merge — e.g. it is only ever minted via a non-trade-linked `splitPosition`, only via NegRisk `positions_converted`, only traded after the materialized frontier, or never matched on an exchange at all. The >99% guarantee is enforced by `tests/data_validation/test_exchange_token_coverage.py`; see `DATA_DICTIONARY.md` "Coverage" for the full breakdown.
+
 ## How to test
 
 ```sh
