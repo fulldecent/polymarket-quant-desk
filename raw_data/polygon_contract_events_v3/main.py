@@ -73,7 +73,11 @@ from typing import TextIO
 from dotenv import load_dotenv
 
 # Make ``_internal`` importable when run as a script.
+_project_root = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(_project_root))
+
+from lib.git_utils import assert_git_clean  # noqa: E402
 
 from _internal.adaptive_controller import AdaptiveController
 from _internal.errors import (
@@ -169,7 +173,7 @@ _stop_event = threading.Event()
 # Environment loading
 # ---------------------------------------------------------------------------
 
-def _load_environment(*, allow_dirty: bool = False) -> dict[str, str]:
+def _load_environment() -> dict[str, str]:
     """Read every required env var from the root ``.env`` and validate it.
 
     Exits the process with a clear message on any missing or invalid value. The returned dict has
@@ -177,7 +181,7 @@ def _load_environment(*, allow_dirty: bool = False) -> dict[str, str]:
     """
     project_root = Path(__file__).resolve().parent.parent.parent
 
-    _assert_git_clean(project_root, allow_dirty=allow_dirty)
+    assert_git_clean(project_root)
 
     load_dotenv(project_root / ".env")
 
@@ -241,44 +245,6 @@ def _load_environment(*, allow_dirty: bool = False) -> dict[str, str]:
         "max_rps": str(max_rps),
         "temp_dir": temp_dir,
     }
-
-
-def _assert_git_clean(project_root: Path, *, allow_dirty: bool = False) -> None:
-    """Fail fast when the repository has uncommitted changes.
-
-    Metadata embeds ``git_commit``. To keep provenance strict, we refuse to write if the working
-    tree is dirty unless the caller explicitly opts in via ``--run-dirty``.
-    """
-    try:
-        result = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=project_root,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except FileNotFoundError:
-        sys.exit("git executable was not found; cannot verify clean working tree")
-    except subprocess.CalledProcessError as e:
-        sys.exit(f"failed to check git status: {e}")
-
-    lines = [line for line in result.stdout.splitlines() if line.strip()]
-    if lines:
-        if allow_dirty:
-            preview = "\n".join(lines[:20])
-            suffix = "\n..." if len(lines) > 20 else ""
-            print(
-                "WARNING: git working tree is dirty, but --run-dirty was set. Proceeding anyway.\n"
-                f"Dirty entries:\n{preview}{suffix}"
-            )
-            return
-        preview = "\n".join(lines[:20])
-        suffix = "\n..." if len(lines) > 20 else ""
-        sys.exit(
-            "Refusing to start because git working tree is dirty. "
-            "Commit or stash changes first.\n"
-            f"Dirty entries:\n{preview}{suffix}"
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -1013,25 +979,6 @@ def _print_summary(
     loaded = None
     lag = chain_head - SCRAPE_START_BLOCK
     if store is not None:
-        sunk = store.get_sunk_frontier()
-        loaded = store.get_loaded_frontier()
-        summary_lines.append("")
-        summary_lines.append("frontier evidence")
-        summary_lines.append(
-            f"  manifest frontier:   {manifest_frontier:,}"
-            if manifest_frontier >= 0
-            else "  manifest frontier:   none"
-        )
-        summary_lines.append(
-            f"  sunk parquet to:     {sunk:,}"
-            if sunk is not None and sunk > (SCRAPE_START_BLOCK - 1)
-            else "  sunk parquet to:     none"
-        )
-        summary_lines.append(
-            f"  loaded hot frontier:  {loaded:,}" if loaded is not None and loaded >= 0 else "  loaded hot frontier: none"
-        )
-
-    if store is not None:
         hot_db_blocks = sum(
             (to_b - from_b + 1)
             for from_b, to_b, _ in store.list_loaded_ranges(include_sunk=False)
@@ -1105,11 +1052,6 @@ def main() -> None:
         help="concurrent Parquet sink workers (default: 1)",
     )
     parser.add_argument(
-        "--run-dirty",
-        action="store_true",
-        help="allow startup even when git working tree is dirty",
-    )
-    parser.add_argument(
         "--max-calls", type=int, default=None,
         help="stop after this many RPC calls (default: no limit)",
     )
@@ -1128,7 +1070,7 @@ def main() -> None:
     if args.lag_tolerance < 0:
         sys.exit(f"--lag-tolerance must be >= 0; got {args.lag_tolerance}")
 
-    env = _load_environment(allow_dirty=args.run_dirty)
+    env = _load_environment()
     max_block_span = int(env["max_block_span"])
     max_rps = int(env["max_rps"])
 
@@ -1623,12 +1565,16 @@ def main() -> None:
                         chain_head=chain_head,
                     )
 
-                    # Compute how many blocks in this range fall beyond the next sink partition
+                    # Compute how many blocks in this chunk do not contribute to the
+                    # "next: xx.xx%" statistic (i.e., fall outside the next partition).
                     next_partition_start = (
                         (max(sf, SCRAPE_START_BLOCK - 1) + 1) // PARTITION_SIZE_10K
                     ) * PARTITION_SIZE_10K
                     next_partition_end = next_partition_start + PARTITION_SIZE_10K - 1
-                    beyond_blks = max(0, to_b - next_partition_end)
+                    overlap_start = max(from_b, next_partition_start)
+                    overlap_end = min(to_b, next_partition_end)
+                    contributing = max(0, overlap_end - overlap_start + 1)
+                    beyond_blks = chunk_span - contributing
 
                     # Print after persist succeeds
                     _suffix = f" (beyond next: {beyond_blks:,} blks)" if beyond_blks > 0 else ""

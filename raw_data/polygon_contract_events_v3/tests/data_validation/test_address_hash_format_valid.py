@@ -11,13 +11,16 @@ from helpers import glob_complete, glob_all
 
 def _check_blob_len(con, label, source, col, expected_len):
     bad = con.execute(f"""
-        SELECT COUNT(*) AS n
+        SELECT octet_length({col}) AS actual_len, COUNT(*) AS n,
+               hex(MIN({col})) AS sample_hex
         FROM {source}
         WHERE octet_length({col}) != {expected_len}
-    """).fetchone()[0]
-    if bad > 0:
-        return [(label, col, expected_len, bad)]
-    return []
+        GROUP BY actual_len
+        ORDER BY n DESC
+        LIMIT 5
+    """).fetchall()
+    return [(label, col, expected_len, actual_len, n, hex_val)
+            for actual_len, n, hex_val in bad]
 
 
 def test_address_hash_format_valid(con, ranges):
@@ -47,9 +50,10 @@ def test_address_hash_format_valid(con, ranges):
     failures += _check_blob_len(con, "token_registered", tr, "transaction_hash", 32)
 
     assert len(failures) == 0, (
-        f"{len(failures)} column(s) have BLOB length violations: "
-        + "; ".join(
-            f"{t}.{c} expected {elen}B, {n} bad rows"
-            for t, c, elen, n in failures[:5]
+        f"{len(failures)} column(s) have BLOB length violations:\n"
+        + "\n".join(
+            f"  {t}.{c}: expected {elen}B, got {alen}B, {n} row(s), "
+            f"sample={hex_val[:64]}{'...' if len(hex_val) > 64 else ''}"
+            for t, c, elen, alen, n, hex_val in failures
         )
     )

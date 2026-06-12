@@ -57,18 +57,24 @@ _ARRAY_COLUMNS = [
 def test_payout_numerators_length_matches_outcome_slot_count(con):
     """Strong invariant from Gnosis CTF: payouts.length == outcomeSlotCount."""
     src = glob_all("condition_resolution")
-    bad = con.execute(f"""
-        SELECT outcome_slot_count,
-               json_array_length(payout_numerators) AS arr_len,
-               COUNT(*) AS n
-        FROM {src}
-        WHERE payout_numerators IS NULL
-           OR json_array_length(payout_numerators) IS NULL
-           OR json_array_length(payout_numerators) != outcome_slot_count
-        GROUP BY outcome_slot_count, json_array_length(payout_numerators)
-        ORDER BY n DESC
-        LIMIT 5
-    """).fetchall()
+    try:
+        bad = con.execute(f"""
+            SELECT outcome_slot_count,
+                   TRY(json_array_length(payout_numerators)) AS arr_len,
+                   COUNT(*) AS n
+            FROM {src}
+            WHERE payout_numerators IS NULL
+               OR TRY(json_array_length(payout_numerators)) IS NULL
+               OR TRY(json_array_length(payout_numerators)) != outcome_slot_count
+            GROUP BY outcome_slot_count, TRY(json_array_length(payout_numerators))
+            ORDER BY n DESC
+            LIMIT 5
+        """).fetchall()
+    except Exception as e:
+        raise AssertionError(
+            f"Query failed — condition_resolution likely contains rows with "
+            f"malformed payout_numerators (e.g. null bytes or concatenated JSON): {e}"
+        ) from e
     assert not bad, (
         f"{len(bad)} distinct (outcome_slot_count, payout_numerators length) "
         f"pair(s) in condition_resolution violate "
@@ -86,24 +92,34 @@ def test_array_columns_are_valid_json_arrays(con):
     "valid non-NULL JSON array" reduces to ``json_array_length(col) IS
     NOT NULL``.
     """
-    failures: list[tuple[str, str, int]] = []
+    failures: list[tuple[str, str, int, str | None]] = []
     for path, column in _ARRAY_COLUMNS:
         _contract, event = path.split("/", 1)
         # Only check directories that actually exist on disk.
         if path not in EVENT_LOCATIONS.get(event, []):
             continue
         src = f"read_parquet('{RAW}/{path}/**/*.parquet')"
-        bad = con.execute(f"""
-            SELECT COUNT(*)
-            FROM {src}
-            WHERE {column} IS NULL
-               OR json_array_length({column}) IS NULL
-        """).fetchone()
+        try:
+            bad = con.execute(f"""
+                SELECT COUNT(*)
+                FROM {src}
+                WHERE {column} IS NULL
+                   OR TRY(json_array_length({column})) IS NULL
+            """).fetchone()
+        except Exception as e:
+            failures.append((path, column, -1, str(e)))
+            continue
         n = int(bad[0]) if bad else 0
         if n > 0:
-            failures.append((path, column, n))
+            failures.append((path, column, n, None))
+
+    def _fmt(path: str, col: str, n: int, err: str | None) -> str:
+        if err is not None:
+            return f"{path}.{col}: query error — {err}"
+        return f"{path}.{col}: {n} row(s) are NULL or not a valid JSON array"
 
     assert not failures, (
         f"{len(failures)} (path, column) tuple(s) have rows whose value "
-        f"is NULL or not a valid JSON array; offenders: {failures}"
+        f"is NULL or not a valid JSON array:\n"
+        + "\n".join(_fmt(*f) for f in failures)
     )

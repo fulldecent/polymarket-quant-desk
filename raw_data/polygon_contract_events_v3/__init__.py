@@ -5,5 +5,6 @@ Only stable entry points are re-exported here.
 """
 
 from ._internal.parquet_sink import get_sunk_frontier
+from ._internal.tables import SCRAPE_START_BLOCK
 
-__all__ = ["get_sunk_frontier"]
+__all__ = ["get_sunk_frontier", "SCRAPE_START_BLOCK"]

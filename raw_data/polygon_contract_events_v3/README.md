@@ -2,7 +2,7 @@
 
 Scrape raw Polymarket smart contract event logs from Polygon and store them in Parquet files.
 
-Complete data schema is specified in [DATA_DICTIONARY.md](DATA_DICTIONARY.md). Immutability and completeness guarantees are also in there.
+See [DATA_DICTIONARY.md](DATA_DICTIONARY.md) for full schema and guarantees.
 
 ## How to run it
 
@@ -29,7 +29,7 @@ python -m pytest raw_data/polygon_contract_events_v3/tests/data_validation -v
 
 ## Reproducibility
 
-The cold-tier `data.parquet` files are logical-data-stable across independent scrapes. Given the same source data and the same code, a fresh run of the scraper against a different storage location produces files whose bytes match the existing cold tier exactly.
+The cold-tier `data.parquet` files are logical-data-stable across independent scrapes. Given the same source data and the same code, a fresh run of the scraper against a different storage location produces files whose logical contents match the existing cold tier exactly.
 
 ## Deployed contract source code
 
