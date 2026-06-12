@@ -2,7 +2,7 @@
 
 Scrape raw Polymarket smart contract event logs from Polygon and store them in Parquet files.
 
-See [DATA_DICTIONARY.md](DATA_DICTIONARY.md) for full schema, invariants, and immutability guarantees.
+See [DATA_DICTIONARY.md](DATA_DICTIONARY.md) for full schema and guarantees.
 
 ## How to run it
 

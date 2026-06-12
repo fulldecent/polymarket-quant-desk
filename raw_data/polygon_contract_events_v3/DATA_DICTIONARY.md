@@ -524,11 +524,11 @@ Solidity event: `QuestionEmergencyResolved(bytes32 indexed questionId, uint256[]
 
 ---
 
-## Assertions
+## Guarantees and validation
 
-The `tests/data_validation/` folder contains pytest-style checks that run against the on-disk parquet. Each one enforces a specific property of the data. Together they are the executable companion to this dictionary. Every assertion below lists the scope it covers — "every contract", "v1 exchanges only", "NegRiskAdapter only", etc. — so producer and consumer can agree on exactly what is and is not checked.
+The `tests/data_validation/` folder contains pytest-style checks that run against the on-disk parquet. Each guarantee below links to its validation script and states scope so producer and consumer can agree on exactly what is and is not checked.
 
-Most assertions written before the v2 exchanges existed reference columns (`maker_asset_id`, `taker_asset_id`, v1 `fee_charged.token_id`) that the v2 exchanges do not emit; those assertions are scoped to the v1 exchanges (`CTFExchange`, `NegRiskCtfExchange`) only.
+Most guarantees written before the v2 exchanges existed reference columns (`maker_asset_id`, `taker_asset_id`, v1 `fee_charged.token_id`) that the v2 exchanges do not emit; those guarantees are scoped to the v1 exchanges (`CTFExchange`, `NegRiskCtfExchange`) only.
 
 ### Row identity (every contract, every event)
 

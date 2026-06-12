@@ -143,11 +143,11 @@ _PARTITION_1M_SIZE = 1_000_000
 # market_id is nullable: it is populated only for NegRisk conditions and is NULL
 # for standard (binary CTF / UMA) conditions.
 _OUTPUT_SCHEMA = pa.schema([
+    pa.field("token_id",              pa.binary()),
     pa.field("collateral_token",      pa.binary()),
     pa.field("parent_collection_id",  pa.binary()),
     pa.field("condition_id",          pa.binary()),
     pa.field("index_set",             pa.uint32()),
-    pa.field("token_id",              pa.binary()),
     pa.field("market_id",             pa.binary(), nullable=True),
 ])
 
@@ -333,15 +333,15 @@ def _discover_partition_tuples(
 
 
 def _build_output_table(
-    rows: list[tuple[bytes, bytes, bytes, int, bytes, bytes | None]]
+    rows: list[tuple[bytes, bytes, bytes, bytes, int, bytes | None]]
 ) -> pa.Table:
     """Build the output Arrow table from grain-sorted rows (valid for an empty list)."""
     return pa.table({
-        "collateral_token": pa.array([r[0] for r in rows], type=pa.binary()),
-        "parent_collection_id": pa.array([r[1] for r in rows], type=pa.binary()),
-        "condition_id": pa.array([r[2] for r in rows], type=pa.binary()),
-        "index_set": pa.array([r[3] for r in rows], type=pa.uint32()),
-        "token_id": pa.array([r[4] for r in rows], type=pa.binary()),
+        "token_id": pa.array([r[0] for r in rows], type=pa.binary()),
+        "collateral_token": pa.array([r[1] for r in rows], type=pa.binary()),
+        "parent_collection_id": pa.array([r[2] for r in rows], type=pa.binary()),
+        "condition_id": pa.array([r[3] for r in rows], type=pa.binary()),
+        "index_set": pa.array([r[4] for r in rows], type=pa.uint32()),
         "market_id": pa.array([r[5] for r in rows], type=pa.binary()),
     }, schema=_OUTPUT_SCHEMA)
 
@@ -366,9 +366,7 @@ def process_chunk(
     chunk_dir.parent.mkdir(parents=True, exist_ok=True)
 
     # Discover candidate grain tuples from this partition's trade-linked CT ops,
-    # then keep only those not already materialized in an earlier partition. The
-    # SQL ORDER BY yields the rows already sorted by the grain key (byte-wise for
-    # the BLOB columns, numeric for index_set), matching the output sort contract.
+    # then keep only those not already materialized in an earlier partition.
     candidates = _discover_partition_tuples(con, k_val)
     new_grain: list[tuple[bytes, bytes, bytes, int]] = []
     if candidates:
@@ -391,7 +389,6 @@ def process_chunk(
              AND c.condition_id = s.condition_id
              AND c.index_set = s.index_set
             WHERE s.condition_id IS NULL
-            ORDER BY 1, 2, 3, 4
         """).fetchall()
         con.unregister("candidates")
         new_grain = [(bytes(r[0]), bytes(r[1]), bytes(r[2]), int(r[3])) for r in new_rows]
@@ -400,17 +397,19 @@ def process_chunk(
     # attach market_id (NULL for non-NegRisk conditions).
     out_rows = [
         (
+            get_position_id(
+                collateral, get_collection_id(parent, condition, index_set)
+            ).to_bytes(32, "big"),
             collateral,
             parent,
             condition,
             index_set,
-            get_position_id(
-                collateral, get_collection_id(parent, condition, index_set)
-            ).to_bytes(32, "big"),
             condition_to_market.get(condition),
         )
         for (collateral, parent, condition, index_set) in new_grain
     ]
+    # Output contract: rows are sorted ascending by token_id.
+    out_rows.sort(key=lambda row: row[0])
     new_table = _build_output_table(out_rows)
     row_count = new_table.num_rows
 

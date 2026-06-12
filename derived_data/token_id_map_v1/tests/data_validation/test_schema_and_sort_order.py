@@ -7,9 +7,8 @@ Two contracts from DATA_DICTIONARY.md:
    ``BYTE_ARRAY``, no logical type — NOT ``FIXED_LEN_BYTE_ARRAY``) and
    ``index_set`` is ``UINTEGER`` (``INT(bitWidth=32, isSigned=false)``).
 
-2. Within each partition file, rows are sorted ascending by the grain key
-   ``(collateral_token, parent_collection_id, condition_id, index_set)``. This
-   total order is required for byte-for-byte reproducibility.
+2. Within each partition file, rows are sorted ascending by ``token_id``
+    (byte-wise). This total order is required for byte-for-byte reproducibility.
 """
 import os
 import sys
@@ -25,15 +24,17 @@ load_dotenv(_project_root / ".env")
 sys.path.insert(0, str(_project_root))
 
 _EXPECTED_COLUMNS = [
+    "token_id",
     "collateral_token",
     "parent_collection_id",
     "condition_id",
     "index_set",
-    "token_id",
     "market_id",
 ]
 _BLOB_COLUMNS = {"collateral_token", "parent_collection_id", "condition_id", "token_id", "market_id"}
-_SORT_KEY = ["collateral_token", "parent_collection_id", "condition_id", "index_set"]
+_SORT_KEY = ["token_id"]
+_ZERO32_HEX = "00" * 32
+_NEGRISK_ADAPTER_HEX = "d91E80cF2E7be2e162c6513ceD06f1dD0dA35296".lower().removeprefix("0x")
 
 
 def _output_dir() -> Path:
@@ -84,6 +85,16 @@ def _all_data_files(out: Path) -> list[Path]:
     return sorted(files)
 
 
+def _raw_dir() -> Path:
+    val = os.environ.get("POLYGON_CONTRACT_EVENTS_V3_DIR", "")
+    if not val:
+        pytest.skip("POLYGON_CONTRACT_EVENTS_V3_DIR is not set")
+    raw = Path(val)
+    if not raw.exists():
+        pytest.skip(f"POLYGON_CONTRACT_EVENTS_V3_DIR does not exist: {raw}")
+    return raw
+
+
 def _duckdb_file_list(files: list[Path]) -> str:
     """Return a DuckDB SQL list literal for the exact landed data files."""
     quoted = [f"'{str(path).replace("'", "''")}'" for path in files]
@@ -120,8 +131,8 @@ def test_physical_types_match_raw_dataset():
     )
 
 
-def test_rows_sorted_by_grain_key():
-    """Every partition file's rows are ascending by the grain key."""
+def test_rows_sorted_by_token_id():
+    """Every partition file's rows are ascending by token_id."""
     out = _output_dir()
     files = _all_data_files(out)
     if not files:
@@ -132,13 +143,12 @@ def test_rows_sorted_by_grain_key():
         table = pq.read_table(f, columns=_SORT_KEY)
         if table.num_rows < 2:
             continue
-        rows = list(zip(*[table.column(c).to_pylist() for c in _SORT_KEY]))
-        # bytes compare byte-wise; ints compare numerically; tuple order matches the contract
-        if rows != sorted(rows):
+        token_ids = table.column("token_id").to_pylist()
+        if token_ids != sorted(token_ids):
             offenders.append(str(f.relative_to(out)))
             if len(offenders) >= 10:
                 break
-    assert not offenders, f"partitions not sorted by grain key: {offenders}"
+    assert not offenders, f"partitions not sorted by token_id: {offenders}"
 
 
 def test_grain_key_is_globally_unique():
@@ -209,6 +219,42 @@ def test_grain_key_is_globally_unique():
             f"extra_rows={extra_rows}, duplicated_keys={duplicated_keys}. "
             f"first offending partition files: {offender_rows}"
         )
+
+
+def test_parent_collection_id_is_zero32_everywhere():
+    """Every row has parent_collection_id = ZERO32."""
+    out = _output_dir()
+    files = _all_data_files(out)
+    if not files:
+        pytest.skip("no data.parquet files found")
+
+    file_list = _duckdb_file_list(files)
+    bad = duckdb.query(f"""
+        SELECT COUNT(*) AS c
+        FROM read_parquet({file_list})
+        WHERE parent_collection_id <> unhex('{_ZERO32_HEX}')
+    """).to_df()
+    assert int(bad["c"][0]) == 0, (
+        f"{int(bad['c'][0])} rows have parent_collection_id != ZERO32"
+    )
+
+
+def test_index_set_is_strictly_positive_everywhere():
+    """Every row has index_set > 0."""
+    out = _output_dir()
+    files = _all_data_files(out)
+    if not files:
+        pytest.skip("no data.parquet files found")
+
+    file_list = _duckdb_file_list(files)
+    bad = duckdb.query(f"""
+        SELECT COUNT(*) AS c
+        FROM read_parquet({file_list})
+        WHERE index_set <= 0
+    """).to_df()
+    assert int(bad["c"][0]) == 0, (
+        f"{int(bad['c'][0])} rows have index_set <= 0"
+    )
 
 
 def test_token_id_is_globally_unique():
@@ -315,4 +361,63 @@ def test_market_id_functionally_determined_by_condition():
     assert offenders.empty, (
         f"condition_id maps to multiple market_id values: "
         f"{offenders.to_dict(orient='records')}"
+    )
+
+
+def test_market_id_is_null_iff_condition_is_non_negrisk():
+    """market_id is populated if and only if condition oracle is NegRiskAdapter."""
+    out = _output_dir()
+    raw = _raw_dir()
+    files = _all_data_files(out)
+    if not files:
+        pytest.skip("no data.parquet files found")
+
+    file_list = _duckdb_file_list(files)
+    prep_glob = str(raw / "ConditionalTokens" / "condition_preparation" / "**" / "data.parquet")
+
+    inconsistent_oracle = duckdb.query(f"""
+        SELECT COUNT(*) AS c
+        FROM (
+            SELECT
+                condition_id,
+                COUNT(DISTINCT lower(hex(oracle))) AS oracle_count
+            FROM read_parquet('{prep_glob}')
+            GROUP BY 1
+        )
+        WHERE oracle_count > 1
+    """).to_df()
+    assert int(inconsistent_oracle["c"][0]) == 0, (
+        f"{int(inconsistent_oracle['c'][0])} condition_id values map to multiple oracle addresses"
+    )
+
+    summary = duckdb.query(f"""
+        WITH prep AS (
+            SELECT
+                condition_id,
+                lower(hex(any_value(oracle))) AS oracle_hex
+            FROM read_parquet('{prep_glob}')
+            GROUP BY 1
+        ),
+        joined AS (
+            SELECT m.condition_id, m.market_id, p.oracle_hex
+            FROM read_parquet({file_list}) AS m
+            LEFT JOIN prep AS p USING (condition_id)
+        )
+        SELECT
+            COUNT(*) FILTER (WHERE oracle_hex IS NULL) AS missing_preparation_rows,
+            COUNT(*) FILTER (
+                WHERE (oracle_hex = '{_NEGRISK_ADAPTER_HEX}' AND market_id IS NULL)
+                   OR (oracle_hex <> '{_NEGRISK_ADAPTER_HEX}' AND market_id IS NOT NULL)
+            ) AS mismatched_market_id_rows
+        FROM joined
+    """).to_df()
+
+    missing_prep = int(summary["missing_preparation_rows"][0])
+    mismatched = int(summary["mismatched_market_id_rows"][0])
+
+    assert missing_prep == 0, (
+        f"{missing_prep} map rows reference condition_id values missing from condition_preparation"
+    )
+    assert mismatched == 0, (
+        f"{mismatched} map rows violate the market_id nullability invariant by oracle"
     )
