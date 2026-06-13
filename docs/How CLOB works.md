@@ -19,8 +19,6 @@ Unanswered questions (we could answer these with analysis of the source code or 
 
 **Here is the precise, mathematically accurate explanation:**
 
----
-
 **When you enter “Buy $25 of YES” on the Polymarket website:**
 
 1. The website immediately calculates the **largest integer number of tokens** *N* such that buying *N* tokens at the current best ask price (or your chosen worst acceptable price) would cost **≤ $25**.

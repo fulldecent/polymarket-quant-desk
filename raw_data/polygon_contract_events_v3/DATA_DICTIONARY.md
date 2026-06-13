@@ -75,10 +75,6 @@ The folder existing with the lexicographically highest pattern `manifests/1M={N}
 - Some fills  on CTFExchange occur after condition resolution, this is an off-chain invariant the contracts do not enforce — exactly 54 such cases are known and tolerated (see [test_no_trading_after_resolution](tests/data_validation/test_no_trading_after_resolution.py)).
 - **Not included in this dataset:** ERC-20 token transfers (USDC.e and other tokens), ERC-1155 outcome-token transfers from `ConditionalTokens` (`TransferSingle` / `TransferBatch`), proxy-wallet creation/management events, generic NegRisk wrapped-collateral transfers, and any events from contracts not listed in the [Contracts](#contracts) table. These flows are relevant to the Polymarket ecosystem but live outside the events scraped here.
 
-## Versioning
-
-The specifications and guarantees in this document are versioned as `v3`. The producer shall not make a material breaking change to any specification or guarantee in this document and call the result `v3`. We would use good judgement before considering any breaking change as not "material" and would coordinate with known consumers before doing that.
-
 ## Schema common columns
 
 All tables share these four columns, in this order, **before any event-specific columns**. The ordering is part of the contract — both the four common columns and the event-specific columns that follow appear in the order documented here.
@@ -93,8 +89,6 @@ All tables share these four columns, in this order, **before any event-specific 
 The emitting contract address is **not** stored as a column — it is implicit from the directory path (e.g., `CTFExchange/order_filled/`).
 
 The partition values (`1M=…`, `10K=…`) are encoded in the directory path. They **must not appear as columns inside the Parquet file** — they are Hive-style partition keys, not data.
-
----
 
 ## Contracts
 
@@ -111,8 +105,6 @@ Each contract has a `deployment_block`, specified below, and it has no events be
 | UmaCtfAdapter | `0x157Ce2d672854c848c9b79C49a8Cc6cc89176a49` | `UmaCtfAdapter/` | 33,605,574 | UMA oracle integration for market resolution |
 | FeeModuleCTF | `0xE3f18aCc55091e2c48d883fc8C8413319d4Ab7b0` | `FeeModuleCTF/` | 75,253,526 | Fee refund module for CTFExchange |
 | FeeModuleNegRisk | `0xB768891e3130F6dF18214Ac804d4DB76c2C37730` | `FeeModuleNegRisk/` | 75,253,721 | Fee refund module for NegRiskCtfExchange |
-
----
 
 ## Events by contract
 
@@ -196,8 +188,6 @@ Solidity event: `PayoutRedemption(address indexed redeemer, IERC20 indexed colla
 | `index_sets` | `STRING` | JSON array of uint256 decimal strings — outcome index sets being redeemed. May be the empty array `[]` (a no-op redeem call with no index sets); this is a valid value, not an error. |
 | `payout` | `STRING` | uint256 decimal string — total collateral returned, in raw token units |
 
----
-
 ### CTFExchange / NegRiskCtfExchange
 
 These two contracts emit identical event signatures. Data is stored in separate directories: `CTFExchange/` for binary markets, `NegRiskCtfExchange/` for NegRisk markets.
@@ -270,8 +260,6 @@ Solidity event: `OrderCancelled(bytes32 indexed orderHash)`
 |---|---|---|
 | `order_hash` | `"BLOB"` (32 bytes) | The cancelled order identifier |
 
----
-
 ### CTFExchangeV2 / NegRiskCtfExchangeV2
 
 Next-generation versions of the exchanges. The event schema differs from the v1 exchanges: fills carry a single `token_id` plus a `side` flag (instead of separate maker/taker asset IDs), there is no `token_id` on `fee_charged`, there are no `token_registered` or `order_cancelled` events, and orders can be pre-approved on-chain.
@@ -333,8 +321,6 @@ Solidity event: `OrderPreapprovalInvalidated(bytes32 indexed orderHash)`
 |---|---|---|
 | `order_hash` | `"BLOB"` (32 bytes) | The order whose pre-approval was invalidated |
 
----
-
 ### FeeModuleCTF / FeeModuleNegRisk
 
 These contracts pair 1:1 with their corresponding v1 exchange (FeeModuleCTF ↔ CTFExchange, FeeModuleNegRisk ↔ NegRiskCtfExchange). The v2 exchanges do not have a FeeModule; fills on `CTFExchangeV2` / `NegRiskCtfExchangeV2` have no corresponding `fee_refunded` row.
@@ -354,8 +340,6 @@ Solidity event: `FeeRefunded(bytes32 indexed orderHash, address indexed to, uint
 | `fee_charged` | `STRING` | uint256 decimal string — net fee retained by the protocol, in raw token units |
 
 Invariant: `refund + fee_charged = order_filled.fee` for the corresponding v1 fill.
-
----
 
 ### NegRiskAdapter
 
@@ -441,8 +425,6 @@ Solidity event: `PayoutRedemption(address indexed redeemer, bytes32 indexed cond
 | `amounts` | `STRING` | JSON array of uint256 decimal strings — amounts per outcome |
 | `payout` | `STRING` | uint256 decimal string — total collateral returned, in raw token units |
 
----
-
 ### UmaCtfAdapter
 
 UMA oracle integration for market resolution. `UmaCtfAdapter.question_id` is the same `bytes32` value as `ConditionalTokens/condition_preparation.question_id`: a consumer joins UMA events to CTF conditions on `question_id`, and from there to outcome tokens via `CTFExchange/token_registered.condition_id` (or `NegRiskCtfExchange/token_registered.condition_id`).
@@ -522,8 +504,6 @@ Solidity event: `QuestionEmergencyResolved(bytes32 indexed questionId, uint256[]
 | `question_id` | `"BLOB"` (32 bytes) | The question resolved |
 | `payouts` | `STRING` | JSON array of uint256 decimal strings — payout per outcome |
 
----
-
 ## Guarantees and validation
 
 The `tests/data_validation/` folder contains pytest-style checks that run against the on-disk parquet. Each guarantee below links to its validation script and states scope so producer and consumer can agree on exactly what is and is not checked.
@@ -600,3 +580,7 @@ Not exchange-specific.
 
 - [test_fee_reconciliation_per_tx](tests/data_validation/test_fee_reconciliation_per_tx.py) — `SUM(order_filled.fee) = SUM(fee_charged.amount)` per transaction. **Scope:** v1 exchanges only (`CTFExchange/{order_filled, fee_charged}`, `NegRiskCtfExchange/{order_filled, fee_charged}`); v2 `fee_charged` lacks `token_id` and has not been ported.
 - [test_fee_refunded_known_transactions](tests/data_validation/test_fee_refunded_known_transactions.py) — two known transactions have the expected `fee_refunded` rows with `refund + fee_charged = gross fee` totals. **Scope:** `FeeModuleCTF/fee_refunded`, `FeeModuleNegRisk/fee_refunded`, `CTFExchange/order_filled`, `NegRiskCtfExchange/order_filled` (fee modules apply only to v1 fills).
+
+## Versioning
+
+This is `v3`. The producer shall not make a material breaking change to the schema or guarantees without incrementing the version.

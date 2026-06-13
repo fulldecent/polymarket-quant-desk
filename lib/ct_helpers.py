@@ -129,72 +129,18 @@ def get_position_id(collateral_token: bytes, collection_id: bytes) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Hex-string convenience wrappers
-# ---------------------------------------------------------------------------
-
-def get_collection_id_hex(
-    parent_collection_id_hex: str, condition_id_hex: str, index_set: int
-) -> str:
-    """Same as get_collection_id but accepts/returns 0x-prefixed hex strings."""
-    result = get_collection_id(
-        bytes.fromhex(parent_collection_id_hex.removeprefix("0x")),
-        bytes.fromhex(condition_id_hex.removeprefix("0x")),
-        index_set,
-    )
-    return "0x" + result.hex()
-
-
-def get_position_id_hex(
-    collateral_token_hex: str, collection_id_hex: str
-) -> int:
-    """Same as get_position_id but accepts 0x-prefixed hex strings."""
-    return get_position_id(
-        bytes.fromhex(collateral_token_hex.removeprefix("0x")),
-        bytes.fromhex(collection_id_hex.removeprefix("0x")),
-    )
-
-
-import functools
-
-
-def token_id_from_condition(
-    collateral_token_hex: str,
-    parent_collection_id_hex: str,
-    condition_id_hex: str,
-    index_set: int,
-) -> int:
-    """
-    End-to-end: compute the ERC-1155 token ID for one outcome of a condition.
-
-    This is the composition: getPositionId(collateral, getCollectionId(...)).
-    Results are cached — the ECC math only runs once per unique input tuple.
-    """
-    return _token_id_from_condition_cached(
-        collateral_token_hex, parent_collection_id_hex, condition_id_hex, index_set
-    )
-
-
-@functools.lru_cache(maxsize=None)
-def _token_id_from_condition_cached(
-    collateral_token_hex: str,
-    parent_collection_id_hex: str,
-    condition_id_hex: str,
-    index_set: int,
-) -> int:
-    coll = get_collection_id_hex(
-        parent_collection_id_hex, condition_id_hex, index_set
-    )
-    return get_position_id_hex(collateral_token_hex, coll)
-
-
-# ---------------------------------------------------------------------------
 # Self-test against known Polymarket values
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    CONDITION = "0x9c930ccdce11158a4de95a3f3f5e9da8aa9176784a8082202c81e2a0a2c0253e"
-    COLLATERAL = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
-    PARENT = "0x" + "00" * 32
+    # Test vectors are written as hex literals only for readability; the API
+    # operates on raw bytes, matching the variable-length BYTE_ARRAY columns in
+    # polygon_contract_events_v3 (no 0x prefix anywhere in the data model).
+    CONDITION = bytes.fromhex(
+        "9c930ccdce11158a4de95a3f3f5e9da8aa9176784a8082202c81e2a0a2c0253e"
+    )
+    COLLATERAL = bytes.fromhex("2791bca1f2de4661ed88a30c99a7a9449aa84174")
+    PARENT = bytes(32)
 
     EXPECTED = {
         1: 47756312234909391864093638304641104786505078015591144731389023729388049333957,
@@ -203,7 +149,7 @@ if __name__ == "__main__":
 
     ok = True
     for idx_set, expected_tid in EXPECTED.items():
-        tid = token_id_from_condition(COLLATERAL, PARENT, CONDITION, idx_set)
+        tid = get_position_id(COLLATERAL, get_collection_id(PARENT, CONDITION, idx_set))
         status = "PASS" if tid == expected_tid else "FAIL"
         if tid != expected_tid:
             ok = False

@@ -39,9 +39,9 @@ Partition discovery for a derived dataset is by BLOCK RANGE, not by source-folde
 
 Every partition becomes visible atomically.
 
-- Write `data.parquet` and `metadata.json` into a temp location (`create_temp_location`), then publish with `publish_atomically(temp, allow_overwrite=False)`. On any failure, `cleanup_temp(temp)` and re-raise.
+- Write `data.parquet` and `metadata.json` into a temp location (`create_temp_location`), then publish with `publish_atomically(temp)`. On any failure, `cleanup_temp(temp)` and re-raise.
 - Folder visibility therefore implies completeness: readers and planners may rely on "folder exists" meaning "partition is complete and immutable".
-- `publish_atomically` must never overwrite an existing final path. A `FileExistsError` there means something tried to violate immutability.
+- `publish_atomically` never overwrites an existing final path — there is no opt-out. A `FileExistsError` there means something tried to violate immutability.
 
 ## Logical types
 
@@ -85,7 +85,7 @@ Producers are long-running and must be observable (see also `.github/copilot-ins
 
 ## Adding a derived dataset (checklist)
 
-1. Add a row to `docs/data_catalog.md` (Producer, Mutability, Inputs, Dictionary, Sort order).
+1. Add a row to [`docs/Data catalog.md`](../../docs/Data%20catalog.md) (Producer, Mutability, Inputs, Dictionary, Sort order).
 2. Write `DATA_DICTIONARY.md` next to the producer: scope, grain, schema with logical types, physical sort order, partitioning, guarantees, sources.
 3. Implement the producer to satisfy every Absolute directive above.
 4. Add data-validation tests that assert: start partition present; consecutive coverage with no gaps; each partition has `data.parquet` + `metadata.json`; physical Parquet types match this policy; rows sorted per the declared order.

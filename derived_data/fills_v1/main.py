@@ -1,0 +1,648 @@
+#!/usr/bin/env python3
+"""
+Materializes the fills_v1 derived table.
+
+One row per account leg of every matched fill on the four Polymarket exchanges
+(CTFExchange, NegRiskCtfExchange = "v1"; CTFExchangeV2, NegRiskCtfExchangeV2 =
+"v2"), enriched with the condition (and NegRisk market) the outcome token
+belongs to and a running per-account YES position.
+
+EVENT MODEL (verified empirically against the raw data)
+-------------------------------------------------------
+Each on-chain ``matchOrders`` call emits, in log order within its transaction:
+
+    [maker OrderFilled] x N   (taker field = the real taker account)
+    [taker OrderFilled]       (taker field = the exchange address)
+    [OrdersMatched]
+
+So every ``order_filled`` row maps to exactly one fills_v1 leg:
+
+* maker legs  -> the N maker OrderFilled rows (account = ``maker``), is_taker = FALSE
+* taker leg   -> the single taker-self OrderFilled (taker == exchange address),
+                 account = ``maker`` (which is the real taker), is_taker = TRUE
+
+The taker-self row natively carries the taker's own fee, so we do not need
+``orders_matched`` at all. A maker leg's atomic match is the next taker-self
+OrderFilled at a higher log_index in the same transaction (the match segment ends
+with the taker-self fill); that taker-self order_hash is the match key.
+
+BUY/SELL and the USDC side
+--------------------------
+* v1: ``maker_asset_id == ZERO32`` means the order's signer sent USDC (a BUY of
+  the outcome token); otherwise the signer sent the outcome token (a SELL).
+* v2: ``side == 0`` is BUY, ``side == 1`` is SELL.
+
+The fee is always charged on the asset the signer RECEIVES: a BUY receives
+outcome tokens (token-denominated fee), a SELL receives USDC (USDC-denominated
+fee). ``fee_usdc`` reports only the USDC-denominated fees; token-denominated
+(buy-side) fees are not converted and contribute 0 (see DATA_DICTIONARY.md).
+
+OUTCOME CONVENTION (YES = index_set 1, NO = index_set 2)
+--------------------------------------------------------
+Per Polymarket's CTF documentation
+(https://github.com/Polymarket/agent-skills/blob/main/ctf-operations.md:
+"partition [1, 2] for binary (Yes=1, No=2)"), the YES outcome is index_set 1 and
+NO is index_set 2. ``net_yes_tokens`` expresses every leg in YES-equivalent
+terms. The producer fails fast if any traded token has index_set outside {1, 2}.
+
+OUTPUT
+------
+Partitioned parquet at:
+
+    {FILLS_V1_DIR}/1M={N}/10K={K}/data.parquet
+    {FILLS_V1_DIR}/1M={N}/10K={K}/metadata.json
+
+See DATA_DICTIONARY.md for the full schema and invariant documentation.
+
+REQUIRED ENV VARS
+-----------------
+    POLYGON_CONTRACT_EVENTS_V3_DIR   root of raw {contract}/{event}/... parquet
+    TOKEN_ID_MAP_V1_DIR              token_id -> (condition_id, index_set, market_id)
+    FILLS_V1_DIR                     output directory
+    TEMP_DIR                         DuckDB spill directory
+
+USAGE
+-----
+    python derived_data/fills_v1/main.py [options]
+
+    --dry-run       print the work plan without writing any data
+    --sample N      process only the first N incomplete partitions
+"""
+
+import argparse
+import logging
+import signal
+import sys
+import threading
+import time
+from pathlib import Path
+
+import duckdb
+from dotenv import load_dotenv
+from rich.console import Console
+
+_project_root = Path(__file__).resolve().parent.parent.parent
+load_dotenv(_project_root / ".env")
+
+sys.path.insert(0, str(_project_root))
+from lib.env import require_env  # noqa: E402
+from lib.git_utils import assert_git_clean  # noqa: E402
+from lib.metadata_utils import create_parquet_metadata_json, parquet_content_hash  # noqa: E402
+from lib.partition_utils import (  # noqa: E402
+    PARTITION_10K_LABEL,
+    PARTITION_1M_LABEL,
+    enumerate_partitions,
+    partition_dir,
+    partition_end,
+)
+from lib.run_logging import make_progress, setup_logging  # noqa: E402
+from lib.atomic_publish import (  # noqa: E402
+    create_temp_location,
+    publish_atomically,
+    cleanup_temp,
+)
+from raw_data.polygon_contract_events_v3 import get_sunk_frontier, SCRAPE_START_BLOCK  # noqa: E402
+
+# ============================================================================
+# constants
+# ============================================================================
+
+# 32 zero bytes — the USDC side marker in maker_asset_id / taker_asset_id and the
+# USDC denomination marker in fee_refunded.token_id.
+ZERO32_SQL = "unhex('" + "00" * 32 + "')"
+
+# Exchange configuration. ``addr`` is the lowercase, 0x-free contract address; a
+# leg is the taker leg when its order_filled.taker equals this address. ``gen``
+# selects the v1 (separate maker/taker asset ids + FeeModule refund) or v2
+# (side flag + native net fee) decoding. ``fee_module`` names the FeeModule
+# table that carries v1 net fees; v2 has none.
+EXCHANGES = (
+    {"name": "CTFExchange",          "addr": "4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e", "gen": 1, "fee_module": "FeeModuleCTF"},
+    {"name": "NegRiskCtfExchange",   "addr": "c5d563a36ae78145c45a50134d48a1215220f80a", "gen": 1, "fee_module": "FeeModuleNegRisk"},
+    {"name": "CTFExchangeV2",        "addr": "e111180000d2663c0091e4f400237545b87b996b", "gen": 2, "fee_module": None},
+    {"name": "NegRiskCtfExchangeV2", "addr": "e2222d279d744050d28e00520010520000310f59", "gen": 2, "fee_module": None},
+)
+
+# Output Parquet schema. Logical types mirror polygon_contract_events_v3 so the
+# columns join cleanly: BLOB -> pa.binary() (variable-length BYTE_ARRAY, never
+# FIXED_LEN_BYTE_ARRAY), uint32 -> pa.uint32(), signed amounts -> INT64.
+# Column order is fixed and is part of the contract (see DATA_DICTIONARY.md).
+_OUTPUT_COLUMNS = (
+    "block_number",
+    "logical_fill_index",
+    "transaction_index",
+    "log_index",
+    "account",
+    "token_id",
+    "condition_id",
+    "market_id",
+    "is_taker",
+    "net_yes_tokens",
+    "gross_usdc",
+    "fee_usdc",
+    "net_yes_position_after",
+)
+
+console = Console()
+
+_stop_event = threading.Event()
+_global_con: duckdb.DuckDBPyConnection | None = None
+
+
+# ============================================================================
+# configuration
+# ============================================================================
+
+RAW       = require_env("POLYGON_CONTRACT_EVENTS_V3_DIR")
+TOKEN_MAP = require_env("TOKEN_ID_MAP_V1_DIR")
+OUT_DIR   = require_env("FILLS_V1_DIR")
+TEMP_DIR  = require_env("TEMP_DIR")
+
+
+# ============================================================================
+# input discovery
+# ============================================================================
+
+def _partition_file(table: str, k_val: int) -> Path:
+    """Path to one table's data.parquet for the 10K partition starting at k_val."""
+    return Path(RAW) / table / partition_dir(k_val) / "data.parquet"
+
+
+def _existing(table: str, k_val: int) -> str | None:
+    """Return the data.parquet path for this table+partition if it exists, else None."""
+    p = _partition_file(table, k_val)
+    return str(p) if p.exists() else None
+
+
+# ============================================================================
+# per-exchange leg SQL
+# ============================================================================
+
+def _legs_select(exch: dict, path: str) -> str:
+    """A SELECT producing unified leg columns for one exchange's order_filled file.
+
+    Unified columns:
+        block_number, transaction_index, log_index, transaction_hash,
+        order_hash, account, token_id, is_taker, buy, taker_buys_self,
+        q (HUGEINT outcome tokens), c (HUGEINT USDC), fee_is_usdc, gross_fee,
+        is_v1, fee_module
+    """
+    addr = exch["addr"]
+    is_v1 = exch["gen"] == 1
+    fee_module = exch["fee_module"] or ""
+
+    if is_v1:
+        # v1: BUY when the signer sends USDC (maker_asset_id == ZERO32).
+        buy_expr = f"(maker_asset_id = {ZERO32_SQL})"
+        token_expr = "CASE WHEN maker_asset_id = " + ZERO32_SQL + " THEN taker_asset_id ELSE maker_asset_id END"
+        q_expr = "CASE WHEN maker_asset_id = " + ZERO32_SQL + " THEN taker_amount_filled ELSE maker_amount_filled END"
+        c_expr = "CASE WHEN maker_asset_id = " + ZERO32_SQL + " THEN maker_amount_filled ELSE taker_amount_filled END"
+    else:
+        # v2: BUY when side == 0.
+        buy_expr = "(side = 0)"
+        token_expr = "token_id"
+        q_expr = "CASE WHEN side = 0 THEN taker_amount_filled ELSE maker_amount_filled END"
+        c_expr = "CASE WHEN side = 0 THEN maker_amount_filled ELSE taker_amount_filled END"
+
+    return f"""
+        SELECT
+            block_number,
+            transaction_index,
+            log_index,
+            -log_index AS neg_log_index,
+            transaction_hash,
+            order_hash,
+            maker AS account,
+            {token_expr} AS token_id,
+            (lower(hex(taker)) = '{addr}') AS is_taker,
+            {buy_expr} AS buy,
+            CAST({q_expr} AS HUGEINT) AS q,
+            CAST({c_expr} AS HUGEINT) AS c,
+            -- fee is on the received asset: USDC only when the signer is selling.
+            (NOT {buy_expr}) AS fee_is_usdc,
+            CAST(fee AS HUGEINT) AS gross_fee,
+            {str(is_v1).lower()} AS is_v1,
+            '{fee_module}' AS fee_module
+        FROM read_parquet('{path}')
+    """
+
+
+def _refund_select(k_val: int) -> str | None:
+    """A SELECT of v1 USDC net fees keyed by (transaction_hash, order_hash).
+
+    Returns None when neither FeeModule has data in this partition.
+    fee_refunded.fee_charged is the net protocol fee; only USDC-denominated
+    refunds (token_id == ZERO32) contribute to fee_usdc.
+    """
+    parts = []
+    for module in ("FeeModuleCTF", "FeeModuleNegRisk"):
+        path = _existing(f"{module}/fee_refunded", k_val)
+        if path:
+            parts.append(
+                f"SELECT transaction_hash, order_hash, CAST(fee_charged AS HUGEINT) AS fee_charged "
+                f"FROM read_parquet('{path}') WHERE token_id = {ZERO32_SQL}"
+            )
+    if not parts:
+        return None
+    return " UNION ALL ".join(parts)
+
+
+def _build_partition_sql(k_val: int, leg_paths: list[tuple[dict, str]]) -> str:
+    """Assemble the full per-partition query that yields the final, ordered rows.
+
+    Stages:
+      raw_legs    union of every exchange's order_filled legs
+      taker_legs  the is_taker legs (one per atomic match)
+      assoc       each maker leg's match key + the match's taker direction,
+                  found by ASOF (next taker-self leg at a higher log_index)
+      enriched    join token_id_map (condition_id, index_set, market_id) + fees
+      indexed     assign logical_fill_index per block
+      final       add net_yes_position_after running balance and project columns
+    """
+    legs_union = " UNION ALL ".join(_legs_select(exch, path) for exch, path in leg_paths)
+    refund_sql = _refund_select(k_val)
+    refund_cte = refund_sql if refund_sql else "SELECT NULL::BLOB transaction_hash, NULL::BLOB order_hash, NULL::HUGEINT fee_charged WHERE FALSE"
+
+    return f"""
+    WITH raw_legs AS (
+        {legs_union}
+    ),
+    taker_legs AS (
+        SELECT transaction_hash, neg_log_index, order_hash, buy
+        FROM raw_legs WHERE is_taker
+    ),
+    refunds AS (
+        {refund_cte}
+    ),
+    -- A maker leg belongs to the next taker-self leg at a higher log_index in the
+    -- same transaction (the match segment ends with the taker-self fill). ASOF
+    -- picks the closest such taker leg; neg_log_index turns "smallest greater"
+    -- into ASOF's "largest not-greater".
+    assoc AS (
+        SELECT
+            m.*,
+            CASE WHEN m.is_taker THEN m.order_hash ELSE t.order_hash END AS match_key,
+            CASE WHEN m.is_taker THEN m.buy        ELSE t.buy        END AS taker_buys
+        FROM raw_legs m
+        ASOF LEFT JOIN taker_legs t
+          ON m.transaction_hash = t.transaction_hash
+         AND m.neg_log_index >= t.neg_log_index
+        WHERE m.is_taker OR t.order_hash IS NOT NULL
+    ),
+    enriched AS (
+        SELECT
+            a.block_number,
+            a.transaction_index,
+            a.log_index,
+            a.account,
+            a.token_id,
+            tok.condition_id,
+            tok.market_id,
+            tok.index_set,
+            a.is_taker,
+            a.match_key,
+            a.taker_buys,
+            -- net_yes_tokens: q * direction(+buy/-sell) * outcome(+YES/-NO)
+            ( a.q
+              * (CASE WHEN a.buy THEN 1 ELSE -1 END)
+              * (CASE WHEN tok.index_set = 1 THEN 1 ELSE -1 END) ) AS net_yes_tokens,
+            -- gross_usdc: +c for buys (spend), -c for sells (receive)
+            ( a.c * (CASE WHEN a.buy THEN 1 ELSE -1 END) ) AS gross_usdc,
+            -- fee_usdc: USDC-denominated net fee only; v1 nets via FeeModule refund,
+            -- v2 uses the native fee; buy-side (token) fees contribute 0.
+            ( CASE
+                WHEN NOT a.fee_is_usdc THEN 0
+                WHEN a.is_v1 THEN COALESCE(r.fee_charged, 0)
+                ELSE a.gross_fee
+              END ) AS fee_usdc,
+            -- best-for-taker maker price ordering value: taker buying -> cheapest
+            -- first (ascending price); taker selling -> highest first (descending).
+            ( (a.c::DOUBLE / a.q::DOUBLE) * (CASE WHEN a.taker_buys THEN 1 ELSE -1 END) ) AS price_rank
+        FROM assoc a
+        LEFT JOIN tok ON a.token_id = tok.token_id
+        LEFT JOIN refunds r
+          ON a.is_v1 AND a.transaction_hash = r.transaction_hash AND a.order_hash = r.order_hash
+    ),
+    keyed AS (
+        SELECT
+            *,
+            MIN(log_index) OVER (PARTITION BY block_number, transaction_index, match_key) AS match_order_key
+        FROM enriched
+    ),
+    indexed AS (
+        SELECT
+            *,
+            CAST(ROW_NUMBER() OVER (
+                PARTITION BY block_number
+                ORDER BY
+                    transaction_index,
+                    match_order_key,
+                    is_taker DESC,
+                    price_rank,
+                    log_index
+            ) - 1 AS UINTEGER) AS logical_fill_index
+        FROM keyed
+    )
+    SELECT
+        CAST(block_number AS UINTEGER)        AS block_number,
+        logical_fill_index,
+        CAST(transaction_index AS UINTEGER)   AS transaction_index,
+        CAST(log_index AS UINTEGER)           AS log_index,
+        account,
+        token_id,
+        condition_id,
+        market_id,
+        is_taker,
+        CAST(net_yes_tokens AS BIGINT)        AS net_yes_tokens,
+        CAST(gross_usdc AS BIGINT)            AS gross_usdc,
+        CAST(fee_usdc AS BIGINT)              AS fee_usdc,
+        CAST(
+            COALESCE(bal.bal, 0)
+            + SUM(net_yes_tokens) OVER (
+                PARTITION BY account, condition_id
+                ORDER BY block_number, logical_fill_index
+                ROWS UNBOUNDED PRECEDING)
+            AS BIGINT)                        AS net_yes_position_after,
+        index_set,
+        condition_id IS NULL                  AS _missing_token
+    FROM indexed
+    LEFT JOIN balances bal USING (account, condition_id)
+    ORDER BY block_number, logical_fill_index
+    """
+
+
+# ============================================================================
+# token_id_map + running-balance state
+# ============================================================================
+
+def _load_token_map(con: duckdb.DuckDBPyConnection, log: logging.Logger) -> None:
+    """Load token_id -> (condition_id, index_set, market_id) into a temp table once."""
+    glob = f"{TOKEN_MAP}/**/*.parquet"
+    con.execute("""
+        CREATE OR REPLACE TEMP TABLE tok (
+            token_id BLOB, condition_id BLOB, index_set UINTEGER, market_id BLOB
+        )
+    """)
+    try:
+        con.execute(f"""
+            INSERT INTO tok
+            SELECT token_id, condition_id, index_set, market_id
+            FROM read_parquet('{glob}')
+        """)
+    except duckdb.IOException:
+        log.warning("token_id_map_v1 has no parquet files yet; every fill will fail the mapping assertion")
+    n = con.execute("SELECT COUNT(*) FROM tok").fetchone()[0]
+    log.info(f"loaded {n:,} token_id_map rows")
+
+
+def _load_balances(con: duckdb.DuckDBPyConnection, log: logging.Logger) -> None:
+    """Seed per-(account, condition_id) YES balances from already-landed fills_v1.
+
+    The carry-in for the next partition is the sum of net_yes_tokens across every
+    fill written so far. process_chunk maintains this table incrementally as it
+    writes each partition (first-seen analogue from token_id_map_v1).
+    """
+    con.execute("""
+        CREATE OR REPLACE TEMP TABLE balances (account BLOB, condition_id BLOB, bal HUGEINT)
+    """)
+    glob = f"{OUT_DIR}/**/*.parquet"
+    try:
+        con.execute(f"""
+            INSERT INTO balances
+            SELECT account, condition_id, SUM(net_yes_tokens)::HUGEINT
+            FROM read_parquet('{glob}')
+            GROUP BY account, condition_id
+        """)
+        n = con.execute("SELECT COUNT(*) FROM balances").fetchone()[0]
+        log.info(f"seeded {n:,} running (account, condition) balances from existing output")
+    except duckdb.IOException:
+        log.info("no existing fills_v1 output; starting running balances from empty")
+
+
+# ============================================================================
+# per-partition processing
+# ============================================================================
+
+def process_chunk(
+    con: duckdb.DuckDBPyConnection,
+    m_val: int,
+    k_val: int,
+    log: logging.Logger,
+) -> int:
+    """Process one 10K partition: build legs, assign order/position, write atomically.
+
+    Every partition ALWAYS produces an output (data.parquet + metadata.json), even
+    with zero fills. Fails fast if any traded token is missing from token_id_map or
+    has an index_set outside {1, 2} (the binary YES=1/NO=2 invariant).
+    """
+    chunk_dir = Path(OUT_DIR) / partition_dir(k_val)
+    chunk_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    leg_paths = [(exch, _existing(f"{exch['name']}/order_filled", k_val)) for exch in EXCHANGES]
+    leg_paths = [(exch, path) for exch, path in leg_paths if path]
+
+    if leg_paths:
+        sql = _build_partition_sql(k_val, leg_paths)
+        con.execute(f"CREATE OR REPLACE TEMP TABLE chunk_rows AS {sql}")
+
+        # Fail fast: every traded token must resolve to a binary condition.
+        bad = con.execute("""
+            SELECT
+                COUNT(*) FILTER (WHERE _missing_token) AS missing,
+                COUNT(*) FILTER (WHERE NOT _missing_token AND index_set NOT IN (1, 2)) AS nonbinary
+            FROM chunk_rows
+        """).fetchone()
+        if bad[0]:
+            raise RuntimeError(
+                f"10K={k_val}: {bad[0]} fill legs reference a token_id absent from token_id_map_v1"
+            )
+        if bad[1]:
+            raise RuntimeError(
+                f"10K={k_val}: {bad[1]} fill legs have index_set outside {{1, 2}} "
+                f"(non-binary condition; the YES=1/NO=2 model requires binary conditions)"
+            )
+    else:
+        con.execute("DROP TABLE IF EXISTS chunk_rows")
+        con.execute(_empty_chunk_rows_sql())
+
+    select_cols = ", ".join(_OUTPUT_COLUMNS)
+    row_count = con.execute("SELECT COUNT(*) FROM chunk_rows").fetchone()[0]
+
+    temp_loc = create_temp_location(parent_dir=chunk_dir.parent, final_name=chunk_dir.name, temp_suffix=".tmp")
+    input_hashes = _partition_input_hashes(k_val)
+    try:
+        out_parquet = temp_loc.path / "data.parquet"
+        con.execute(f"""
+            COPY (SELECT {select_cols} FROM chunk_rows ORDER BY block_number, logical_fill_index)
+            TO '{out_parquet.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
+        """)
+        _write_metadata(con, temp_loc.path, m_val, k_val, input_hashes, log)
+        publish_atomically(temp_loc)
+        _update_balances(con)
+        log.info(f"10K={k_val}: wrote {row_count:,} fill legs")
+        return row_count
+    except Exception:
+        cleanup_temp(temp_loc)
+        raise
+
+
+def _empty_chunk_rows_sql() -> str:
+    """Create an empty chunk_rows table with the exact output column types."""
+    return """
+    CREATE TEMP TABLE chunk_rows AS
+    SELECT
+        CAST(NULL AS UINTEGER) AS block_number,
+        CAST(NULL AS UINTEGER) AS logical_fill_index,
+        CAST(NULL AS UINTEGER) AS transaction_index,
+        CAST(NULL AS UINTEGER) AS log_index,
+        CAST(NULL AS BLOB)     AS account,
+        CAST(NULL AS BLOB)     AS token_id,
+        CAST(NULL AS BLOB)     AS condition_id,
+        CAST(NULL AS BLOB)     AS market_id,
+        CAST(NULL AS BOOLEAN)  AS is_taker,
+        CAST(NULL AS BIGINT)   AS net_yes_tokens,
+        CAST(NULL AS BIGINT)   AS gross_usdc,
+        CAST(NULL AS BIGINT)   AS fee_usdc,
+        CAST(NULL AS BIGINT)   AS net_yes_position_after,
+        CAST(NULL AS UINTEGER) AS index_set,
+        FALSE                  AS _missing_token
+    WHERE FALSE
+    """
+
+
+def _update_balances(con: duckdb.DuckDBPyConnection) -> None:
+    """Fold this partition's net_yes_tokens deltas into the running balance table."""
+    con.execute("""
+        CREATE OR REPLACE TEMP TABLE deltas AS
+        SELECT account, condition_id, SUM(net_yes_tokens)::HUGEINT AS delta
+        FROM chunk_rows GROUP BY account, condition_id
+    """)
+    con.execute("""
+        UPDATE balances b SET bal = b.bal + d.delta
+        FROM deltas d WHERE b.account = d.account AND b.condition_id = d.condition_id
+    """)
+    con.execute("""
+        INSERT INTO balances
+        SELECT d.account, d.condition_id, d.delta
+        FROM deltas d
+        LEFT JOIN balances b ON b.account = d.account AND b.condition_id = d.condition_id
+        WHERE b.account IS NULL
+    """)
+
+
+# ============================================================================
+# provenance
+# ============================================================================
+
+def _partition_input_hashes(k_val: int) -> dict[str, str]:
+    """SHA-256 of every raw input file read to build this partition (portable keys)."""
+    import os
+
+    tables = [f"{e['name']}/order_filled" for e in EXCHANGES]
+    tables += ["FeeModuleCTF/fee_refunded", "FeeModuleNegRisk/fee_refunded"]
+    hashes: dict[str, str] = {}
+    for table in tables:
+        path = _existing(table, k_val)
+        if path:
+            rel = os.path.relpath(path, RAW)
+            hashes[rel] = parquet_content_hash(Path(path))
+    return hashes
+
+
+def _write_metadata(con, chunk_dir: Path, m_val: int, k_val: int, input_hashes: dict[str, str], log) -> None:
+    part = chunk_dir / "data.parquet"
+    if not part.exists():
+        log.warning(f"data.parquet not found at {part}")
+        return
+    create_parquet_metadata_json(
+        part,
+        dataset="fills_v1",
+        source_script="derived_data/fills_v1/main.py",
+        input_hashes=input_hashes,
+        parameters={"1M": m_val, "10K": k_val, "min_block": k_val, "max_block": partition_end(k_val)},
+        row_count_connection=con,
+        created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    )
+
+
+# ============================================================================
+# main
+# ============================================================================
+
+def main() -> None:
+    global _global_con
+    parser = argparse.ArgumentParser(description="Materialize fills_v1")
+    parser.add_argument("--dry-run", action="store_true", help="print work plan without writing")
+    parser.add_argument("--sample", type=int, default=0, help="process only first N partitions")
+    args = parser.parse_args()
+
+    assert_git_clean(_project_root)
+
+    log = setup_logging("fills_v1", __file__, console)
+    log.info("fills_v1 materializer starting")
+
+    def _handle_sigint(sig, frame):
+        _stop_event.set()
+        try:
+            if _global_con is not None:
+                _global_con.interrupt()
+        except Exception:
+            pass
+
+    signal.signal(signal.SIGINT, _handle_sigint)
+
+    # Discover work by block range up to the upstream frontier (no source-folder
+    # discovery): a 10K range with no fills still produces a zero-row output.
+    frontier = get_sunk_frontier(RAW)
+    all_partitions = enumerate_partitions(SCRAPE_START_BLOCK, frontier)
+    todo = [
+        (m, k)
+        for (m, k) in all_partitions
+        if not (Path(OUT_DIR) / f"{PARTITION_1M_LABEL}={m}" / f"{PARTITION_10K_LABEL}={k}").exists()
+    ]
+    log.info(f"frontier={frontier}, total={len(all_partitions)}, todo={len(todo)}")
+
+    if args.dry_run:
+        for m, k in todo[:10]:
+            log.info(f"DRY-RUN would process 1M={m} 10K={k}")
+        if len(todo) > 10:
+            log.info(f"... and {len(todo) - 10} more")
+        return
+
+    if args.sample:
+        todo = todo[: args.sample]
+
+    con = duckdb.connect()
+    _global_con = con
+    con.execute(f"SET temp_directory = '{TEMP_DIR}'")
+    con.execute("SET preserve_insertion_order = false")
+
+    _load_token_map(con, log)
+    _load_balances(con, log)
+
+    console.print(
+        f"frontier={frontier}  |  total={len(all_partitions):,}  |  "
+        f"[green]{len(all_partitions) - len(todo):,} already landed[/green]  |  "
+        f"[yellow]{len(todo):,} to process[/yellow]"
+    )
+    if not todo:
+        console.print("[green]Nothing to do.[/green]")
+        return
+
+    with make_progress(console) as progress:
+        task = progress.add_task("Materializing fills_v1", total=len(todo))
+        processed = 0
+        for m_val, k_val in todo:
+            if _stop_event.is_set():
+                log.info("interrupted by user")
+                break
+            process_chunk(con, m_val, k_val, log)
+            processed += 1
+            progress.update(task, advance=1)
+
+    log.info(f"fills_v1 materializer finished. Processed {processed} partitions.")
+    console.print(f"[green]Complete! Processed {processed} partitions.[/green]")
+
+
+if __name__ == "__main__":
+    main()

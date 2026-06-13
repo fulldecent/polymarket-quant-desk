@@ -288,7 +288,7 @@ def _publish_manifest_success_atomically(cold_path: Path, partition_start: int) 
     success_file.write_bytes(b"")
 
     # Publish atomically (raises FileExistsError if immutability violated)
-    publish_atomically(temp_location, allow_overwrite=False)
+    publish_atomically(temp_location)
 
 
 def _cleanup_tmp_partition_dirs(cold_path: Path, partition_start: int) -> int:

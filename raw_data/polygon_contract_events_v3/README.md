@@ -29,7 +29,7 @@ python -m pytest raw_data/polygon_contract_events_v3/tests/data_validation -v
 
 ## Reproducibility
 
-The cold-tier `data.parquet` files are logical-data-stable across independent scrapes. Given the same source data and the same code, a fresh run of the scraper against a different storage location produces files whose logical contents match the existing cold tier exactly.
+Given identical source data (immutable blockchain and faithful RPC responses), this program will always generate Parquet files with the same rows in the same order within each partition.
 
 ## Deployed contract source code
 

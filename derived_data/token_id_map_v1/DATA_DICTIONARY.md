@@ -4,15 +4,15 @@ Lookup table: `(collateral_token, parent_collection_id, condition_id, index_set)
 
 ## Scope
 
-Every outcome token that trades on a Polymarket exchange.
+Every outcome token that trades on a Polymarket exchange. (See [coverage note](#coverage) below.)
 
 A ConditionalTokens split/merge is treated as Polymarket-related only when it shares a transaction with an exchange `orders_matched` event from any of the four exchanges (`CTFExchange`, `CTFExchangeV2`, `NegRiskCtfExchange`, `NegRiskCtfExchangeV2`). Both legs live in the same transaction — and therefore the same block and 10K partition — so the join is partition-local. Each qualifying `ConditionalTokens/position_split` or `ConditionalTokens/positions_merge` row carries the `collateral_token`, `parent_collection_id`, `condition_id`, and `partition` (index sets) that fully determine each `token_id`. NegRisk markets are covered without special handling: the NegRiskAdapter performs its split/merge against the wrapped collateral, so the underlying `ConditionalTokens` event already carries the correct collateral.
 
 ## Grain
 
-One row per unique `token_id`.
+One row per `token_id`.
 
-Note: This means (asserting that there are no Keccak-256 collisions) that each `(collateral_token, parent_collection_id, condition_id, index_set)` is also unique.
+Each `(collateral_token, parent_collection_id, condition_id, index_set)` is also unique (assuming no Keccak-256 collisions).
 
 ## Schema
 
@@ -28,8 +28,6 @@ Note: This means (asserting that there are no Keccak-256 collisions) that each `
 ## Physical sort order
 
 Within each partition file, rows are sorted ascending by `token_id` (byte-wise ascending).
-
-This total ordering over `token_id` makes each partition file row-for-row reproducible from identical source data.
 
 ## Partitioning
 
