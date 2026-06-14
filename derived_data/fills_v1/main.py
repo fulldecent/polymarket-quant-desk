@@ -520,8 +520,7 @@ def _bootstrap_balances_sidecar(con: duckdb.DuckDBPyConnection, log: logging.Log
             TO '{sidecar_path.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
         """)
 
-        if idx % 100 == 0 or idx == len(landed):
-            log.info(f"bootstrap: wrote sidecar for 10K={k_val} ({row_count:,} keys) [{idx}/{len(landed)}]")
+        log.info(f"bootstrap: wrote sidecar for 10K={k_val} ({row_count:,} keys) [{idx}/{len(landed)}]")
 
     log.info("balances sidecar bootstrap complete")
 
@@ -556,6 +555,7 @@ def _write_balances_sidecar_partition(con: duckdb.DuckDBPyConnection, k_val: int
         COPY (SELECT account, condition_id, ending_balance FROM touched)
         TO '{sidecar_path.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
     """)
+    log.info(f"wrote balances sidecar for 10K={k_val}")
 
 
 # ============================================================================
