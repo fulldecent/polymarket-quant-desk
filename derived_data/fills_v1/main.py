@@ -101,6 +101,8 @@ from lib.atomic_publish import (  # noqa: E402
     publish_atomically,
     cleanup_temp,
 )
+from lib.derived_frontier import get_derived_frontier
+
 from raw_data.polygon_contract_events_v3 import get_sunk_frontier, SCRAPE_START_BLOCK  # noqa: E402
 
 # ============================================================================
@@ -157,6 +159,8 @@ RAW       = require_env("POLYGON_CONTRACT_EVENTS_V3_DIR")
 TOKEN_MAP = require_env("TOKEN_ID_MAP_V1_DIR")
 OUT_DIR   = require_env("FILLS_V1_DIR")
 TEMP_DIR  = require_env("TEMP_DIR")
+
+BALANCES_SUBDIR = "_balances"
 
 
 # ============================================================================
@@ -390,33 +394,168 @@ def _load_token_map(con: duckdb.DuckDBPyConnection, log: logging.Logger) -> None
             FROM read_parquet('{glob}')
         """)
     except duckdb.IOException:
-        log.warning("token_id_map_v1 has no parquet files yet; every fill will fail the mapping assertion")
+        raise RuntimeError(
+            "token_id_map_v1 has no parquet files; fills_v1 requires a complete token map. "
+            "Run token_id_map_v1 first and ensure TOKEN_ID_MAP_V1_DIR is populated."
+        )
     n = con.execute("SELECT COUNT(*) FROM tok").fetchone()[0]
+    if n == 0:
+        raise RuntimeError(
+            "token_id_map_v1 is empty; fills_v1 requires a complete token map. "
+            "Run token_id_map_v1 first and ensure TOKEN_ID_MAP_V1_DIR is populated."
+        )
     log.info(f"loaded {n:,} token_id_map rows")
 
 
-def _load_balances(con: duckdb.DuckDBPyConnection, log: logging.Logger) -> None:
-    """Seed per-(account, condition_id) YES balances from already-landed fills_v1.
+def _balances_sidecar_dir() -> Path:
+    """Root directory for the internal balances sidecar (implementation detail)."""
+    return Path(OUT_DIR) / BALANCES_SUBDIR
 
-    The carry-in for the next partition is the sum of net_yes_tokens across every
-    fill written so far. process_chunk maintains this table incrementally as it
-    writes each partition (first-seen analogue from token_id_map_v1).
+
+def _balances_partition_path(k_val: int) -> Path:
+    """Path to the immutable per-partition balances sidecar file."""
+    return _balances_sidecar_dir() / partition_dir(k_val) / "balances.parquet"
+
+
+def _ensure_balances_sidecar(con: duckdb.DuckDBPyConnection, log: logging.Logger) -> None:
+    """Ensure the balances sidecar exists and covers all landed fills partitions.
+
+    If the sidecar directory is missing or empty, perform a one-time bootstrap:
+    walk every landed fills partition in order, compute the ending balance for
+    each touched (account, condition_id), and write the immutable per-partition
+    sidecar file. After bootstrap (or if sidecar already existed), load the
+    latest balances into the temp table for the current run.
+
+    The sidecar is the sole source of balance carry-in. There is no fallback
+    historical scan during normal operation.
     """
+    sidecar_root = _balances_sidecar_dir()
+    sidecar_root.mkdir(parents=True, exist_ok=True)
+
+    # Check if any sidecar partition exists
+    has_sidecar = any(sidecar_root.rglob("balances.parquet"))
+
+    if not has_sidecar:
+        log.info("balances sidecar missing; bootstrap from historical fills (one-time cost)")
+        _bootstrap_balances_sidecar(con, log)
+
+    # Load sidecar into temp table (purpose-built, read-only for this run)
     con.execute("""
         CREATE OR REPLACE TEMP TABLE balances (account BLOB, condition_id BLOB, bal HUGEINT)
     """)
-    glob = f"{OUT_DIR}/**/*.parquet"
+    glob = f"{sidecar_root}/**/*.parquet"
     try:
         con.execute(f"""
             INSERT INTO balances
-            SELECT account, condition_id, SUM(net_yes_tokens)::HUGEINT
+            SELECT account, condition_id, ending_balance AS bal
             FROM read_parquet('{glob}')
-            GROUP BY account, condition_id
         """)
         n = con.execute("SELECT COUNT(*) FROM balances").fetchone()[0]
-        log.info(f"seeded {n:,} running (account, condition) balances from existing output")
+        log.info(f"loaded {n:,} running (account, condition) balances from sidecar")
     except duckdb.IOException:
-        log.info("no existing fills_v1 output; starting running balances from empty")
+        raise RuntimeError(
+            "balances sidecar is empty after bootstrap; this is a bug in the bootstrap logic"
+        )
+
+
+def _bootstrap_balances_sidecar(con: duckdb.DuckDBPyConnection, log: logging.Logger) -> None:
+    """Rebuild the entire balances sidecar from landed fills partitions.
+
+    This is the only place that ever reads historical fills data.parquet files
+    to derive balances. It runs only when the sidecar is missing. The result
+    is a set of immutable per-partition sidecar files under _balances/.
+    """
+    from lib.partition_utils import enumerate_partitions as _enum_parts
+
+    # Find all landed fills partitions by scanning the output directory
+    landed: list[tuple[int, int]] = []
+    for m_dir in Path(OUT_DIR).glob("1M=*"):
+        if not m_dir.is_dir():
+            continue
+        for k_dir in m_dir.glob("10K=*"):
+            if (k_dir / "data.parquet").exists() and (k_dir / "metadata.json").exists():
+                k_val = int(k_dir.name.split("=")[1])
+                m_val = int(m_dir.name.split("=")[1])
+                landed.append((m_val, k_val))
+    landed.sort(key=lambda x: (x[0], x[1]))
+
+    if not landed:
+        log.info("no landed fills partitions; sidecar will be empty")
+        return
+
+    log.info(f"bootstrap will process {len(landed)} landed fills partitions")
+
+    # Process each landed partition in order, writing its sidecar entry
+    for idx, (m_val, k_val) in enumerate(landed, 1):
+        if _stop_event.is_set():
+            log.info("bootstrap interrupted by user")
+            raise RuntimeError("bootstrap interrupted; sidecar is incomplete")
+
+        data_path = Path(OUT_DIR) / partition_dir(k_val) / "data.parquet"
+        if not data_path.exists():
+            continue
+
+        # Compute ending balance per (account, condition_id) for this partition
+        # (the row with the highest logical_fill_index for each key)
+        con.execute(f"""
+            CREATE OR REPLACE TEMP TABLE part_bal AS
+            SELECT
+                account,
+                condition_id,
+                net_yes_position_after AS ending_balance
+            FROM read_parquet('{data_path.as_posix()}')
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY account, condition_id
+                ORDER BY logical_fill_index DESC
+            ) = 1
+        """)
+
+        row_count = con.execute("SELECT COUNT(*) FROM part_bal").fetchone()[0]
+
+        # Write immutable sidecar entry
+        sidecar_path = _balances_partition_path(k_val)
+        sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+        con.execute(f"""
+            COPY (SELECT account, condition_id, ending_balance FROM part_bal)
+            TO '{sidecar_path.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
+        """)
+
+        if idx % 100 == 0 or idx == len(landed):
+            log.info(f"bootstrap: wrote sidecar for 10K={k_val} ({row_count:,} keys) [{idx}/{len(landed)}]")
+
+    log.info("balances sidecar bootstrap complete")
+
+
+def _write_balances_sidecar_partition(con: duckdb.DuckDBPyConnection, k_val: int, log: logging.Logger) -> None:
+    """Write the immutable sidecar entry for the just-processed partition.
+
+    Only the (account, condition_id) pairs touched by this partition are recorded,
+    with their ending net_yes_position_after after the last fill for that key.
+    """
+    sidecar_path = _balances_partition_path(k_val)
+    sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # The balances table has been updated by _update_balances with this partition's deltas.
+    # We need the ending balance for exactly the keys that had activity in this partition.
+    # We can derive it from chunk_rows (which still exists) or from the updated balances.
+    # Using chunk_rows is precise: the last row per key in chunk_rows has the ending value.
+    con.execute(f"""
+        CREATE OR REPLACE TEMP TABLE touched AS
+        SELECT
+            account,
+            condition_id,
+            net_yes_position_after AS ending_balance
+        FROM chunk_rows
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY account, condition_id
+            ORDER BY logical_fill_index DESC
+        ) = 1
+    """)
+
+    con.execute(f"""
+        COPY (SELECT account, condition_id, ending_balance FROM touched)
+        TO '{sidecar_path.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
+    """)
 
 
 # ============================================================================
@@ -445,16 +584,21 @@ def process_chunk(
         sql = _build_partition_sql(k_val, leg_paths)
         con.execute(f"CREATE OR REPLACE TEMP TABLE chunk_rows AS {sql}")
 
-        # Fail fast: every traded token must resolve to a binary condition.
-        # Legs whose token_id is absent from token_id_map_v1 are dropped (the map
-        # covers >99% of traded tokens; the contract guarantees condition_id is never NULL).
+        # Fail fast: every traded token must be present in token_id_map_v1 and resolve to a binary condition.
         bad = con.execute("""
-            SELECT COUNT(*) FILTER (WHERE NOT _missing_token AND index_set NOT IN (1, 2)) AS nonbinary
+            SELECT
+                COUNT(*) FILTER (WHERE _missing_token) AS missing,
+                COUNT(*) FILTER (WHERE NOT _missing_token AND index_set NOT IN (1, 2)) AS nonbinary
             FROM chunk_rows
         """).fetchone()
         if bad[0]:
             raise RuntimeError(
-                f"10K={k_val}: {bad[0]} fill legs have index_set outside {{1, 2}} "
+                f"10K={k_val}: {bad[0]} fill legs reference token_ids absent from token_id_map_v1; "
+                f"fills_v1 requires complete token coverage. Advance token_id_map_v1 to this partition first."
+            )
+        if bad[1]:
+            raise RuntimeError(
+                f"10K={k_val}: {bad[1]} fill legs have index_set outside {{1, 2}} "
                 f"(non-binary condition; the YES=1/NO=2 model requires binary conditions)"
             )
     else:
@@ -475,6 +619,7 @@ def process_chunk(
         _write_metadata(con, temp_loc.path, m_val, k_val, input_hashes, log)
         publish_atomically(temp_loc)
         _update_balances(con)
+        _write_balances_sidecar_partition(con, k_val, log)
         log.info(f"10K={k_val}: wrote {row_count:,} fill legs")
         return row_count
     except Exception:
@@ -548,8 +693,7 @@ def _partition_input_hashes(k_val: int) -> dict[str, str]:
 def _write_metadata(con, chunk_dir: Path, m_val: int, k_val: int, input_hashes: dict[str, str], log) -> None:
     part = chunk_dir / "data.parquet"
     if not part.exists():
-        log.warning(f"data.parquet not found at {part}")
-        return
+        raise RuntimeError(f"data.parquet not found at {part} after write; cannot create metadata")
     create_parquet_metadata_json(
         part,
         dataset="fills_v1",
@@ -589,7 +733,17 @@ def main() -> None:
 
     # Discover work by block range up to the upstream frontier (no source-folder
     # discovery): a 10K range with no fills still produces a zero-row output.
-    frontier = get_sunk_frontier(RAW)
+    # The effective frontier is the MIN of the cold dataset and token_id_map_v1;
+    # fills_v1 may only consume partitions where BOTH sources are complete.
+    cold_frontier = get_sunk_frontier(RAW)
+    token_map_frontier = get_derived_frontier(TOKEN_MAP)
+    if token_map_frontier < cold_frontier:
+        raise RuntimeError(
+            f"token_id_map_v1 frontier ({token_map_frontier}) is behind the cold frontier ({cold_frontier}); "
+            f"fills_v1 requires complete token coverage up to the cold frontier. "
+            f"Advance token_id_map_v1 first."
+        )
+    frontier = min(cold_frontier, token_map_frontier)
     all_partitions = enumerate_partitions(SCRAPE_START_BLOCK, frontier)
     todo = [
         (m, k)
@@ -614,7 +768,7 @@ def main() -> None:
     con.execute("SET preserve_insertion_order = false")
 
     _load_token_map(con, log)
-    _load_balances(con, log)
+    _ensure_balances_sidecar(con, log)
 
     console.print(
         f"frontier={frontier}  |  total={len(all_partitions):,}  |  "

@@ -172,8 +172,7 @@ def _write_metadata(
     """Write metadata.json per docs/Metadata files.md schema."""
     part = chunk_dir / "data.parquet"
     if not part.exists():
-        log.warning(f"data.parquet not found at {part}")
-        return
+        raise RuntimeError(f"data.parquet not found at {part} after write; cannot create metadata")
 
     create_parquet_metadata_json(
         part,
