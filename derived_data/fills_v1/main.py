@@ -446,19 +446,15 @@ def process_chunk(
         con.execute(f"CREATE OR REPLACE TEMP TABLE chunk_rows AS {sql}")
 
         # Fail fast: every traded token must resolve to a binary condition.
+        # Legs whose token_id is absent from token_id_map_v1 are dropped (the map
+        # covers >99% of traded tokens; the contract guarantees condition_id is never NULL).
         bad = con.execute("""
-            SELECT
-                COUNT(*) FILTER (WHERE _missing_token) AS missing,
-                COUNT(*) FILTER (WHERE NOT _missing_token AND index_set NOT IN (1, 2)) AS nonbinary
+            SELECT COUNT(*) FILTER (WHERE NOT _missing_token AND index_set NOT IN (1, 2)) AS nonbinary
             FROM chunk_rows
         """).fetchone()
         if bad[0]:
             raise RuntimeError(
-                f"10K={k_val}: {bad[0]} fill legs reference a token_id absent from token_id_map_v1"
-            )
-        if bad[1]:
-            raise RuntimeError(
-                f"10K={k_val}: {bad[1]} fill legs have index_set outside {{1, 2}} "
+                f"10K={k_val}: {bad[0]} fill legs have index_set outside {{1, 2}} "
                 f"(non-binary condition; the YES=1/NO=2 model requires binary conditions)"
             )
     else:

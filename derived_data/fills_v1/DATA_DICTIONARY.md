@@ -11,7 +11,7 @@ Files are stored in `$FILLS_V1_DIR`. References below to filenames are relative 
 | Dataset | Role |
 |---|---|
 | `polygon_contract_events_v3` | Primary source — `order_filled` (all four exchanges: `CTFExchange`, `CTFExchangeV2`, `NegRiskCtfExchange`, `NegRiskCtfExchangeV2`), plus the FeeModule `fee_refunded` events (`FeeModuleCTF`, `FeeModuleNegRisk`) used to net v1 fees |
-| `token_id_map_v1` | Lookup — resolves `token_id → condition_id` and `token_id → market_id` for the vast majority of traded outcome tokens. v1 `order_filled` rows carry outcome-token IDs as `maker_asset_id` / `taker_asset_id` and v2 rows as `token_id`, never the condition, so the map is required to attribute a fill to its condition. The map is an approximation (a token enters only when a ConditionalTokens split/merge shares a transaction with an exchange `orders_matched`); coverage exceeds 99% by both row-weighted and distinct-token metrics (see its DATA_DICTIONARY.md). Fills whose token_id is absent from the map receive NULL condition_id/market_id. |
+| `token_id_map_v1` | Lookup — resolves `token_id → condition_id` and `token_id → market_id`. v1 `order_filled` rows carry outcome-token IDs as `maker_asset_id` / `taker_asset_id` and v2 rows as `token_id`, never the condition, so the map is required to attribute a fill to its condition. The map is an approximation (a token enters only when a ConditionalTokens split/merge shares a transaction with an exchange `orders_matched`); coverage exceeds 99% by both row-weighted and distinct-token metrics (see its DATA_DICTIONARY.md). `fills_v1` only materializes legs whose token_id is present in the map; legs for tokens absent from the map are dropped. |
 
 Both upstream datasets must be fully materialized through the target partition before this dataset is produced.
 
@@ -24,13 +24,13 @@ This dataset reuses the logical Parquet types from [`polygon_contract_events_v3`
 | `INT(bitWidth=64, isSigned=true)` | `INT64` | `BIGINT` | Signed condition-token and USDC amounts (6 decimal places) |
 | `BOOLEAN` | `BOOLEAN` | `BOOLEAN` | Boolean flags |
 
-Condition-token amounts and USDC amounts both use 6 decimal places (raw units; `1_000_000` = 1 token or 1 USDC). All amount columns fit comfortably in signed 64 bits. `NULL` is permitted only in the columns marked nullable below; all other columns are guaranteed non-null.
+Condition-token amounts and USDC amounts both use 6 decimal places (raw units; `1_000_000` = 1 token or 1 USDC). All amount columns fit comfortably in signed 64 bits. `NULL` is permitted only for `market_id`; all other columns are guaranteed non-null.
 
 ## Grain
 
 One row per **account leg** of every `order_filled` event, identified by `(block_number, logical_fill_index)`.
 
-Every `order_filled` row maps to exactly one fills_v1 leg. The exchange contract's own marketplace legs (where maker or taker equals an exchange address) are excluded; every row represents a beneficial trader's side of the fill.
+Every `order_filled` row whose outcome token is present in `token_id_map_v1` maps to exactly one fills_v1 leg. The exchange contract's own marketplace legs (where maker or taker equals an exchange address) are excluded; every row represents a beneficial trader's side of the fill. Legs whose `token_id` is absent from `token_id_map_v1` are dropped (the map covers >99% of traded tokens).
 
 ## Schema
 
@@ -42,8 +42,8 @@ Every `order_filled` row maps to exactly one fills_v1 leg. The exchange contract
 | `log_index` | `INT(bitWidth=32, isSigned=false)` | no | Log index of the source `order_filled` |
 | `account` | `"BLOB"` (20 bytes) | no | Trader (wallet) address for this leg |
 | `token_id` | `"BLOB"` (32 bytes) | no | Outcome token ID traded in this leg |
-| `condition_id` | `"BLOB"` (32 bytes) | **yes** | CTF condition the outcome token belongs to, from `token_id_map_v1`; `NULL` when the token is absent from the map (coverage >99%, not 100%) |
-| `market_id` | `"BLOB"` (32 bytes) | **yes** | NegRisk market identifier from `token_id_map_v1`; `NULL` for standard (binary CTF / UMA) conditions or when the token is absent from the map |
+| `condition_id` | `"BLOB"` (32 bytes) | no | CTF condition the outcome token belongs to, from `token_id_map_v1` |
+| `market_id` | `"BLOB"` (32 bytes) | **yes** | NegRisk market identifier from `token_id_map_v1`; `NULL` for standard (binary CTF / UMA) conditions |
 | `is_taker` | `BOOLEAN` | no | `TRUE` for the taker leg of the matched order, `FALSE` for a maker leg |
 | `net_yes_tokens` | `INT(bitWidth=64, isSigned=true)` | no | Signed equivalent change in the condition's YES tokens for this account (fees do not apply to condition tokens): positive for buy YES, negative for sell YES, positive for sell NO, negative for buy NO. 6 decimals. |
 | `gross_usdc` | `INT(bitWidth=64, isSigned=true)` | no | Signed nominal USDC amount before fees: positive for buys (account spends USDC), negative for sells (account receives USDC). Micro USDC, 6 decimals. |
@@ -81,7 +81,7 @@ Fees are charged only in selected markets and the mechanism differs by exchange 
 
 ## Outcome convention (YES = index_set 1, NO = index_set 2)
 
-Per Polymarket's CTF documentation (https://github.com/Polymarket/agent-skills/blob/main/ctf-operations.md: "partition [1, 2] for binary (Yes=1, No=2)"), the YES outcome is index_set 1 and NO is index_set 2. `net_yes_tokens` expresses every leg in YES-equivalent terms. The producer asserts that every traded token has index_set ∈ {1, 2} (binary conditions only) and fails fast on violation.
+Per Polymarket's CTF documentation (<https://github.com/Polymarket/agent-skills/blob/main/ctf-operations.md>: "partition [1, 2] for binary (Yes=1, No=2)"), the YES outcome is index_set 1 and NO is index_set 2. `net_yes_tokens` expresses every leg in YES-equivalent terms. The producer asserts that every traded token has index_set ∈ {1, 2} (binary conditions only) and fails fast on violation.
 
 ## Versioning
 
