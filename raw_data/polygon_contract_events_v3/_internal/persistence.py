@@ -1015,10 +1015,21 @@ class HotStore:
         # Discover partitions on disk. Optimized scan if manifest_frontier known.
         partitions_on_disk: set[int] = set()
 
+        # Fetch the hot DB sunk frontier before the scan so we can extend the window past it.
+        # This prevents a scenario where manifest_frontier lags behind the hot DB sunk frontier
+        # (e.g. after a crash between cold-tier write and hot DB commit_sink), causing the scan
+        # to miss already-landed cold partitions and then re-submit them to the sink pool.
+        sunk_frontier = self.get_sunk_frontier()
+
         if manifest_frontier is not None and manifest_frontier >= SCRAPE_START_BLOCK - 1:
-            # Optimized: scan forward from manifest frontier
+            # Optimized: scan forward from manifest frontier, extended to cover the hot DB sunk
+            # frontier so we always detect cold partitions that were written after the manifest
+            # frontier but before the sunk frontier was updated.
             scan_start = ((manifest_frontier + 1) // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
             scan_limit = scan_start + 1_000_000
+            if sunk_frontier > SCRAPE_START_BLOCK - 1:
+                # Extend window to reach at least 1 full 1M-block band past the sunk frontier.
+                scan_limit = max(scan_limit, sunk_frontier + 1_000_000)
 
             for p in range(scan_start, scan_limit, PARTITION_SIZE_10K):
                 k1m = (p // 1_000_000) * 1_000_000
@@ -1051,7 +1062,6 @@ class HotStore:
                 message=f"found {len(partitions_on_disk)} partitions on disk",
             )
 
-        sunk_frontier = self.get_sunk_frontier()
         if sunk_frontier <= SCRAPE_START_BLOCK - 1:
             expected_next = (SCRAPE_START_BLOCK // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
         else:

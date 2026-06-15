@@ -320,6 +320,10 @@ def process_chunk(
     subsequent partitions in the same run honour the first-seen invariant.
     """
     chunk_dir = Path(OUT_DIR) / partition_dir(k_val)
+    if chunk_dir.exists():
+        sys.exit(
+            f"FATAL: refusing to overwrite immutable partition: {chunk_dir}"
+        )
     chunk_dir.parent.mkdir(parents=True, exist_ok=True)
 
     # Discover candidate grain tuples from this partition's trade-linked CT ops,
