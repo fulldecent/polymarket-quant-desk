@@ -125,6 +125,7 @@ def publish_atomically(
 def cleanup_on_failure(temp_location: TempLocation) -> Iterator[None]:
     """Context manager that ensures temp cleanup if an exception occurs.
     
+    TODO: standardize on one of these patterns
     Usage:
         >>> temp = create_temp_location(...)
         >>> try:
