@@ -1342,7 +1342,9 @@ def main() -> None:
         if backlog:
             _print_message(f"Submitted {len(backlog):,} pre-existing ready partition(s) to the sink pool.")
 
-        gaps = store.find_gaps(SCRAPE_START_BLOCK, chain_head)
+        # Work planning must ignore already-sunk history and only consider
+        # unsunk coverage above the sunk frontier.
+        gaps = store.find_gaps(SCRAPE_START_BLOCK, chain_head, include_sunk=False)
         total_gap_blocks = sum(t - f + 1 for f, t in gaps)
         sunk_frontier = store.get_sunk_frontier()
         loaded_frontier = store.get_loaded_frontier()
@@ -1739,7 +1741,9 @@ def main() -> None:
                     _stop_event.set()
                     break
 
-                new_gaps = store.find_gaps(SCRAPE_START_BLOCK, new_head)
+                # Recompute only unsunk gaps; sunk history is immutable and
+                # must never be re-scheduled.
+                new_gaps = store.find_gaps(SCRAPE_START_BLOCK, new_head, include_sunk=False)
                 new_gap_blocks = sum(t - f + 1 for f, t in new_gaps)
 
                 if new_gap_blocks <= args.lag_tolerance:
