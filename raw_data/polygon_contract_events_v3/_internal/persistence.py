@@ -1033,8 +1033,9 @@ class HotStore:
 
             for p in range(scan_start, scan_limit, PARTITION_SIZE_10K):
                 k1m = (p // 1_000_000) * 1_000_000
-                # Targeted glob within 1M partition boundaries
-                pattern = str(cold_root / "**" / f"1M={k1m}" / f"10K={p}" / "data.parquet")
+                # Cold path: cold_root/<contract>/<event>/1M=.../10K=.../data.parquet
+                # Two wildcard levels needed; recursive=False treats ** as * (one level only).
+                pattern = str(cold_root / "*" / "*" / f"1M={k1m}" / f"10K={p}" / "data.parquet")
                 matches = glob.glob(pattern, recursive=False)
                 if matches:
                     partitions_on_disk.add(p)
