@@ -9,50 +9,83 @@ directory structure.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
-from .partition_utils import PARTITION_10K_LABEL, PARTITION_1M_LABEL, partition_end
+from .partition_utils import (
+    PARTITION_10K_LABEL,
+    PARTITION_10K_SIZE,
+    PARTITION_1M_LABEL,
+    PARTITION_1M_SIZE,
+    partition_end,
+    partition_start,
+)
 
 
-def get_derived_frontier(derived_root: str | Path) -> int:
-    """Return the highest block for which a complete derived partition exists.
+def _partition_folder(base: Path, partition: int) -> Path:
+    """Return ``base/1M=<m>/10K=<k>`` for a 10K-aligned partition start."""
+    m_val = (partition // PARTITION_1M_SIZE) * PARTITION_1M_SIZE
+    return base / f"{PARTITION_1M_LABEL}={m_val}" / f"{PARTITION_10K_LABEL}={partition}"
 
-    Scans the output directory for ``1M=*/10K=*/data.parquet`` + ``metadata.json``
-    pairs and returns the inclusive end block of the highest such partition.
-    Returns ``SCRAPE_START_BLOCK - 1`` (effectively "nothing") if no partitions
-    are present.
 
-    This is the derived-dataset analogue of ``get_sunk_frontier`` for raw data.
-    A derived producer should take the min of all upstream frontiers (raw cold
-    + any prerequisite derived datasets) to decide what it may safely consume.
+def scan_frontier_1M_10K_folders(
+    base_path: str | Path,
+    starting_partition: int,
+    tmp_suffix: str,
+    cb_progress: Callable[[int], None],
+) -> int | None:
+    """Return highest contiguous landed partition from ``starting_partition``.
+
+    Contract:
+    * ``starting_partition`` is required and interpreted as a block number;
+      scanning starts at its containing 10K partition.
+    * Presence of a partition folder is sufficient (no file checks inside).
+    * Temporary sibling folder ``10K=<k>{tmp_suffix}`` invalidates that
+      partition for frontier purposes.
+    * If the starting partition folder is missing, return ``None``.
+    * If the starting partition folder exists but its tmp sibling exists,
+      return ``None``.
+    * On every accepted contiguous partition, invoke ``cb_progress(partition)``.
 
     Args:
-        derived_root: Root directory of a derived dataset (e.g. TOKEN_ID_MAP_V1_DIR).
+        base_path: Dataset root containing 1M/10K folders.
+        starting_partition: First partition to probe (or any block inside it).
+        tmp_suffix: Temp suffix used by atomic publish (for example, ``.tmp``).
+        cb_progress: Called once per accepted contiguous partition.
 
     Returns:
-        Highest block number covered by a complete partition, or a sentinel
-        below SCRAPE_START_BLOCK if nothing is landed.
+        Highest contiguous 10K partition start, or ``None`` if the scan
+        cannot start.
     """
-    from raw_data.polygon_contract_events_v3 import SCRAPE_START_BLOCK
+    root = Path(base_path)
+    if not root.is_dir():
+        return None
 
-    root = Path(derived_root)
-    if not root.exists() or not root.is_dir():
-        return SCRAPE_START_BLOCK - 1
+    current = partition_start(starting_partition)
+    current_dir = _partition_folder(root, current)
+    current_tmp_dir = current_dir.with_name(current_dir.name + tmp_suffix)
 
-    max_k: int | None = None
-    for m_dir in root.glob(f"{PARTITION_1M_LABEL}=*"):
-        if not m_dir.is_dir():
-            continue
-        for k_dir in m_dir.glob(f"{PARTITION_10K_LABEL}=*"):
-            if not k_dir.is_dir():
-                continue
-            data_file = k_dir / "data.parquet"
-            meta_file = k_dir / "metadata.json"
-            if data_file.exists() and meta_file.exists():
-                k_val = int(k_dir.name.split("=")[1])
-                if max_k is None or k_val > max_k:
-                    max_k = k_val
+    if not current_dir.is_dir():
+        return None
+    if current_tmp_dir.exists():
+        return None
 
-    if max_k is None:
-        return SCRAPE_START_BLOCK - 1
+    cb_progress(current)
+    latest = current
 
-    return partition_end(max_k)
+    while True:
+        nxt = latest + PARTITION_10K_SIZE
+        nxt_dir = _partition_folder(root, nxt)
+        nxt_tmp_dir = nxt_dir.with_name(nxt_dir.name + tmp_suffix)
+
+        if nxt_tmp_dir.exists():
+            break
+        if not nxt_dir.is_dir():
+            break
+
+        cb_progress(nxt)
+        latest = nxt
+
+    return latest
+
+
+

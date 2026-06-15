@@ -101,7 +101,7 @@ from lib.atomic_publish import (  # noqa: E402
     publish_atomically,
     cleanup_temp,
 )
-from lib.derived_frontier import get_derived_frontier
+from lib.derived_frontier import scan_frontier_1M_10K_folders
 
 from raw_data.polygon_contract_events_v3 import get_sunk_frontier, SCRAPE_START_BLOCK  # noqa: E402
 
@@ -736,7 +736,17 @@ def main() -> None:
     # The effective frontier is the MIN of the cold dataset and token_id_map_v1;
     # fills_v1 may only consume partitions where BOTH sources are complete.
     cold_frontier = get_sunk_frontier(RAW)
-    token_map_frontier = get_derived_frontier(TOKEN_MAP)
+    token_map_latest = scan_frontier_1M_10K_folders(
+        base_path=TOKEN_MAP,
+        starting_partition=SCRAPE_START_BLOCK,
+        tmp_suffix=".tmp",
+        cb_progress=lambda _partition: None,
+    )
+    token_map_frontier = (
+        partition_end(token_map_latest)
+        if token_map_latest is not None
+        else SCRAPE_START_BLOCK - 1
+    )
     if token_map_frontier < cold_frontier:
         raise RuntimeError(
             f"token_id_map_v1 frontier ({token_map_frontier}) is behind the cold frontier ({cold_frontier}); "

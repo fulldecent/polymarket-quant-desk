@@ -70,6 +70,8 @@ from lib.partition_utils import (  # noqa: E402
     partition_end,
     partition_start,
 )
+from lib.derived_frontier import scan_frontier_1M_10K_folders  # noqa: E402
+
 from lib.run_logging import make_progress, setup_logging  # noqa: E402
 from lib.atomic_publish import (  # noqa: E402
     create_temp_location,
@@ -462,16 +464,24 @@ def main() -> None:
     frontier = get_sunk_frontier(RAW)
     all_partitions = enumerate_partitions(SCRAPE_START_BLOCK, frontier)
 
-    # Already-landed partitions (output folder exists) are immutable and skipped.
-    # They never appear in the progress bar.
-    todo = [
-        (m, k)
-        for (m, k) in all_partitions
-        if not (Path(OUT_DIR) / f"{PARTITION_1M_LABEL}={m}" / f"{PARTITION_10K_LABEL}={k}").exists()
-    ]
+    # Discover self frontier via strict contiguous 1M/10K scanner (tmp-aware),
+    # then plan only partitions above that frontier.
+    latest_landed_partition = scan_frontier_1M_10K_folders(
+        base_path=OUT_DIR,
+        starting_partition=SCRAPE_START_BLOCK,
+        tmp_suffix=".tmp",
+        cb_progress=lambda _partition: None,
+    )
+    self_frontier = (
+        partition_end(latest_landed_partition)
+        if latest_landed_partition is not None
+        else SCRAPE_START_BLOCK - 1
+    )
+    todo_start = max(SCRAPE_START_BLOCK, self_frontier + 1)
+    todo = enumerate_partitions(todo_start, frontier)
 
     log.info(
-        f"frontier={frontier}, start_partition_10K={START_PARTITION_10K}, "
+        f"frontier={frontier}, self_frontier={self_frontier}, start_partition_10K={START_PARTITION_10K}, "
         f"total={len(all_partitions)}, todo={len(todo)}"
     )
 
