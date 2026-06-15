@@ -484,7 +484,7 @@ def read_manifest_frontier(
                 f"expected manifests for 10K={expected} before 10K={pstart}"
             )
         expected += PARTITION_SIZE_10K
-        if progress_cb and (idx % 50 == 0 or idx == len(existing_partitions)):
+        if progress_cb:
             progress_cb(
                 op="manifest",
                 phase="read",
