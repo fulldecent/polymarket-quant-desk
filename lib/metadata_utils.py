@@ -19,7 +19,11 @@ _JSON_COMPACT_SEPARATORS = (",", ":")
 
 @lru_cache(maxsize=1)
 def _current_git_commit(*, repo_root: Path | None = None) -> str:
-    """Return current HEAD commit hash, or ``unknown`` if unavailable."""
+    """Return current HEAD commit hash.
+
+    Provenance is mandatory for every partition. If git metadata is not
+    available, fail fast.
+    """
     root = repo_root if repo_root is not None else Path(__file__).resolve().parents[1]
     try:
         result = subprocess.run(
@@ -27,11 +31,20 @@ def _current_git_commit(*, repo_root: Path | None = None) -> str:
             capture_output=True,
             text=True,
             cwd=str(root),
+            check=True,
         )
-        commit = result.stdout.strip()
-        return commit if commit else "unknown"
-    except Exception:
-        return "unknown"
+    except Exception as e:
+        raise RuntimeError(
+            f"cannot write metadata without provenance; failed to read git HEAD at {root}: {e}"
+        ) from e
+
+    commit = result.stdout.strip()
+    if not commit:
+        raise RuntimeError(
+            f"git returned empty HEAD at {root}; cannot write metadata without provenance"
+        )
+
+    return commit
 
 
 def _parquet_content_hash(parquet_path: Path, *, chunk_size: int = 1 << 20) -> str:
