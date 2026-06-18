@@ -1,5 +1,7 @@
 # Polymarket quant desk
 
+:warning: NOTE: The fills dataset is in early access and may be subject to change. SemVer does not apply to that. The rest is production ready.
+
 An automated suite for analyzing and executing trade strategies against Polymarket
 
 ## Hardware requirements
@@ -46,6 +48,17 @@ Repeat this process periodically to get new data as it is available from the mar
    source .venv/bin/activate
    python raw_data/polygon_contract_events_v3/main.py --parallel 25
    ```
+
+2. Build the derived datasets
+
+   Run each derived producer after the raw scrape, in dependency order (see [docs/Data catalog.md](docs/Data%20catalog.md) for the full graph):
+
+   ```sh
+   source .venv/bin/activate
+   python derived_data/token_id_map_v1/main.py
+   ```
+
+   Each producer is incremental and immutable: it materializes every new 10,000-block partition up to the upstream frontier and never rewrites a landed partition. Shared building blocks for producers live in [lib/](lib/README.md).
 
 ## Explorations
 

@@ -45,34 +45,31 @@
 -- loaded_block_ranges (scraper progress tracking)
 --
 -- This is the ONLY internal/bookkeeping table in this schema; everything else mirrors a Parquet
--- event table. It records every block range whose events have been ingested into the hot DB, and
--- whether that range has been sunk to a cold-tier Parquet partition.
+-- event table. It records every block range whose events have been ingested into the hot DB.
 --
--- Columns are (from_block, to_block, sunk_to_parquet), with from_block and to_block inclusive.
--- 
+-- Columns are (from_block, to_block), with from_block and to_block inclusive.
+--
+-- The "sunk frontier" (highest block fully sunk to cold tier) is tracked in-memory via the
+-- HotStore.sunk_frontier variable, populated from manifest files at startup. Deleted rows are
+-- cleaned up asynchronously after writes are confirmed durable.
+--
 -- Invariants enforced by the application layer:
 --
---   1. Zero or one row may exist with sunk_to_parquet=TRUE. If it exists, its from_block is
---      SCRAPE_START_BLOCK and its to_block is the highest block whose 10K partition has been fully
---      sunk. This row represents the "sunk frontier": all blocks up to and including to_block are
---      sunk, all blocks above to_block are not.
+--   1. from_block <= to_block for every row.
 --
---   2. Every row with sunk_to_parquet=FALSE has from_block > the sunk frontier (or >=
---      SCRAPE_START_BLOCK if no sunk row exists).
+--   2. Rows at or below sunk_frontier may remain temporarily until async cleanup runs.
+--      All planning/ready-to-sink logic must treat only blocks > sunk_frontier as unsunk.
 --
---   3. from_block <= to_block for every row.
---
---   4. No two rows with sunk_to_parquet=FALSE may overlap or even touch. Therefore, for any pair:
+--   3. No two rows may overlap or even touch. Therefore, for any pair:
 --      either a.to_block + 1 < b.from_block (gap of at least one block)
 --      OR     a.from_block > b.to_block + 1.
 --
--- See alse DATA_DICTIONARY.md "Frontier ordering contract" for how these invariants enable
+-- See also DATA_DICTIONARY.md "Frontier ordering contract" for how these invariants enable
 -- frontier-based incremental processing in the sink.
 
 CREATE TABLE IF NOT EXISTS loaded_block_ranges (
     from_block       UINTEGER NOT NULL,
     to_block         UINTEGER NOT NULL,
-    sunk_to_parquet  BOOLEAN  NOT NULL,
 
     PRIMARY KEY (from_block, to_block),
     CHECK (from_block <= to_block)

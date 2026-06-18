@@ -288,7 +288,7 @@ def _publish_manifest_success_atomically(cold_path: Path, partition_start: int) 
     success_file.write_bytes(b"")
 
     # Publish atomically (raises FileExistsError if immutability violated)
-    publish_atomically(temp_location, allow_overwrite=False)
+    publish_atomically(temp_location)
 
 
 def _cleanup_tmp_partition_dirs(cold_path: Path, partition_start: int) -> int:
@@ -440,6 +440,10 @@ def read_manifest_frontier(
     if not manifests_root.is_dir():
         raise V3Error(f"manifests path exists but is not a directory: {manifests_root}")
 
+    # TODO: Consider cutover to the shared strict frontier scanner in lib/
+    # (currently `scan_frontier_1M_10K_folders` in lib/derived_frontier.py).
+    # If/when we move this path over, rename that helper to a neutral name
+    # that is not derived-specific, then reuse it here for manifest frontier reads.
     existing_partitions: list[int] = []
     for partition_dir in manifests_root.glob("1M=*/10K=*"):
         if not partition_dir.is_dir():
@@ -480,7 +484,7 @@ def read_manifest_frontier(
                 f"expected manifests for 10K={expected} before 10K={pstart}"
             )
         expected += PARTITION_SIZE_10K
-        if progress_cb and (idx % 50 == 0 or idx == len(existing_partitions)):
+        if progress_cb:
             progress_cb(
                 op="manifest",
                 phase="read",

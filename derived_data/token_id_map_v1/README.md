@@ -29,4 +29,4 @@ python -m pytest derived_data/token_id_map_v1/tests/data_validation -v
 
 ## Reproducibility
 
-The generated data is row-for-row stable across independent scrapes. Given the same source data and the same code, a fresh run of the scraper against a different storage location produces files whose logical contents match the existing cold tier exactly.
+Given identical source data, this program will always generate Parquet files with the same rows in the same order within each partition.

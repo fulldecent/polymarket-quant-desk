@@ -390,3 +390,18 @@ A consumer that wants the true economic flow must apply:
 - `emit CTFExchangeV2.FeeCharged(address receiver, uint256 amount)` — one emission per fee-bearing leg (one for each of the maker and the taker when both pay a fee). The `amount` is in USDC. There is no `token_id` field (unlike v1 `FeeCharged`). The sum of all `fee_charged.amount` values in a transaction equals the sum of all `order_filled.fee` values in the same transaction.
 
 Unlike v1, there is no FeeModule and no `fee_refunded` event — the `fee` in each `order_filled` is the final amount collected.
+
+### Per-account fee attribution (V2)
+
+For analytics that attribute fees to individual accounts, the key observation is that in `matchOrders` calls — the dominant v2 execution path — every participant submits a signed order and appears as `maker` in their own `order_filled` row. Their personal fee is therefore the `fee` field on that row:
+
+- **SELL maker** (side = 1): net USDC received = `taker_amount_filled − fee`
+- **BUY maker** (side = 0): net USDC paid = `maker_amount_filled + fee`
+
+For `fillOrder` / `fillOrders` calls where a participant acts as `taker` (not `maker`), there is no dedicated row for their fee — the `fee` in the single fill row belongs to the maker's leg. This execution path is rare on v2.
+
+An on-chain invariant holds for every v2 transaction:
+
+$$\sum_{\text{fills}} \text{order\_filled.fee} = \sum_{\text{fee\_charged events}} \text{fee\_charged.amount}$$
+
+This can be used to verify completeness of per-account fee attribution across a transaction. Note that `fee_charged.receiver` in v2 is the fee *recipient* (the protocol), not the fee payer — it cannot be used to identify which account paid.

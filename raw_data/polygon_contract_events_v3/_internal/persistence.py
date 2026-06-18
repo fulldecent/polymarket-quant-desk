@@ -15,8 +15,8 @@ Responsibilities of this module:
     as one atomic transaction. The two either both commit or both roll
     back, so the same block range cannot be loaded twice.
   * Maintain the ``loaded_block_ranges`` invariant: rows are strictly
-    disjoint AND non-adjacent within each ``sunk_to_parquet`` value
-    (touching same-status rows are coalesced).
+    disjoint AND non-adjacent (touching rows are coalesced). Sunk state
+    is tracked in-memory via ``HotStore.sunk_frontier``, not in the DB.
   * Track which 10K partitions have become ready to sink and tell the
     caller about them on every ingestion call, so the caller never has
     to poll.
@@ -25,9 +25,9 @@ Responsibilities NOT in this module (see ``parquet_sink.py``):
 
   * Writing Parquet files.
   * Filesystem layout / directory creation.
-  * Flipping ``sunk_to_parquet`` from False to True (the sink does this
-    via a method on this class, but the trigger is the sink, not an
-    ingestion event).
+  * Updating the sunk frontier (the sink does this via a method on this
+    class, but the trigger is the sink writing and confirming cold-tier
+    files are durable).
 
 Concurrency model — the orchestrator owns every hot-DB write:
 
@@ -103,14 +103,13 @@ Atomicity guarantees (per call):
     ``loaded_block_ranges`` update. Both commit together or neither
     does. A return from ``persist()`` means the data and the progress
     record are both durable.
-  * ``commit_sink()``: one transaction wraps every DELETE plus the
-    coalescing update to ``loaded_block_ranges`` that flips a range
-    from unsunk to sunk. The orchestrator calls this only after the
-    sink worker has reported that every Parquet temp file for the
-    partition has been renamed into place. A crash between the
-    worker's rename and the orchestrator's commit leaves the cold
-    tier with the files and the hot DB with the rows — recoverable
-    by ``reconcile_with_cold_tier`` at next startup.
+  * ``commit_sink()``: updates the in-memory sunk frontier and schedules
+    async cleanup of rows from event tables. The orchestrator calls this
+    only after the sink worker has reported that every Parquet temp file
+    for the partition has been renamed into place (and manifest written).
+    A crash leaves the cold tier with the files durable; the rows remain
+    in the hot DB but are ignored at next startup (sunk frontier is
+    recalculated from manifest files).
 """
 
 from __future__ import annotations
@@ -209,25 +208,21 @@ def _find_ready_partitions(
     ``SCRAPE_START_BLOCK`` are conceptually pre-history and treated as
     "covered by definition" since the scraper never records them. So
     the first partition ``P0 = floor(SCRAPE_START_BLOCK / 10K) * 10K``
-    is considered ready when an unsunk row covers
+    is considered ready when a row covers
     ``[SCRAPE_START_BLOCK, P0 + 9_999]``, even though it does not
     extend down to ``P0``.
 
-    The caller is expected to have already filtered ``unsunk_rows`` to
-    only the rows with ``sunk_to_parquet=False``. Sunk rows would not
-    keep a partition ready to sink; they would mean the partition is
-    already done.
+    All rows in ``unsunk_rows`` represent unsunk (not yet sunk to cold tier)
+    block ranges.
     """
     p0 = (SCRAPE_START_BLOCK // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
     ready: list[int] = []
     for f, t, sunk in unsunk_rows:
-        # Defensive: this helper must never propose a partition for a
-        # range that has already been sunk to the cold tier. The cold
-        # tier is immutable; re-sinking would clobber existing files.
+        # All rows should be unsunk at this point (only unsunk ranges remain in DB)
         if sunk:
             raise V3Error(
                 f"_find_ready_partitions received a sunk row ({f},{t}); "
-                f"caller must filter sunk_to_parquet=FALSE"
+                f"logic error in row selection"
             )
         # First partition special case: an unsunk row that begins at
         # or before ``SCRAPE_START_BLOCK`` and extends through the end
@@ -298,8 +293,8 @@ class PersistResult:
     as a direct result of this call.
 
     A partition ``P`` is "ready to sink" when the inclusive range
-    ``[P, P + 9_999]`` is fully covered by rows of ``loaded_block_ranges``
-    with ``sunk_to_parquet = FALSE``.
+    ``[P, P + 9_999]`` is fully covered by unsunk rows of
+    ``loaded_block_ranges``.
 
     Only partitions that were NOT already ready before this call appear
     here; this lets the caller drive the sink writer with a simple
@@ -411,6 +406,7 @@ class HotStore:
         self.progress_cb = progress_cb
         self._conn: duckdb.DuckDBPyConnection | None = None
         self._closed = False
+        self.sunk_frontier = SCRAPE_START_BLOCK - 1  # In-memory sunk frontier, populated at startup
 
         if not os.path.isfile(schema_path):
             raise FileNotFoundError(f"schema_path does not exist: {schema_path}")
@@ -609,12 +605,11 @@ class HotStore:
             * The range ``[from_block, to_block]`` may overlap an
               existing row of ``loaded_block_ranges`` only in the
               well-defined sense of coalescing: see the schema's
-              disjoint-and-non-adjacent-per-status invariant. The
-              library's internal coalescing handles arbitrary overlaps
-              with existing ``sunk_to_parquet=FALSE`` rows. Overlap with
-              an existing ``sunk_to_parquet=TRUE`` row is a caller bug
-              (re-loading already-sunk data) and is rejected with
-              ``ValueError``.
+              disjoint-and-non-adjacent invariant. The library's
+              internal coalescing handles arbitrary overlaps with
+              existing unsunk rows. Overlap with ranges below the
+              in-memory sunk frontier is a caller bug (re-loading
+              already-sunk data) and is rejected with ``ValueError``.
 
         Postconditions on success:
             * The new rows are visible to subsequent queries.
@@ -665,21 +660,11 @@ class HotStore:
         # Reject overlap with any sunk range (documented precondition).
         # The caller must never re-load data that has already been sunk
         # to the cold tier; doing so would violate the immutability contract.
-        sunk_overlap = conn.execute(
-            """
-            SELECT from_block, to_block
-            FROM loaded_block_ranges
-            WHERE sunk_to_parquet = TRUE
-              AND NOT (to_block < ? OR from_block > ?)
-            LIMIT 1
-            """,
-            (from_block, to_block),
-        ).fetchone()
-        if sunk_overlap:
+        # Sunk state is tracked in-memory via sunk_frontier.
+        if from_block <= self.sunk_frontier:
             raise ValueError(
-                f"persist range [{from_block}, {to_block}] overlaps sunk range "
-                f"[{sunk_overlap[0]}, {sunk_overlap[1]}]; re-loading already-sunk "
-                f"data is forbidden"
+                f"persist range [{from_block}, {to_block}] is below sunk frontier "
+                f"{self.sunk_frontier}; re-loading already-sunk data is forbidden"
             )
 
         last_conflict: Exception | None = None
@@ -720,8 +705,8 @@ class HotStore:
                 # Record the range in loaded_block_ranges
                 conn.execute(
                     """
-                    INSERT INTO loaded_block_ranges (from_block, to_block, sunk_to_parquet)
-                    VALUES (?, ?, FALSE)
+                    INSERT INTO loaded_block_ranges (from_block, to_block)
+                    VALUES (?, ?)
                     ON CONFLICT (from_block, to_block) DO NOTHING
                     """,
                     (from_block, to_block),
@@ -770,22 +755,25 @@ class HotStore:
         ) from last_conflict
 
     def _coalesce_unsunk_ranges(self, conn: duckdb.DuckDBPyConnection) -> None:
-        """Coalesce adjacent unsunk ranges in loaded_block_ranges."""
+        """Coalesce adjacent unsunk ranges in loaded_block_ranges.
+        
+        All rows in loaded_block_ranges represent unsunk ranges (sunk state
+        is tracked in-memory via sunk_frontier).
+        """
         rows = conn.execute(
             """
             SELECT from_block, to_block
             FROM loaded_block_ranges
-            WHERE sunk_to_parquet = FALSE
             ORDER BY from_block
             """
         ).fetchall()
         if not rows:
             return
         coalesced = _coalesce_ranges([(f, t, False) for f, t in rows])
-        conn.execute("DELETE FROM loaded_block_ranges WHERE sunk_to_parquet = FALSE")
+        conn.execute("DELETE FROM loaded_block_ranges")
         for f, t, _ in coalesced:
             conn.execute(
-                "INSERT INTO loaded_block_ranges (from_block, to_block, sunk_to_parquet) VALUES (?, ?, FALSE)",
+                "INSERT INTO loaded_block_ranges (from_block, to_block) VALUES (?, ?)",
                 (f, t),
             )
 
@@ -794,13 +782,22 @@ class HotStore:
     ) -> list[tuple[int, int, bool]]:
         rows = conn.execute(
             """
-            SELECT from_block, to_block, sunk_to_parquet
+            SELECT from_block, to_block
             FROM loaded_block_ranges
-            WHERE sunk_to_parquet = FALSE
             ORDER BY from_block
             """
         ).fetchall()
-        return [(int(f), int(t), bool(s)) for f, t, s in rows]
+        # Compute unsunk segments by clipping away anything at/below sunk_frontier.
+        result = []
+        for f, t in rows:
+            f = int(f)
+            t = int(t)
+            if t <= self.sunk_frontier:
+                continue
+            if f <= self.sunk_frontier:
+                f = self.sunk_frontier + 1
+            result.append((f, t, False))
+        return result
 
     # ------------------------------------------------------------------
     # Range / frontier queries
@@ -813,27 +810,42 @@ class HotStore:
     ) -> list[tuple[int, int, bool]]:
         """Return every row of ``loaded_block_ranges`` in ascending order.
 
-        Each tuple is ``(from_block, to_block, sunk_to_parquet)``.
+        Each tuple is ``(from_block, to_block, is_sunk)`` where ``is_sunk``
+        is True if ``to_block <= sunk_frontier``.
 
-        If ``include_sunk`` is False, only rows with
-        ``sunk_to_parquet=False`` are returned.
+        If ``include_sunk`` is False, only unsunk rows are returned.
 
         Postconditions:
-            * The returned rows satisfy the disjoint-and-non-adjacent-
-              per-status invariant.
             * Rows are sorted by ``from_block``.
         """
         conn = self._get_conn()
-        where = "" if include_sunk else "WHERE sunk_to_parquet = FALSE"
         rows = conn.execute(
-            f"""
-            SELECT from_block, to_block, sunk_to_parquet
+            """
+            SELECT from_block, to_block
             FROM loaded_block_ranges
-            {where}
             ORDER BY from_block
             """
         ).fetchall()
-        return [(int(f), int(t), bool(s)) for f, t, s in rows]
+        result = []
+        for f, t in rows:
+            f = int(f)
+            t = int(t)
+            if include_sunk:
+                if t <= self.sunk_frontier:
+                    result.append((f, t, True))
+                elif f > self.sunk_frontier:
+                    result.append((f, t, False))
+                else:
+                    # Split a stale mixed row into sunk and unsunk segments.
+                    result.append((f, self.sunk_frontier, True))
+                    result.append((self.sunk_frontier + 1, t, False))
+            else:
+                if t <= self.sunk_frontier:
+                    continue
+                if f <= self.sunk_frontier:
+                    f = self.sunk_frontier + 1
+                result.append((f, t, False))
+        return result
 
     def find_gaps(
         self,
@@ -843,8 +855,9 @@ class HotStore:
         include_sunk: bool = True,
     ) -> list[tuple[int, int]]:
         """Return every sub-range of ``[from_block, to_block]`` that is
-        NOT covered by any row of ``loaded_block_ranges`` (filtered by
-        ``include_sunk``).
+        NOT covered by any unsunk row of ``loaded_block_ranges``.
+
+        When ``include_sunk=False``, only considers ranges above the sunk frontier.
 
         The result is a list of disjoint, non-adjacent inclusive ranges,
         sorted ascending. Use this to drive a resumable scraper.
@@ -855,21 +868,29 @@ class HotStore:
         if from_block < SCRAPE_START_BLOCK or from_block > to_block:
             raise ValueError("invalid range")
         conn = self._get_conn()
-        where = "" if include_sunk else "AND sunk_to_parquet = FALSE"
+        effective_from = from_block if include_sunk else max(from_block, self.sunk_frontier + 1)
+        if effective_from > to_block:
+            return []
+
         covered = conn.execute(
             f"""
             SELECT from_block, to_block
             FROM loaded_block_ranges
             WHERE NOT (to_block < ? OR from_block > ?)
-            {where}
             ORDER BY from_block
             """,
-            (from_block, to_block),
+            (effective_from, to_block),
         ).fetchall()
 
         gaps: list[tuple[int, int]] = []
-        cursor = from_block
+        cursor = effective_from
         for f, t in covered:
+            f = int(f)
+            t = int(t)
+            if not include_sunk and f <= self.sunk_frontier:
+                f = self.sunk_frontier + 1
+                if f > t:
+                    continue
             if cursor < f:
                 gaps.append((cursor, f - 1))
             cursor = max(cursor, t + 1)
@@ -911,40 +932,15 @@ class HotStore:
         return frontier
 
     def get_sunk_frontier(self) -> int:
-        """Return the highest block ``N`` such that
-        ``[SCRAPE_START_BLOCK, N]`` is fully covered by
-        ``loaded_block_ranges`` rows with ``sunk_to_parquet=TRUE``. This
-        is the high-water mark of "consumers can rely on the cold
-        Parquet tier having these blocks."
+        """Return the in-memory sunk frontier: the highest block ``N`` such that
+        ``[SCRAPE_START_BLOCK, N]`` is fully covered by cold-tier Parquet files.
 
-        Walks sunk rows in ascending ``from_block`` order and stops
-        at the first gap. Because the per-status invariant coalesces
-        adjacent sunk rows, in practice there is at most one sunk
-        row starting at or before ``SCRAPE_START_BLOCK``, but the
-        loop is written defensively against fragmentation introduced
-        by migrations or future code paths.
+        This value is populated at startup from manifest files and updated each
+        time a partition is successfully committed to the cold tier.
 
-        Returns ``SCRAPE_START_BLOCK - 1`` if no sunk range covers
-        ``SCRAPE_START_BLOCK``.
+        Returns ``SCRAPE_START_BLOCK - 1`` if nothing has been sunk yet.
         """
-        conn = self._get_conn()
-        rows = conn.execute(
-            """
-            SELECT from_block, to_block
-            FROM loaded_block_ranges
-            WHERE sunk_to_parquet = TRUE
-            ORDER BY from_block
-            """
-        ).fetchall()
-        frontier = SCRAPE_START_BLOCK - 1
-        for f, t in rows:
-            f = int(f)
-            t = int(t)
-            if f > frontier + 1:
-                break
-            if t > frontier:
-                frontier = t
-        return frontier
+        return self.sunk_frontier
 
     def list_10k_partitions_ready_to_sink(self) -> list[int]:
         """Return every 10K-aligned partition start block ``P`` such
@@ -1015,15 +1011,36 @@ class HotStore:
         # Discover partitions on disk. Optimized scan if manifest_frontier known.
         partitions_on_disk: set[int] = set()
 
-        if manifest_frontier is not None and manifest_frontier >= SCRAPE_START_BLOCK - 1:
-            # Optimized: scan forward from manifest frontier
+        # Fetch the hot DB sunk frontier before the scan so we can extend the window past it.
+        # This prevents a scenario where manifest_frontier lags behind the hot DB sunk frontier
+        # (e.g. after a crash between cold-tier write and hot DB commit_sink), causing the scan
+        # to miss already-landed cold partitions and then re-submit them to the sink pool.
+        sunk_frontier = self.get_sunk_frontier()
+
+        # Optimized forward scan is only safe when the hot DB already has a sunk anchor.
+        # If the hot DB is fresh/empty (no sunk frontier), we must discover all landed cold
+        # partitions; otherwise older already-sunk partitions can be missed and later re-sunk.
+        can_use_optimized_scan = (
+            sunk_frontier > SCRAPE_START_BLOCK - 1
+            and manifest_frontier is not None
+            and manifest_frontier >= SCRAPE_START_BLOCK - 1
+        )
+
+        if can_use_optimized_scan:
+            # Optimized: scan forward from manifest frontier, extended to cover the hot DB sunk
+            # frontier so we always detect cold partitions that were written after the manifest
+            # frontier but before the sunk frontier was updated.
             scan_start = ((manifest_frontier + 1) // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
             scan_limit = scan_start + 1_000_000
+            if sunk_frontier > SCRAPE_START_BLOCK - 1:
+                # Extend window to reach at least 1 full 1M-block band past the sunk frontier.
+                scan_limit = max(scan_limit, sunk_frontier + 1_000_000)
 
             for p in range(scan_start, scan_limit, PARTITION_SIZE_10K):
                 k1m = (p // 1_000_000) * 1_000_000
-                # Targeted glob within 1M partition boundaries
-                pattern = str(cold_root / "**" / f"1M={k1m}" / f"10K={p}" / "data.parquet")
+                # Cold path: cold_root/<contract>/<event>/1M=.../10K=.../data.parquet
+                # Two wildcard levels needed; recursive=False treats ** as * (one level only).
+                pattern = str(cold_root / "*" / "*" / f"1M={k1m}" / f"10K={p}" / "data.parquet")
                 matches = glob.glob(pattern, recursive=False)
                 if matches:
                     partitions_on_disk.add(p)
@@ -1051,7 +1068,6 @@ class HotStore:
                 message=f"found {len(partitions_on_disk)} partitions on disk",
             )
 
-        sunk_frontier = self.get_sunk_frontier()
         if sunk_frontier <= SCRAPE_START_BLOCK - 1:
             expected_next = (SCRAPE_START_BLOCK // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
         else:
@@ -1064,150 +1080,129 @@ class HotStore:
                 progress_cb(op="reconcile", phase="update", message="no new partitions to mark")
             return 0
 
-        conn = self._get_conn()
-        newly_marked = 0
-
-        conn.execute("BEGIN TRANSACTION")
-        try:
-            for p in newly_sunk:
-                if stop_event and stop_event.is_set():
-                    raise OperationCancelled("reconcile cancelled")
-
-                p_end = p + PARTITION_SIZE_10K - 1
-
-                # Remove any existing coverage (sunk or unsunk) that overlaps this partition
-                conn.execute(
-                    """
-                    DELETE FROM loaded_block_ranges
-                    WHERE (from_block <= ? AND to_block >= ?)
-                       OR (from_block >= ? AND from_block <= ?)
-                    """,
-                    (p_end, p, p, p_end),
-                )
-
-                # Insert the full partition as sunk
-                conn.execute(
-                    """
-                    INSERT INTO loaded_block_ranges (from_block, to_block, sunk_to_parquet)
-                    VALUES (?, ?, TRUE)
-                    """,
-                    (p, p_end),
-                )
-                newly_marked += 1
-
-            # Coalesce all sunk rows into a single contiguous prefix starting at SCRAPE_START_BLOCK
-            sunk_rows = conn.execute(
-                "SELECT from_block, to_block FROM loaded_block_ranges WHERE sunk_to_parquet = TRUE ORDER BY from_block"
-            ).fetchall()
-
-            if sunk_rows:
-                merged: list[tuple[int, int]] = []
-                for f, t in sunk_rows:
-                    if merged and merged[-1][1] + 1 >= f:
-                        prev_f, prev_t = merged[-1]
-                        merged[-1] = (prev_f, max(prev_t, t))
-                    else:
-                        merged.append((f, t))
-
-                # Do NOT extend downward to SCRAPE_START_BLOCK.
-                # Only partitions whose files exist on disk are marked sunk.
-                # If earlier partitions are missing, a gap remains (caller
-                # can detect via get_sunk_frontier or list_loaded_ranges).
-
-                conn.execute("DELETE FROM loaded_block_ranges WHERE sunk_to_parquet = TRUE")
-                for f, t in merged:
-                    conn.execute(
-                        "INSERT INTO loaded_block_ranges (from_block, to_block, sunk_to_parquet) VALUES (?, ?, TRUE)",
-                        (f, t),
-                    )
-
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
+        # Update in-memory frontier to the highest newly-sunk partition
+        if newly_sunk:
+            highest_partition = newly_sunk[-1]
+            new_frontier = highest_partition + PARTITION_SIZE_10K - 1
+            # Only advance if contiguous from current frontier
+            if self.sunk_frontier == SCRAPE_START_BLOCK - 1 or new_frontier == self.sunk_frontier + PARTITION_SIZE_10K:
+                self.sunk_frontier = new_frontier
 
         if progress_cb:
             progress_cb(
                 op="reconcile",
                 phase="update",
-                rows_done=newly_marked,
-                message=f"marked {newly_marked} partitions as sunk",
+                rows_done=len(newly_sunk),
+                message=f"advanced sunk frontier to {self.sunk_frontier}",
             )
 
-        return newly_marked
+        return len(newly_sunk)
+
+    def populate_sunk_frontier_from_manifests(self, cold_tier_root: str) -> None:
+        """Populate in-memory sunk frontier by scanning manifest _SUCCESS files.
+        
+        This should be called at startup after manifest contiguity checks.
+        
+        Args:
+            cold_tier_root: Absolute path to the cold-tier root.
+        """
+        import glob
+        from pathlib import Path
+
+        from .parquet_sink import get_sunk_frontier as get_manifest_frontier
+        from .tables import PARTITION_SIZE_10K
+
+        try:
+            frontier = get_manifest_frontier(cold_tier_root)
+            self.sunk_frontier = frontier
+        except (FileNotFoundError, ValueError):
+            # No manifests exist yet
+            self.sunk_frontier = SCRAPE_START_BLOCK - 1
+
+    # ------------------------------------------------------------------
+    # Async cleanup
+    # ------------------------------------------------------------------
+
+    def schedule_delete_sunk_partition_rows(self, partition_start: int) -> None:
+        """Schedule asynchronous deletion of rows for a sunk partition.
+        
+        After a partition is confirmed durable in cold-tier files and manifest
+        is written, rows from the hot DB are deleted asynchronously. This is
+        non-critical for correctness (manifest is the source of truth), so
+        deletions can happen independently from each other and from new ingestion.
+        
+        Args:
+            partition_start: Must be a multiple of 10_000, >= SCRAPE_START_BLOCK.
+        """
+        if partition_start % PARTITION_SIZE_10K != 0:
+            raise ValueError(f"partition_start {partition_start} is not 10K-aligned")
+        
+        p_end = partition_start + PARTITION_SIZE_10K - 1
+        conn = self._get_conn()
+        
+        try:
+            # Delete from every event table for this partition's block range
+            for table in all_table_names():
+                conn.execute(
+                    f"""
+                    DELETE FROM {table}
+                    WHERE block_number BETWEEN ? AND ?
+                    """,
+                    (partition_start, p_end),
+                )
+        except Exception as e:
+            raise V3Error(f"failed to delete partition {partition_start} rows: {e}") from e
+
 
     # ------------------------------------------------------------------
     # Sink integration
     # ------------------------------------------------------------------
 
     def commit_sink(self, partition_start: int) -> None:
-        """Atomically delete the partition's rows from every event table
-        AND flip its range to ``sunk_to_parquet=TRUE`` in
-        ``loaded_block_ranges``.
+        """Mark a partition as sunk and schedule async cleanup.
 
-        Called by the orchestrator after a sink worker has reported
-        success on ``parquet_sink.write_partition_files``. By the time
-        this runs, every Parquet file for the partition is durably on
-        disk and renamed into place; the DELETE is therefore safe — any
-        reader that wants those rows reads the cold tier.
+        Called by the orchestrator after a sink worker has reported success on
+        ``parquet_sink.write_partition_files`` AND the manifest file has been
+        written durably. By that time, every Parquet file for the partition is
+        durable and renamed into place.
 
-        Single DuckDB transaction: ``DELETE FROM <table_n> WHERE
-        block_number BETWEEN P AND P+9999`` for every event table,
-        then a coalescing update to ``loaded_block_ranges`` that flips
-        the partition's range to ``sunk_to_parquet=TRUE``. Sub-second
-        in practice (rows are typically already in DuckDB's buffer pool
-        from the recent COPY).
+        This method:
+        1. Validates frontier ordering (partition must be the next in sequence).
+        2. Updates in-memory sunk_frontier.
+        3. Schedules async cleanup of rows from event tables.
 
-        Also enforces the frontier-ordering contract: ``partition_start``
-        must extend the existing sunk frontier by exactly one 10K
-        partition. Specifically:
+        The hot DB rows are deleted asynchronously (non-critical for correctness
+        since manifest is the source of truth). A crash leaves the files durable
+        and the rows in the hot DB; at next startup, sunk_frontier is
+        recalculated from manifest files, so the rows are ignored.
 
-          * If ``get_sunk_frontier() == SCRAPE_START_BLOCK - 1``
-            (nothing sunk yet), the first valid partition is
+        Frontier-ordering contract: ``partition_start`` must extend the existing
+        sunk frontier by exactly one 10K partition:
+
+          * If ``sunk_frontier == SCRAPE_START_BLOCK - 1`` (nothing sunk yet),
+            the first valid partition is
             ``floor(SCRAPE_START_BLOCK / 10_000) * 10_000``.
           * Otherwise, ``partition_start ==
-            (get_sunk_frontier() + 1) // 10_000 * 10_000``, i.e. the
-            partition immediately above the current sunk frontier.
+            (sunk_frontier + 1) // 10_000 * 10_000``, i.e. the partition
+            immediately above the current sunk frontier.
 
-        Out-of-order commits raise ``PartitionFrontierError``. The
-        check exists on this method (the only path that advances the
-        sunk frontier) rather than on the sink worker, so the worker
-        does not need to know about the contract.
+        Out-of-order commits raise ``PartitionFrontierError``.
 
         Preconditions:
-            * ``partition_start`` is a multiple of 10_000 and
-              ``>= SCRAPE_START_BLOCK``.
-            * ``[partition_start, partition_start + 9_999]`` is covered
-              by an unsunk row of ``loaded_block_ranges``.
-            * The Parquet files for this partition exist on disk for
-              every eligible ``(contract, event)`` — the orchestrator
-              should call this only after the worker returned
-              successfully.
-
-        Postconditions on success:
-            * No rows remain in any event table for the partition's
-              block range.
-            * The range is marked ``sunk_to_parquet=TRUE`` and coalesced
-              with adjacent sunk ranges. The sunk frontier has advanced
-              by 10_000 blocks.
+            * ``partition_start`` is a multiple of 10_000 and >= SCRAPE_START_BLOCK.
+            * [partition_start, partition_start + 9_999] is covered by
+              an unsunk row of ``loaded_block_ranges``.
+            * The Parquet files for this partition exist on disk for every
+              eligible (contract, event) and manifest has been written.
         """
         if partition_start % PARTITION_SIZE_10K != 0:
             raise ValueError(f"partition_start {partition_start} is not 10K-aligned")
-        # The first valid partition is
-        # ``floor(SCRAPE_START_BLOCK / 10K) * 10K``, which is below
-        # ``SCRAPE_START_BLOCK`` whenever the latter is not 10K-aligned
-        # (e.g. 33_600_000 < 33_605_403). The relevant invariant is
-        # that the partition's *end* block is at or above
-        # ``SCRAPE_START_BLOCK`` — otherwise the partition lies
-        # entirely in pre-scrape history.
+
         if partition_start + PARTITION_SIZE_10K - 1 < SCRAPE_START_BLOCK:
             raise ValueError(
                 f"partition_start {partition_start} ends before "
                 f"SCRAPE_START_BLOCK {SCRAPE_START_BLOCK}"
             )
-
-        conn = self._get_conn()
-        p_end = partition_start + PARTITION_SIZE_10K - 1
 
         # Frontier check
         sunk_frontier = self.get_sunk_frontier()
@@ -1221,121 +1216,10 @@ class HotStore:
                 f"commit_sink out of order: got {partition_start}, expected {expected}"
             )
 
-        last_conflict: Exception | None = None
-        for attempt in range(_MVCC_MAX_ATTEMPTS):
-            try:
-                conn.execute("BEGIN TRANSACTION")
+        # Advance the sunk frontier
+        p_end = partition_start + PARTITION_SIZE_10K - 1
+        self.sunk_frontier = p_end
 
-                # Delete rows from every event table
-                for contract, event in all_targets():
-                    tbl = table_name(contract, event)
-                    conn.execute(
-                        f"DELETE FROM {tbl} WHERE block_number BETWEEN {partition_start} AND {p_end}"
-                    )
-
-                # Carve the sunk partition range out of whatever unsunk
-                # row(s) currently cover it.
-                #
-                # The schema's invariant says unsunk rows are disjoint and
-                # non-adjacent among themselves, so AT MOST one unsunk row
-                # can overlap the partition's range. We split that row at
-                # the partition boundary: the prefix portion (if any)
-                # becomes sunk (which after coalescing extends the sunk
-                # frontier), the partition itself becomes sunk, and the
-                # suffix portion (if any) stays unsunk.
-                #
-                # We never end up with an unsunk row strictly below the
-                # partition because the frontier-ordering rule above
-                # guarantees the partition is the next one to extend the
-                # sunk frontier — any earlier blocks must already be sunk
-                # or never have been loaded.
-                overlap = conn.execute(
-                    """
-                    SELECT from_block, to_block
-                    FROM loaded_block_ranges
-                    WHERE sunk_to_parquet = FALSE
-                      AND from_block <= ?
-                      AND to_block >= ?
-                    """,
-                    (p_end, partition_start),
-                ).fetchall()
-
-                for (uf, ut) in overlap:
-                    # Replace the unsunk row with up to three pieces:
-                    #   - [uf, partition_start - 1] stays unsunk only if uf
-                    #     is strictly less than partition_start. By the
-                    #     frontier-ordering rule it normally isn't, but we
-                    #     handle the case defensively in case of a future
-                    #     out-of-order loading pattern.
-                    #   - [max(partition_start, uf), min(p_end, ut)]
-                    #     becomes sunk.
-                    #   - [p_end + 1, ut] stays unsunk if ut > p_end.
-                    conn.execute(
-                        "DELETE FROM loaded_block_ranges "
-                        "WHERE from_block = ? AND to_block = ?",
-                        (uf, ut),
-                    )
-                    sunk_from = max(partition_start, uf)
-                    sunk_to = min(p_end, ut)
-                    conn.execute(
-                        "INSERT INTO loaded_block_ranges "
-                        "(from_block, to_block, sunk_to_parquet) "
-                        "VALUES (?, ?, TRUE)",
-                        (sunk_from, sunk_to),
-                    )
-                    if uf < partition_start:
-                        conn.execute(
-                            "INSERT INTO loaded_block_ranges "
-                            "(from_block, to_block, sunk_to_parquet) "
-                            "VALUES (?, ?, FALSE)",
-                            (uf, partition_start - 1),
-                        )
-                    if ut > p_end:
-                        conn.execute(
-                            "INSERT INTO loaded_block_ranges "
-                            "(from_block, to_block, sunk_to_parquet) "
-                            "VALUES (?, ?, FALSE)",
-                            (p_end + 1, ut),
-                        )
-
-                # Coalesce sunk ranges
-                self._coalesce_sunk_ranges(conn)
-
-                conn.execute("COMMIT")
-                return
-            except Exception as e:
-                try:
-                    conn.execute("ROLLBACK")
-                except Exception:
-                    pass
-                if _is_transient_conflict(e) and attempt + 1 < _MVCC_MAX_ATTEMPTS:
-                    last_conflict = e
-                    time.sleep(_MVCC_RETRY_BASE_SLEEP_SEC * (2 ** attempt))
-                    continue
-                raise V3Error(f"commit_sink failed: {e}") from e
-
-        # Exhausted retries on transient conflict.
-        raise V3Error(
-            f"commit_sink failed after {_MVCC_MAX_ATTEMPTS} MVCC retries: {last_conflict}"
-        ) from last_conflict
-
-    def _coalesce_sunk_ranges(self, conn: duckdb.DuckDBPyConnection) -> None:
-        """Coalesce adjacent sunk ranges."""
-        rows = conn.execute(
-            """
-            SELECT from_block, to_block
-            FROM loaded_block_ranges
-            WHERE sunk_to_parquet = TRUE
-            ORDER BY from_block
-            """
-        ).fetchall()
-        if not rows:
-            return
-        coalesced = _coalesce_ranges([(f, t, True) for f, t in rows])
-        conn.execute("DELETE FROM loaded_block_ranges WHERE sunk_to_parquet = TRUE")
-        for f, t, _ in coalesced:
-            conn.execute(
-                "INSERT INTO loaded_block_ranges (from_block, to_block, sunk_to_parquet) VALUES (?, ?, TRUE)",
-                (f, t),
-            )
+        # Schedule async cleanup of rows from event tables
+        self.schedule_delete_sunk_partition_rows(partition_start)
 

@@ -1,0 +1,6 @@
+# packages used by exchange_client/ scripts
+# the active venv is at the project root: source ../.venv/bin/activate
+# to add a dependency: pip install <pkg> && pip freeze > ../requirements.txt
+py-clob-client>=0.34
+python-dotenv>=1.0
+requests>=2.31

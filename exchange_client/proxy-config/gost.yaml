@@ -1,0 +1,81 @@
+# GOST TCP port forwarding through Tor SOCKS5
+# Each service creates a raw TCP tunnel from a local port to the upstream,
+# routed through Tor. Caddy sits in front for Host header rewriting.
+
+services:
+  # httpbin (HTTP, port 80)
+  - name: httpbin-bridge
+    addr: 127.0.0.1:18080
+    handler:
+      type: tcp
+      chain: tor
+    listener:
+      type: tcp
+    forwarder:
+      nodes:
+        - name: httpbin
+          addr: httpbin.org:80
+
+  # Polymarket CLOB API (HTTPS, port 443)
+  - name: clob-bridge
+    addr: 127.0.0.1:18081
+    handler:
+      type: tcp
+      chain: tor
+    listener:
+      type: tcp
+    forwarder:
+      nodes:
+        - name: clob
+          addr: clob.polymarket.com:443
+
+  # Polymarket Gamma API (HTTPS, port 443)
+  - name: gamma-bridge
+    addr: 127.0.0.1:18082
+    handler:
+      type: tcp
+      chain: tor
+    listener:
+      type: tcp
+    forwarder:
+      nodes:
+        - name: gamma
+          addr: gamma-api.polymarket.com:443
+
+  # Polymarket Data API (HTTPS, port 443)
+  - name: data-bridge
+    addr: 127.0.0.1:18083
+    handler:
+      type: tcp
+      chain: tor
+    listener:
+      type: tcp
+    forwarder:
+      nodes:
+        - name: data
+          addr: data-api.polymarket.com:443
+
+  # Polymarket Relayer API (HTTPS, port 443)
+  - name: relayer-bridge
+    addr: 127.0.0.1:18084
+    handler:
+      type: tcp
+      chain: tor
+    listener:
+      type: tcp
+    forwarder:
+      nodes:
+        - name: relayer
+          addr: relayer-v2.polymarket.com:443
+
+chains:
+  - name: tor
+    hops:
+      - name: hop-0
+        nodes:
+          - name: tor-socks
+            addr: 127.0.0.1:9050
+            connector:
+              type: socks5
+            dialer:
+              type: tcp

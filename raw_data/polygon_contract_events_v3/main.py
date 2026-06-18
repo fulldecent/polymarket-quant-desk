@@ -979,6 +979,7 @@ def _print_summary(
     loaded = None
     lag = chain_head - SCRAPE_START_BLOCK
     if store is not None:
+        sunk = store.get_sunk_frontier()
         hot_db_blocks = sum(
             (to_b - from_b + 1)
             for from_b, to_b, _ in store.list_loaded_ranges(include_sunk=False)
@@ -1190,6 +1191,14 @@ def main() -> None:
                 _live["startup_detail"] = f"{_live['startup_detail']} {message}"
             _live["startup_done"] = rows_done
             _live["startup_total"] = rows_total
+            # As manifest partitions are validated, reflect the implied sunk
+            # frontier live in the sticky status line.
+            if rows_done is not None:
+                try:
+                    candidate_partition = int(rows_done)
+                    _live["sunk_to"] = candidate_partition + PARTITION_SIZE_10K - 1
+                except (TypeError, ValueError):
+                    pass
 
         try:
             manifest_frontier, manifest_partition_count = read_manifest_frontier(
@@ -1270,6 +1279,9 @@ def main() -> None:
         )
 
         manifest_frontier = get_manifest_frontier(env["cold_root"])
+        # Manifest is the durable source of truth for sunk frontier at startup.
+        store.sunk_frontier = manifest_frontier
+        _live["sunk_to"] = manifest_frontier if manifest_frontier > (SCRAPE_START_BLOCK - 1) else -1
         _live["manifest_to"] = manifest_frontier if manifest_frontier >= 0 else -1
 
         # --- Reconcile hot DB progress with cold tier ----------------
@@ -1330,7 +1342,9 @@ def main() -> None:
         if backlog:
             _print_message(f"Submitted {len(backlog):,} pre-existing ready partition(s) to the sink pool.")
 
-        gaps = store.find_gaps(SCRAPE_START_BLOCK, chain_head)
+        # Work planning must ignore already-sunk history and only consider
+        # unsunk coverage above the sunk frontier.
+        gaps = store.find_gaps(SCRAPE_START_BLOCK, chain_head, include_sunk=False)
         total_gap_blocks = sum(t - f + 1 for f, t in gaps)
         sunk_frontier = store.get_sunk_frontier()
         loaded_frontier = store.get_loaded_frontier()
@@ -1727,7 +1741,9 @@ def main() -> None:
                     _stop_event.set()
                     break
 
-                new_gaps = store.find_gaps(SCRAPE_START_BLOCK, new_head)
+                # Recompute only unsunk gaps; sunk history is immutable and
+                # must never be re-scheduled.
+                new_gaps = store.find_gaps(SCRAPE_START_BLOCK, new_head, include_sunk=False)
                 new_gap_blocks = sum(t - f + 1 for f, t in new_gaps)
 
                 if new_gap_blocks <= args.lag_tolerance:

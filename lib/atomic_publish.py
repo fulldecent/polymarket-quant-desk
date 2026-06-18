@@ -84,29 +84,30 @@ def create_temp_location(
 
 def publish_atomically(
     temp_location: TempLocation,
-    allow_overwrite: bool = False,
 ) -> None:
     """Atomically publish (rename) a temp location to its final location.
-    
+
     Args:
         temp_location: TempLocation from create_temp_location().
-        allow_overwrite: If False (default), raises if final_path already exists.
-    
+
     Raises:
-        FileExistsError: If allow_overwrite=False and final_path exists.
+        FileExistsError: If final_path already exists. Landed partitions are
+            immutable: overwriting cold data is never permitted, so there is no
+            opt-out. A FileExistsError here means something tried to violate the
+            immutability contract and must be investigated.
         FileNotFoundError: If temp_path was removed before rename.
-    
+
     Guarantees:
         - Atomic from reader perspective (uses os.replace).
-        - If final_path exists and allow_overwrite=False, no changes made.
+        - If final_path exists, no changes are made (the write is refused).
         - On success, temp_path no longer exists.
-    
+
     Example:
         >>> temp = create_temp_location("/data/partitions", "1M=1000000/10K=1000000")
         >>> write_data_to(temp.path)
         >>> publish_atomically(temp)  # Now visible at temp.final_path
     """
-    if not allow_overwrite and temp_location.final_path.exists():
+    if temp_location.final_path.exists():
         raise FileExistsError(
             f"refusing to overwrite immutable final location: {temp_location.final_path}"
         )
@@ -124,6 +125,7 @@ def publish_atomically(
 def cleanup_on_failure(temp_location: TempLocation) -> Iterator[None]:
     """Context manager that ensures temp cleanup if an exception occurs.
     
+    TODO: standardize on one of these patterns
     Usage:
         >>> temp = create_temp_location(...)
         >>> try:

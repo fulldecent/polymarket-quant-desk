@@ -46,7 +46,6 @@ import signal
 import sys
 import threading
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 import duckdb
@@ -54,32 +53,26 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from dotenv import load_dotenv
 from rich.console import Console
-from rich.logging import RichHandler
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TaskProgressColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
 
 _project_root = Path(__file__).resolve().parent.parent.parent
 load_dotenv(_project_root / ".env")
 
 sys.path.insert(0, str(_project_root))
 from lib.ct_helpers import get_collection_id, get_position_id  # noqa: E402
+from lib.env import require_env  # noqa: E402
 from lib.git_utils import assert_git_clean  # noqa: E402
 from lib.metadata_utils import create_parquet_metadata_json, parquet_content_hash  # noqa: E402
-from lib.partition_utils import (
+from lib.partition_utils import (  # noqa: E402
     PARTITION_10K_LABEL,
     PARTITION_1M_LABEL,
+    enumerate_partitions,
     partition_dir,
     partition_end,
     partition_start,
 )
+from lib.derived_frontier import scan_frontier_1M_10K_folders  # noqa: E402
+
+from lib.run_logging import make_progress, setup_logging  # noqa: E402
 from lib.atomic_publish import (  # noqa: E402
     create_temp_location,
     publish_atomically,
@@ -132,8 +125,6 @@ NEG_RISK_ADAPTER = bytes.fromhex("d91e80cf2e7be2e162c6513ced06f1dd0da35296")
 # partition with zero new tokens gets a (possibly zero-row) data.parquet and a
 # metadata.json. This matches SCRAPE_START_BLOCK of polygon_contract_events_v3.
 START_PARTITION_10K = partition_start(SCRAPE_START_BLOCK)
-_PARTITION_10K_SIZE = 10_000
-_PARTITION_1M_SIZE = 1_000_000
 
 # Output Parquet schema. Types MUST match the raw polygon_contract_events_v3
 # logical Parquet types so the columns join cleanly:
@@ -163,55 +154,9 @@ _global_con: duckdb.DuckDBPyConnection | None = None
 # configuration
 # ============================================================================
 
-def _require_env(name: str) -> str:
-    val = os.environ.get(name, "")
-    if not val:
-        sys.exit(f"{name} is not set. Add it to .env.")
-    return val
-
-
-RAW      = _require_env("POLYGON_CONTRACT_EVENTS_V3_DIR")
-OUT_DIR  = _require_env("TOKEN_ID_MAP_V1_DIR")
-TEMP_DIR = _require_env("TEMP_DIR")
-
-
-# ============================================================================
-# logging
-# ============================================================================
-
-def _setup_logging() -> logging.Logger:
-    # One timestamped log file per run, under a logs/ folder next to this script.
-    # Filename embeds the run start time in ISO 8601 zulu (basic format, no colons
-    # so it is filesystem-safe).
-    log_dir = Path(__file__).resolve().parent / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
-    log_path = log_dir / f"main-{ts}.log"
-
-    fmt = logging.Formatter(
-        "%(asctime)s  %(levelname)-7s  %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S",
-    )
-    fh = logging.FileHandler(log_path)
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(fmt)
-
-    # Route console logs through the shared rich Console so they cooperate with
-    # the live Progress display (log lines scroll above a pinned progress bar).
-    ch = RichHandler(
-        console=console,
-        show_path=False,
-        rich_tracebacks=True,
-        omit_repeated_times=False,
-    )
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(logging.Formatter("%(message)s", datefmt="%Y-%m-%dT%H:%M:%S"))
-
-    log = logging.getLogger("token_id_map_v1")
-    log.setLevel(logging.DEBUG)
-    log.addHandler(fh)
-    log.addHandler(ch)
-    return log
+RAW      = require_env("POLYGON_CONTRACT_EVENTS_V3_DIR")
+OUT_DIR  = require_env("TOKEN_ID_MAP_V1_DIR")
+TEMP_DIR = require_env("TEMP_DIR")
 
 
 # ============================================================================
@@ -229,8 +174,7 @@ def _write_metadata(
     """Write metadata.json per docs/Metadata files.md schema."""
     part = chunk_dir / "data.parquet"
     if not part.exists():
-        log.warning(f"data.parquet not found at {part}")
-        return
+        raise RuntimeError(f"data.parquet not found at {part} after write; cannot create metadata")
 
     create_parquet_metadata_json(
         part,
@@ -291,6 +235,21 @@ def _parquet_list_literal(paths: list[str]) -> str:
     """Render a DuckDB list literal of single-quoted, escaped file paths."""
     quoted = ["'" + p.replace("'", "''") + "'" for p in paths]
     return "[" + ", ".join(quoted) + "]"
+
+
+def _partition_input_hashes(k_val: int) -> dict[str, str]:
+    """SHA-256 of every raw input partition file read to build this partition.
+
+    Covers the ``orders_matched`` filter tables and the ConditionalTokens
+    split/merge row-source tables for this 10K partition — the files that fully
+    determine which token tuples are discovered here. Keys are paths relative to
+    the raw root so the provenance is portable across storage locations.
+    """
+    hashes: dict[str, str] = {}
+    for path in _existing_partition_paths(ORDERS_MATCHED_TABLES + CT_SPLIT_MERGE_TABLES, k_val):
+        rel = os.path.relpath(path, RAW)
+        hashes[rel] = parquet_content_hash(Path(path))
+    return hashes
 
 
 def _discover_partition_tuples(
@@ -363,6 +322,10 @@ def process_chunk(
     subsequent partitions in the same run honour the first-seen invariant.
     """
     chunk_dir = Path(OUT_DIR) / partition_dir(k_val)
+    if chunk_dir.exists():
+        sys.exit(
+            f"FATAL: refusing to overwrite immutable partition: {chunk_dir}"
+        )
     chunk_dir.parent.mkdir(parents=True, exist_ok=True)
 
     # Discover candidate grain tuples from this partition's trade-linked CT ops,
@@ -420,10 +383,11 @@ def process_chunk(
         final_name=chunk_name,
         temp_suffix=".tmp",
     )
+    input_hashes = _partition_input_hashes(k_val)
     try:
         pq.write_table(new_table, temp_loc.path / "data.parquet", compression="zstd")
-        _write_metadata(con, temp_loc.path, m_val, k_val, {}, log)
-        publish_atomically(temp_loc, allow_overwrite=False)
+        _write_metadata(con, temp_loc.path, m_val, k_val, input_hashes, log)
+        publish_atomically(temp_loc)
         # Record newly materialized tuples so later partitions suppress duplicates.
         if row_count:
             con.register("new_rows", new_table)
@@ -434,7 +398,7 @@ def process_chunk(
             """)
             con.unregister("new_rows")
         log.info(f"10K={k_val}: wrote {row_count} token mappings")
-        return row_count, {}
+        return row_count, input_hashes
     except Exception:
         cleanup_temp(temp_loc)
         raise
@@ -470,21 +434,6 @@ def _load_seen_tuples(con: duckdb.DuckDBPyConnection) -> None:
         pass
 
 
-def _enumerate_consecutive_partitions(frontier: int) -> list[tuple[int, int]]:
-    """Every consecutive 10K partition from START_PARTITION_10K up to the frontier.
-
-    A partition is included only if its inclusive end block is within the frontier
-    (i.e., fully sunk upstream). The result has no gaps.
-    """
-    parts: list[tuple[int, int]] = []
-    k = START_PARTITION_10K
-    while partition_end(k) <= frontier:
-        m = (k // _PARTITION_1M_SIZE) * _PARTITION_1M_SIZE
-        parts.append((m, k))
-        k += _PARTITION_10K_SIZE
-    return parts
-
-
 def main() -> None:
     global _global_con
     parser = argparse.ArgumentParser(description="Materialize token_id_map_v1")
@@ -494,7 +443,7 @@ def main() -> None:
 
     assert_git_clean(_project_root)
 
-    log = _setup_logging()
+    log = setup_logging("token_id_map_v1", __file__, console)
     log.info("token_id_map_v1 materializer starting")
 
     # Install a SIGINT handler for clean interruption.
@@ -513,18 +462,26 @@ def main() -> None:
     # block range, NOT by source-folder existence: a 10K range with no source events
     # still produces a zero-row data.parquet + metadata.json.
     frontier = get_sunk_frontier(RAW)
-    all_partitions = _enumerate_consecutive_partitions(frontier)
+    all_partitions = enumerate_partitions(SCRAPE_START_BLOCK, frontier)
 
-    # Already-landed partitions (output folder exists) are immutable and skipped.
-    # They never appear in the progress bar.
-    todo = [
-        (m, k)
-        for (m, k) in all_partitions
-        if not (Path(OUT_DIR) / f"{PARTITION_1M_LABEL}={m}" / f"{PARTITION_10K_LABEL}={k}").exists()
-    ]
+    # Discover self frontier via strict contiguous 1M/10K scanner (tmp-aware),
+    # then plan only partitions above that frontier.
+    latest_landed_partition = scan_frontier_1M_10K_folders(
+        base_path=OUT_DIR,
+        starting_partition=SCRAPE_START_BLOCK,
+        tmp_suffix=".tmp",
+        cb_progress=lambda _partition: None,
+    )
+    self_frontier = (
+        partition_end(latest_landed_partition)
+        if latest_landed_partition is not None
+        else SCRAPE_START_BLOCK - 1
+    )
+    todo_start = max(SCRAPE_START_BLOCK, self_frontier + 1)
+    todo = enumerate_partitions(todo_start, frontier)
 
     log.info(
-        f"frontier={frontier}, start_partition_10K={START_PARTITION_10K}, "
+        f"frontier={frontier}, self_frontier={self_frontier}, start_partition_10K={START_PARTITION_10K}, "
         f"total={len(all_partitions)}, todo={len(todo)}"
     )
 
@@ -560,16 +517,7 @@ def main() -> None:
         console.print("[green]Nothing to do.[/green]")
         return
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        console=console,
-    ) as progress:
+    with make_progress(console) as progress:
         task = progress.add_task("Materializing token_id_map_v1", total=len(todo))
 
         processed = 0
