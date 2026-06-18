@@ -1,0 +1,68 @@
+# Reverse proxy through GOST TCP bridges (Tor-routed)
+# Each port maps to a local GOST bridge that tunnels to the real upstream.
+
+# httpbin (test endpoint, plain HTTP upstream)
+:9430 {
+	reverse_proxy http://127.0.0.1:18080 {
+		header_up Host httpbin.org
+		header_up -X-Forwarded-For
+		header_up -X-Forwarded-Proto
+		header_up -X-Forwarded-Host
+	}
+}
+
+# Polymarket CLOB API (TLS upstream via raw TCP tunnel)
+:9431 {
+	reverse_proxy https://127.0.0.1:18081 {
+		header_up Host clob.polymarket.com
+		header_up -X-Forwarded-For
+		header_up -X-Forwarded-Proto
+		header_up -X-Forwarded-Host
+		transport http {
+			tls
+			tls_server_name clob.polymarket.com
+		}
+	}
+}
+
+# Polymarket Gamma API (TLS upstream via raw TCP tunnel)
+:9432 {
+	reverse_proxy https://127.0.0.1:18082 {
+		header_up Host gamma-api.polymarket.com
+		header_up -X-Forwarded-For
+		header_up -X-Forwarded-Proto
+		header_up -X-Forwarded-Host
+		transport http {
+			tls
+			tls_server_name gamma-api.polymarket.com
+		}
+	}
+}
+
+# Polymarket Data API (TLS upstream via raw TCP tunnel)
+:9433 {
+	reverse_proxy https://127.0.0.1:18083 {
+		header_up Host data-api.polymarket.com
+		header_up -X-Forwarded-For
+		header_up -X-Forwarded-Proto
+		header_up -X-Forwarded-Host
+		transport http {
+			tls
+			tls_server_name data-api.polymarket.com
+		}
+	}
+}
+
+# Polymarket Relayer API (TLS upstream via raw TCP tunnel)
+:9434 {
+	reverse_proxy https://127.0.0.1:18084 {
+		header_up Host relayer-v2.polymarket.com
+		header_up -X-Forwarded-For
+		header_up -X-Forwarded-Proto
+		header_up -X-Forwarded-Host
+		transport http {
+			tls
+			tls_server_name relayer-v2.polymarket.com
+		}
+	}
+}

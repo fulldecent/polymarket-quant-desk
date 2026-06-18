@@ -1,0 +1,5 @@
+SOCKSPort 127.0.0.1:9050
+ExitNodes {nl}
+StrictNodes 1
+DataDirectory ./tor-data
+AvoidDiskWrites 1
