@@ -1302,6 +1302,16 @@ def main() -> None:
     # Used for deterministic fill suppression (fills outside [first_seen, resolved) are excluded).
     _build_unified_token_cache(con, log, frontier)
 
+    # Initialize running balance state (updated per partition).
+    con.execute("""
+        CREATE OR REPLACE TEMP TABLE balances (
+            account BLOB,
+            condition_id BLOB,
+            bal HUGEINT
+        )
+    """)
+    log.info("initialized running balance table")
+
     console.print(
         f"frontier={frontier}  |  total={len(all_partitions):,}  |  "
         f"[green]{len(all_partitions) - len(todo):,} already landed[/green]  |  "
