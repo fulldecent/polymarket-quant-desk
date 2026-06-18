@@ -1075,12 +1075,17 @@ def process_chunk(
 
         t_bal_start = time.perf_counter()
         touched_keys, touched_conditions, new_keys = _update_balances(con)
+        
+        # Prune resolved balances: once a condition is resolved, no more fills can occur.
+        # Delete the balances for that condition to shrink state continuously.
+        pruned_keys, pruned_conditions = _prune_resolved_balances(con, partition_end(k_val), log)
+        
         t_bal = time.perf_counter() - t_bal_start
 
         total_elapsed = time.perf_counter() - t0
         log.info(f"10K={k_val}: wrote {row_count:,} fill legs")
         log.info(
-            "telemetry 10K=%s partition=%s/%s rows=%s touched_keys=%s touched_conditions=%s new_keys=%s",
+            "telemetry 10K=%s partition=%s/%s rows=%s touched_keys=%s touched_conditions=%s new_keys=%s pruned_keys=%s pruned_conditions=%s",
             k_val,
             partition_idx,
             total_partitions,
@@ -1088,6 +1093,8 @@ def process_chunk(
             f"{touched_keys:,}",
             f"{touched_conditions:,}",
             f"{new_keys:,}",
+            f"{pruned_keys:,}",
+            f"{pruned_conditions:,}",
         )
         log.info(
             "telemetry 10K=%s timing build=%s write=%s metadata=%s publish=%s update_balances=%s total=%s",
@@ -1163,6 +1170,38 @@ def _update_balances(con: duckdb.DuckDBPyConnection) -> tuple[int, int, int]:
         WHERE b.account IS NULL
     """)
     return int(touched_stats[0]), int(touched_stats[1]), int(new_keys)
+
+
+def _prune_resolved_balances(con: duckdb.DuckDBPyConnection, up_to_block: int, log: logging.Logger) -> tuple[int, int]:
+    """Delete balances for conditions that have resolved up to this block.
+    
+    Once a condition is resolved, no more fills can occur (they are suppressed by the query),
+    so we can delete the balance entries to reduce memory footprint.
+    
+    Returns:
+        pruned_keys, pruned_conditions
+    """
+    stats = con.execute("""
+        SELECT
+            COUNT(*) AS pruned_keys,
+            COUNT(DISTINCT b.condition_id) AS pruned_conditions
+        FROM balances b
+        INNER JOIN token_cache tc ON b.condition_id = tc.condition_id
+        WHERE tc.resolved_block IS NOT NULL AND tc.resolved_block <= ?
+    """, [up_to_block]).fetchone()
+    
+    pruned_keys, pruned_conditions = int(stats[0]), int(stats[1])
+    
+    if pruned_keys > 0:
+        con.execute("""
+            DELETE FROM balances b
+            WHERE condition_id IN (
+                SELECT condition_id FROM token_cache
+                WHERE resolved_block IS NOT NULL AND resolved_block <= ?
+            )
+        """, [up_to_block])
+    
+    return pruned_keys, pruned_conditions
 
 
 # ============================================================================
