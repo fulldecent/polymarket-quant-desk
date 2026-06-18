@@ -227,6 +227,11 @@ def _parse_size_text_to_bytes(size_text: str | None) -> int | None:
     return int(magnitude * factor)
 
 
+def _sql_quote(value: str) -> str:
+    """Escape single quotes for safe embedding in SQL string literals."""
+    return value.replace("'", "''")
+
+
 def _duckdb_memory_usage_bytes(con: duckdb.DuckDBPyConnection) -> int | None:
     """Best-effort process memory telemetry from DuckDB runtime state."""
     try:
@@ -769,6 +774,8 @@ def process_chunk(
     partition_idx: int,
     total_partitions: int,
     telemetry_every: int,
+    profile_build_query: bool,
+    profile_output_dir: Path | None,
 ) -> int:
     """Process one 10K partition: build legs, assign order/position, write atomically.
 
@@ -788,8 +795,24 @@ def process_chunk(
     if leg_paths:
         t_build_start = time.perf_counter()
         sql = _build_partition_sql(k_val, leg_paths)
-        con.execute(f"CREATE OR REPLACE TEMP TABLE chunk_rows AS {sql}")
+        profile_path: Path | None = None
+        if profile_build_query:
+            if profile_output_dir is None:
+                raise RuntimeError("profile_output_dir must be set when profile_build_query is enabled")
+            profile_output_dir.mkdir(parents=True, exist_ok=True)
+            profile_path = profile_output_dir / f"build-10K={k_val}.json"
+            con.execute("PRAGMA enable_profiling='json'")
+            con.execute(f"PRAGMA profiling_output='{_sql_quote(profile_path.as_posix())}'")
+
+        try:
+            con.execute(f"CREATE OR REPLACE TEMP TABLE chunk_rows AS {sql}")
+        finally:
+            if profile_build_query:
+                con.execute("PRAGMA disable_profiling")
+
         t_build = time.perf_counter() - t_build_start
+        if profile_path is not None:
+            log.info(f"telemetry 10K={k_val} duckdb_build_profile={profile_path.as_posix()}")
 
         # Drop legs for token_ids not present in token_id_map_v1; this is an allowed
         # approximation documented by token_id_map_v1 and fills_v1 contracts.
@@ -1012,12 +1035,32 @@ def main() -> None:
         default=10,
         help="log full balances snapshot every N processed partitions (0 disables periodic snapshots)",
     )
+    parser.add_argument(
+        "--duckdb-profile-build",
+        action="store_true",
+        help="write DuckDB JSON profile for each build query (CREATE TABLE chunk_rows AS ...)",
+    )
+    parser.add_argument(
+        "--duckdb-profile-dir",
+        default="",
+        help="directory for DuckDB build-query profiles (default: fills_v1/logs/profiles/<run-timestamp>)",
+    )
     args = parser.parse_args()
 
     assert_git_clean(_project_root)
 
     log = setup_logging("fills_v1", __file__, console)
     log.info("fills_v1 materializer starting")
+
+    profile_output_dir: Path | None = None
+    if args.duckdb_profile_build:
+        if args.duckdb_profile_dir:
+            profile_output_dir = Path(args.duckdb_profile_dir)
+        else:
+            run_ts = time.strftime("%Y-%m-%dT%H%M%SZ", time.gmtime())
+            profile_output_dir = Path(__file__).resolve().parent / "logs" / "profiles" / run_ts
+        profile_output_dir.mkdir(parents=True, exist_ok=True)
+        log.info(f"duckdb build-query profiling enabled; output_dir={profile_output_dir.as_posix()}")
 
     def _handle_sigint(sig, frame):
         _stop_event.set()
@@ -1103,6 +1146,8 @@ def main() -> None:
                 partition_idx=partition_idx,
                 total_partitions=len(todo),
                 telemetry_every=args.telemetry_every,
+                profile_build_query=args.duckdb_profile_build,
+                profile_output_dir=profile_output_dir,
             )
             processed += 1
             progress.update(task, advance=1)
