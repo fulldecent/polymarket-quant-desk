@@ -600,19 +600,56 @@ def _ensure_balances_sidecar(con: duckdb.DuckDBPyConnection, log: logging.Logger
         log.info("balances sidecar missing; bootstrap from historical fills (one-time cost)")
         _bootstrap_balances_sidecar(con, log)
 
-    # Load sidecar into temp table (purpose-built, read-only for this run)
+    # Load sidecar into temp table (purpose-built, read-only for this run).
+    # The sidecar stores immutable per-partition snapshots of touched keys, so
+    # the same (account, condition_id) can appear across many files over time.
+    # Carry-in requires the latest snapshot per key, not all historical rows.
     con.execute("""
-        CREATE OR REPLACE TEMP TABLE balances (account BLOB, condition_id BLOB, bal HUGEINT)
+        CREATE OR REPLACE TEMP TABLE balances (
+            account BLOB,
+            condition_id BLOB,
+            bal HUGEINT
+        )
     """)
     glob = f"{sidecar_root}/**/*.parquet"
     try:
+        raw_rows = con.execute(f"SELECT COUNT(*) FROM read_parquet('{glob}')").fetchone()[0]
         con.execute(f"""
             INSERT INTO balances
             SELECT account, condition_id, ending_balance AS bal
-            FROM read_parquet('{glob}')
+            FROM (
+                SELECT
+                    account,
+                    condition_id,
+                    ending_balance,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY account, condition_id
+                        ORDER BY CAST(regexp_extract(filename, '10K=([0-9]+)', 1) AS UINTEGER) DESC
+                    ) AS rn
+                FROM read_parquet('{glob}', filename = true)
+            ) s
+            WHERE rn = 1
         """)
+
+        dup_keys = con.execute("""
+            SELECT COUNT(*)
+            FROM (
+                SELECT account, condition_id
+                FROM balances
+                GROUP BY account, condition_id
+                HAVING COUNT(*) > 1
+            )
+        """).fetchone()[0]
+        if dup_keys:
+            raise RuntimeError(
+                f"balances carry-in must be unique by (account, condition_id); found {dup_keys:,} duplicate keys"
+            )
+
         n = con.execute("SELECT COUNT(*) FROM balances").fetchone()[0]
-        log.info(f"loaded {n:,} running (account, condition) balances from sidecar")
+        log.info(
+            f"loaded {n:,} latest running (account, condition) balances from sidecar "
+            f"({raw_rows:,} historical snapshot rows scanned)"
+        )
     except duckdb.IOException:
         raise RuntimeError(
             "balances sidecar is empty after bootstrap; this is a bug in the bootstrap logic"
