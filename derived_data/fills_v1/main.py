@@ -641,7 +641,31 @@ def _load_condition_resolution(con: duckdb.DuckDBPyConnection, log: logging.Logg
         return
 
     n = con.execute("SELECT COUNT(*) FROM condition_resolution").fetchone()[0]
-    log.info(f"loaded {n:,} resolved conditions for telemetry")
+
+    # Telemetry clarity: raw condition_resolution universe is not guaranteed to be
+    # a subset of token_id_map_v1 conditions. Report overlap explicitly.
+    overlap = con.execute("""
+        WITH tok_conditions AS (
+            SELECT DISTINCT condition_id
+            FROM tok
+        )
+        SELECT
+            (SELECT COUNT(*) FROM tok_conditions) AS tok_condition_count,
+            (SELECT COUNT(*) FROM condition_resolution) AS resolved_condition_count,
+            (
+                SELECT COUNT(*)
+                FROM condition_resolution r
+                INNER JOIN tok_conditions t USING (condition_id)
+            ) AS resolved_in_token_map
+    """).fetchone()
+
+    log.info(
+        "loaded %s resolved conditions for telemetry (token_map_conditions=%s, overlap=%s, outside_token_map=%s)",
+        f"{n:,}",
+        f"{int(overlap[0]):,}",
+        f"{int(overlap[2]):,}",
+        f"{int(overlap[1] - overlap[2]):,}",
+    )
 
 
 def _balances_sidecar_dir() -> Path:
@@ -720,34 +744,51 @@ def _ensure_balances_sidecar(con: duckdb.DuckDBPyConnection, log: logging.Logger
             f"sidecar latest-load strategy=one_shot_hive_partition elapsed={_format_seconds(time.perf_counter() - t_load_start)}"
         )
     except duckdb.OutOfMemoryException:
-        # Fallback path: newest->oldest anti-join merge. Slower, but robust when
-        # memory headroom is too tight for the one-shot window.
-        log.warning("sidecar one-shot latest-load OOM; falling back to incremental merge strategy")
+        # Fallback path: process newest 1M groups first. Each group does an
+        # intra-batch latest-per-key collapse then anti-joins against already
+        # loaded keys. This is much faster than per-file merging while using
+        # substantially less memory than a global one-shot window.
+        log.warning("sidecar one-shot latest-load OOM; falling back to batched incremental merge strategy")
 
-        def _k_from_sidecar_path(path: Path) -> int:
-            match = re.search(r"10K=([0-9]+)", path.as_posix())
+        def _m_from_sidecar_path(path: Path) -> int:
+            match = re.search(r"1M=([0-9]+)", path.as_posix())
             if not match:
-                raise RuntimeError(f"invalid sidecar path without 10K partition label: {path}")
+                raise RuntimeError(f"invalid sidecar path without 1M partition label: {path}")
             return int(match.group(1))
 
-        sidecar_files.sort(key=_k_from_sidecar_path, reverse=True)
-        for idx, path in enumerate(sidecar_files, start=1):
-            p = _sql_quote(path.as_posix())
+        m_dirs = [d for d in sidecar_root.glob("1M=*") if d.is_dir()]
+        m_dirs.sort(key=_m_from_sidecar_path, reverse=True)
+        total_groups = len(m_dirs)
+
+        for idx, m_dir in enumerate(m_dirs, start=1):
+            batch_glob = _sql_quote((m_dir / "10K=*" / "balances.parquet").as_posix())
             con.execute(f"""
                 INSERT INTO balances
-                SELECT s.account, s.condition_id, s.bal
+                SELECT b.account, b.condition_id, b.bal
                 FROM (
+                    WITH latest_in_batch AS (
+                        SELECT
+                            account,
+                            condition_id,
+                            ending_balance,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY account, condition_id
+                                ORDER BY "10K" DESC
+                            ) AS rn
+                        FROM read_parquet('{batch_glob}', hive_partitioning = 1)
+                    )
                     SELECT account, condition_id, ending_balance AS bal
-                    FROM read_parquet('{p}')
-                ) s
-                LEFT JOIN balances b
-                  ON b.account = s.account AND b.condition_id = s.condition_id
-                WHERE b.account IS NULL
+                    FROM latest_in_batch
+                    WHERE rn = 1
+                ) b
+                LEFT JOIN balances existing
+                  ON existing.account = b.account AND existing.condition_id = b.condition_id
+                WHERE existing.account IS NULL
             """)
-            if idx % 250 == 0 or idx == len(sidecar_files):
-                log.info(f"sidecar latest-load progress: files={idx:,}/{len(sidecar_files):,}")
+            if idx % 10 == 0 or idx == total_groups:
+                log.info(f"sidecar latest-load progress: groups={idx:,}/{total_groups:,}")
         log.info(
-            f"sidecar latest-load strategy=incremental_merge elapsed={_format_seconds(time.perf_counter() - t_load_start)}"
+            f"sidecar latest-load strategy=batched_incremental_merge elapsed={_format_seconds(time.perf_counter() - t_load_start)}"
         )
 
     dup_keys = con.execute("""
