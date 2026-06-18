@@ -394,7 +394,9 @@ def _build_partition_sql(k_val: int, leg_paths: list[tuple[dict, str]]) -> str:
       taker_legs  the is_taker legs (one per atomic match)
       assoc       each maker leg's match key + the match's taker direction,
                   found by ASOF (next taker-self leg at a higher log_index)
-      enriched    join token_id_map (condition_id, index_set, market_id) + fees
+    enriched_v1 v1-only enrichment (joins refunds)
+    enriched_v2 v2-only enrichment (no refunds join)
+    enriched    union of v1/v2 enriched rows
       indexed     assign logical_fill_index per block
       final       add net_yes_position_after running balance and project columns
     """
@@ -428,7 +430,7 @@ def _build_partition_sql(k_val: int, leg_paths: list[tuple[dict, str]]) -> str:
          AND m.neg_log_index >= t.neg_log_index
         WHERE m.is_taker OR t.order_hash IS NOT NULL
     ),
-    enriched AS (
+    enriched_v1 AS (
         SELECT
             a.block_number,
             a.transaction_index,
@@ -447,12 +449,11 @@ def _build_partition_sql(k_val: int, leg_paths: list[tuple[dict, str]]) -> str:
               * (CASE WHEN tok.index_set = 1 THEN 1 ELSE -1 END) ) AS net_yes_tokens,
             -- gross_usdc: +c for buys (spend), -c for sells (receive)
             ( a.c * (CASE WHEN a.buy THEN 1 ELSE -1 END) ) AS gross_usdc,
-            -- fee_usdc: USDC-denominated net fee only; v1 nets via FeeModule refund,
-            -- v2 uses the native fee; buy-side (token) fees contribute 0.
+                        -- fee_usdc (v1): USDC-denominated net fee only; v1 nets via FeeModule
+                        -- refund; buy-side (token) fees contribute 0.
             ( CASE
                 WHEN NOT a.fee_is_usdc THEN 0
-                WHEN a.is_v1 THEN COALESCE(r.fee_charged, 0)
-                ELSE a.gross_fee
+                                ELSE COALESCE(r.fee_charged, 0)
               END ) AS fee_usdc,
             -- best-for-taker maker price ordering value: taker buying -> cheapest
             -- first (ascending price); taker selling -> highest first (descending).
@@ -460,7 +461,77 @@ def _build_partition_sql(k_val: int, leg_paths: list[tuple[dict, str]]) -> str:
         FROM assoc a
         LEFT JOIN tok ON a.token_id = tok.token_id
         LEFT JOIN refunds r
-          ON a.is_v1 AND a.transaction_hash = r.transaction_hash AND a.order_hash = r.order_hash
+                    ON a.transaction_hash = r.transaction_hash AND a.order_hash = r.order_hash
+                WHERE a.is_v1
+        ),
+        enriched_v2 AS (
+                SELECT
+                        a.block_number,
+                        a.transaction_index,
+                        a.log_index,
+                        a.account,
+                        a.token_id,
+                        tok.condition_id,
+                        tok.market_id,
+                        tok.index_set,
+                        a.is_taker,
+                        a.match_key,
+                        a.taker_buys,
+                        -- net_yes_tokens: q * direction(+buy/-sell) * outcome(+YES/-NO)
+                        ( a.q
+                            * (CASE WHEN a.buy THEN 1 ELSE -1 END)
+                            * (CASE WHEN tok.index_set = 1 THEN 1 ELSE -1 END) ) AS net_yes_tokens,
+                        -- gross_usdc: +c for buys (spend), -c for sells (receive)
+                        ( a.c * (CASE WHEN a.buy THEN 1 ELSE -1 END) ) AS gross_usdc,
+                        -- fee_usdc (v2): USDC-denominated native fee only; buy-side (token)
+                        -- fees contribute 0.
+                        ( CASE
+                                WHEN NOT a.fee_is_usdc THEN 0
+                                ELSE a.gross_fee
+                            END ) AS fee_usdc,
+                        -- best-for-taker maker price ordering value: taker buying -> cheapest
+                        -- first (ascending price); taker selling -> highest first (descending).
+                        ( (a.c::DOUBLE / a.q::DOUBLE) * (CASE WHEN a.taker_buys THEN 1 ELSE -1 END) ) AS price_rank
+                FROM assoc a
+                LEFT JOIN tok ON a.token_id = tok.token_id
+                WHERE NOT a.is_v1
+        ),
+        enriched AS (
+                SELECT
+                        block_number,
+                        transaction_index,
+                        log_index,
+                        account,
+                        token_id,
+                        condition_id,
+                        market_id,
+                        index_set,
+                        is_taker,
+                        match_key,
+                        taker_buys,
+                        net_yes_tokens,
+                        gross_usdc,
+                        fee_usdc,
+                        price_rank
+                FROM enriched_v1
+                UNION ALL
+                SELECT
+                        block_number,
+                        transaction_index,
+                        log_index,
+                        account,
+                        token_id,
+                        condition_id,
+                        market_id,
+                        index_set,
+                        is_taker,
+                        match_key,
+                        taker_buys,
+                        net_yes_tokens,
+                        gross_usdc,
+                        fee_usdc,
+                        price_rank
+                FROM enriched_v2
     ),
     keyed AS (
         SELECT
@@ -621,36 +692,63 @@ def _ensure_balances_sidecar(con: duckdb.DuckDBPyConnection, log: logging.Logger
         log.info("balances sidecar has no files; starting with empty carry-in balances")
         return
 
-    def _k_from_sidecar_path(path: Path) -> int:
-        match = re.search(r"10K=([0-9]+)", path.as_posix())
-        if not match:
-            raise RuntimeError(f"invalid sidecar path without 10K partition label: {path}")
-        return int(match.group(1))
+    glob = _sql_quote(f"{sidecar_root}/**/*.parquet")
 
-    # Memory-safe latest-per-key load: process sidecar files newest->oldest,
-    # inserting only keys not already loaded. The first observed row for a key
-    # is therefore its latest snapshot.
-    sidecar_files.sort(key=_k_from_sidecar_path, reverse=True)
-
-    raw_rows = 0
-    for idx, path in enumerate(sidecar_files, start=1):
-        p = _sql_quote(path.as_posix())
-        raw_rows += con.execute(f"SELECT COUNT(*) FROM read_parquet('{p}')").fetchone()[0]
+    # Fast path: let DuckDB resolve latest-per-key directly using hive partition
+    # metadata (10K) instead of per-file Python loops.
+    t_load_start = time.perf_counter()
+    raw_rows = con.execute(f"SELECT COUNT(*) FROM read_parquet('{glob}')").fetchone()[0]
+    try:
         con.execute(f"""
             INSERT INTO balances
-            SELECT s.account, s.condition_id, s.bal
-            FROM (
-                SELECT account, condition_id, ending_balance AS bal
-                FROM read_parquet('{p}')
-            ) s
-            LEFT JOIN balances b
-              ON b.account = s.account AND b.condition_id = s.condition_id
-            WHERE b.account IS NULL
-        """)
-        if idx % 250 == 0 or idx == len(sidecar_files):
-            log.info(
-                f"sidecar latest-load progress: files={idx:,}/{len(sidecar_files):,}"
+            WITH latest AS (
+                SELECT
+                    account,
+                    condition_id,
+                    ending_balance,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY account, condition_id
+                        ORDER BY "10K" DESC
+                    ) AS rn
+                FROM read_parquet('{glob}', hive_partitioning = 1)
             )
+            SELECT account, condition_id, ending_balance AS bal
+            FROM latest
+            WHERE rn = 1
+        """)
+        log.info(
+            f"sidecar latest-load strategy=one_shot_hive_partition elapsed={_format_seconds(time.perf_counter() - t_load_start)}"
+        )
+    except duckdb.OutOfMemoryException:
+        # Fallback path: newest->oldest anti-join merge. Slower, but robust when
+        # memory headroom is too tight for the one-shot window.
+        log.warning("sidecar one-shot latest-load OOM; falling back to incremental merge strategy")
+
+        def _k_from_sidecar_path(path: Path) -> int:
+            match = re.search(r"10K=([0-9]+)", path.as_posix())
+            if not match:
+                raise RuntimeError(f"invalid sidecar path without 10K partition label: {path}")
+            return int(match.group(1))
+
+        sidecar_files.sort(key=_k_from_sidecar_path, reverse=True)
+        for idx, path in enumerate(sidecar_files, start=1):
+            p = _sql_quote(path.as_posix())
+            con.execute(f"""
+                INSERT INTO balances
+                SELECT s.account, s.condition_id, s.bal
+                FROM (
+                    SELECT account, condition_id, ending_balance AS bal
+                    FROM read_parquet('{p}')
+                ) s
+                LEFT JOIN balances b
+                  ON b.account = s.account AND b.condition_id = s.condition_id
+                WHERE b.account IS NULL
+            """)
+            if idx % 250 == 0 or idx == len(sidecar_files):
+                log.info(f"sidecar latest-load progress: files={idx:,}/{len(sidecar_files):,}")
+        log.info(
+            f"sidecar latest-load strategy=incremental_merge elapsed={_format_seconds(time.perf_counter() - t_load_start)}"
+        )
 
     dup_keys = con.execute("""
         SELECT COUNT(*)
