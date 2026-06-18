@@ -621,24 +621,36 @@ def _ensure_balances_sidecar(con: duckdb.DuckDBPyConnection, log: logging.Logger
         log.info("balances sidecar has no files; starting with empty carry-in balances")
         return
 
-    glob = f"{sidecar_root}/**/*.parquet"
-    raw_rows = con.execute(f"SELECT COUNT(*) FROM read_parquet('{glob}')").fetchone()[0]
-    con.execute(f"""
-        INSERT INTO balances
-        SELECT account, condition_id, ending_balance AS bal
-        FROM (
-            SELECT
-                account,
-                condition_id,
-                ending_balance,
-                ROW_NUMBER() OVER (
-                    PARTITION BY account, condition_id
-                    ORDER BY CAST(regexp_extract(filename, '10K=([0-9]+)', 1) AS UINTEGER) DESC
-                ) AS rn
-            FROM read_parquet('{glob}', filename = true)
-        ) s
-        WHERE rn = 1
-    """)
+    def _k_from_sidecar_path(path: Path) -> int:
+        match = re.search(r"10K=([0-9]+)", path.as_posix())
+        if not match:
+            raise RuntimeError(f"invalid sidecar path without 10K partition label: {path}")
+        return int(match.group(1))
+
+    # Memory-safe latest-per-key load: process sidecar files newest->oldest,
+    # inserting only keys not already loaded. The first observed row for a key
+    # is therefore its latest snapshot.
+    sidecar_files.sort(key=_k_from_sidecar_path, reverse=True)
+
+    raw_rows = 0
+    for idx, path in enumerate(sidecar_files, start=1):
+        p = _sql_quote(path.as_posix())
+        raw_rows += con.execute(f"SELECT COUNT(*) FROM read_parquet('{p}')").fetchone()[0]
+        con.execute(f"""
+            INSERT INTO balances
+            SELECT s.account, s.condition_id, s.bal
+            FROM (
+                SELECT account, condition_id, ending_balance AS bal
+                FROM read_parquet('{p}')
+            ) s
+            LEFT JOIN balances b
+              ON b.account = s.account AND b.condition_id = s.condition_id
+            WHERE b.account IS NULL
+        """)
+        if idx % 250 == 0 or idx == len(sidecar_files):
+            log.info(
+                f"sidecar latest-load progress: files={idx:,}/{len(sidecar_files):,}"
+            )
 
     dup_keys = con.execute("""
         SELECT COUNT(*)
