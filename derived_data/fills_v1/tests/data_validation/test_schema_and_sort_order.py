@@ -116,21 +116,26 @@ def test_physical_sort_order():
 
 def test_logical_fill_index_unique_per_block():
     """Within each block, logical_fill_index is unique (gaps are allowed)."""
+    d = _fills_dir()
     con = _connect()
-    glob = _fills_data_glob()
-    bad = con.execute(
-        f"""
-        SELECT COUNT(*) FROM (
-            SELECT block_number,
-                   COUNT(*) AS c,
-                   COUNT(DISTINCT logical_fill_index) AS d
-            FROM read_parquet('{glob}')
-            GROUP BY block_number
-            HAVING c <> d
-        )
+    bad_blocks = 0
+    for pq_path in sorted(d.rglob("data.parquet")):
+        if "/_balances/" in pq_path.as_posix():
+            continue
+        q = f"""
+            SELECT COUNT(*)
+            FROM (
+                SELECT block_number,
+                       COUNT(*) AS c,
+                       COUNT(DISTINCT logical_fill_index) AS d
+                FROM read_parquet('{pq_path.as_posix()}')
+                GROUP BY block_number
+                HAVING c <> d
+            )
         """
-    ).fetchone()[0]
-    assert bad == 0, f"found {bad} blocks with duplicate logical_fill_index values"
+        bad_blocks += int(con.execute(q).fetchone()[0])
+
+    assert bad_blocks == 0, f"found {bad_blocks} blocks with duplicate logical_fill_index values"
 
 
 def test_blob_column_byte_lengths():

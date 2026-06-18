@@ -83,6 +83,12 @@ Fees are charged only in selected markets and the mechanism differs by exchange 
 
 Per Polymarket's CTF documentation (<https://github.com/Polymarket/agent-skills/blob/main/ctf-operations.md>: "partition [1, 2] for binary (Yes=1, No=2)"), the YES outcome is index_set 1 and NO is index_set 2. `net_yes_tokens` expresses every leg in YES-equivalent terms. The producer asserts that every traded token has index_set ∈ {1, 2} (binary conditions only) and fails fast on violation.
 
+## Row suppression: fills after condition resolution
+
+Fills that occur after the resolution of their condition are suppressed from output and do not appear in any partition file. A fill is suppressed if its `(block_number, log_index)` is strictly after the `(block_number, log_index)` of the `ConditionalTokens/condition_resolution` event for its `condition_id`.
+
+This suppression is deterministic and depends only on the condition's resolution timestamp (on-chain), not on partition boundaries or producer state. The same fill will always be suppressed or included across all runs. Consumers should never observe fills with `condition_id` values in resolved states at their respective `(block_number, log_index)` tuples.
+
 ## Versioning
 
 This is `v1`. The producer shall not make a material breaking change to the schema, ordering, or guarantees without incrementing the version.

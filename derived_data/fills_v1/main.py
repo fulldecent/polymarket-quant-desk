@@ -163,6 +163,12 @@ TEMP_DIR  = require_env("TEMP_DIR")
 
 BALANCES_SUBDIR = "_balances"
 
+# Sidecar one-shot latest-key collapse is very fast when it fits in memory, but
+# on large histories it can OOM after significant work. If historical snapshot
+# row count exceeds this threshold, skip one-shot and go directly to batched
+# incremental merge.
+_SIDECAR_ONE_SHOT_MAX_ROWS = 75_000_000
+
 _SIZE_UNITS = {
     "bytes": 1,
     "byte": 1,
@@ -437,16 +443,15 @@ def _build_partition_sql(k_val: int, leg_paths: list[tuple[dict, str]]) -> str:
             a.log_index,
             a.account,
             a.token_id,
-            tok.condition_id,
-            tok.market_id,
-            tok.index_set,
+            tc.condition_id,
+            tc.market_id,
             a.is_taker,
             a.match_key,
             a.taker_buys,
             -- net_yes_tokens: q * direction(+buy/-sell) * outcome(+YES/-NO)
             ( a.q
               * (CASE WHEN a.buy THEN 1 ELSE -1 END)
-              * (CASE WHEN tok.index_set = 1 THEN 1 ELSE -1 END) ) AS net_yes_tokens,
+              * (CASE WHEN tok_index.index_set = 1 THEN 1 ELSE -1 END) ) AS net_yes_tokens,
             -- gross_usdc: +c for buys (spend), -c for sells (receive)
             ( a.c * (CASE WHEN a.buy THEN 1 ELSE -1 END) ) AS gross_usdc,
                         -- fee_usdc (v1): USDC-denominated net fee only; v1 nets via FeeModule
@@ -457,9 +462,19 @@ def _build_partition_sql(k_val: int, leg_paths: list[tuple[dict, str]]) -> str:
               END ) AS fee_usdc,
             -- best-for-taker maker price ordering value: taker buying -> cheapest
             -- first (ascending price); taker selling -> highest first (descending).
-            ( (a.c::DOUBLE / a.q::DOUBLE) * (CASE WHEN a.taker_buys THEN 1 ELSE -1 END) ) AS price_rank
+            ( (a.c::DOUBLE / a.q::DOUBLE) * (CASE WHEN a.taker_buys THEN 1 ELSE -1 END) ) AS price_rank,
+            -- Suppression flag: keep if within [first_seen, resolved) range.
+            ( tc.condition_id IS NULL
+              OR a.block_number < tc.first_seen_block
+              OR (tc.resolved_block IS NOT NULL 
+                  AND (a.block_number > tc.resolved_block
+                       OR (a.block_number = tc.resolved_block AND a.log_index >= tc.resolved_log_index)))
+            ) AS _suppressed
         FROM assoc a
-        LEFT JOIN tok ON a.token_id = tok.token_id
+        LEFT JOIN token_cache tc ON a.token_id = tc.token_id
+        LEFT JOIN (
+            SELECT token_id, index_set FROM read_parquet('{TOKEN_MAP}/**/*.parquet')
+        ) tok_index ON a.token_id = tok_index.token_id
         LEFT JOIN refunds r
                     ON a.transaction_hash = r.transaction_hash AND a.order_hash = r.order_hash
                 WHERE a.is_v1
@@ -471,16 +486,15 @@ def _build_partition_sql(k_val: int, leg_paths: list[tuple[dict, str]]) -> str:
                         a.log_index,
                         a.account,
                         a.token_id,
-                        tok.condition_id,
-                        tok.market_id,
-                        tok.index_set,
+                        tc.condition_id,
+                        tc.market_id,
                         a.is_taker,
                         a.match_key,
                         a.taker_buys,
                         -- net_yes_tokens: q * direction(+buy/-sell) * outcome(+YES/-NO)
                         ( a.q
                             * (CASE WHEN a.buy THEN 1 ELSE -1 END)
-                            * (CASE WHEN tok.index_set = 1 THEN 1 ELSE -1 END) ) AS net_yes_tokens,
+                            * (CASE WHEN tok_index.index_set = 1 THEN 1 ELSE -1 END) ) AS net_yes_tokens,
                         -- gross_usdc: +c for buys (spend), -c for sells (receive)
                         ( a.c * (CASE WHEN a.buy THEN 1 ELSE -1 END) ) AS gross_usdc,
                         -- fee_usdc (v2): USDC-denominated native fee only; buy-side (token)
@@ -491,10 +505,20 @@ def _build_partition_sql(k_val: int, leg_paths: list[tuple[dict, str]]) -> str:
                             END ) AS fee_usdc,
                         -- best-for-taker maker price ordering value: taker buying -> cheapest
                         -- first (ascending price); taker selling -> highest first (descending).
-                        ( (a.c::DOUBLE / a.q::DOUBLE) * (CASE WHEN a.taker_buys THEN 1 ELSE -1 END) ) AS price_rank
+                        ( (a.c::DOUBLE / a.q::DOUBLE) * (CASE WHEN a.taker_buys THEN 1 ELSE -1 END) ) AS price_rank,
+                        -- Suppression flag: keep if within [first_seen, resolved) range.
+                        ( tc.condition_id IS NULL
+                          OR a.block_number < tc.first_seen_block
+                          OR (tc.resolved_block IS NOT NULL 
+                              AND (a.block_number > tc.resolved_block
+                                   OR (a.block_number = tc.resolved_block AND a.log_index >= tc.resolved_log_index)))
+                        ) AS _suppressed
                 FROM assoc a
-                LEFT JOIN tok ON a.token_id = tok.token_id
-                WHERE NOT a.is_v1
+                LEFT JOIN token_cache tc ON a.token_id = tc.token_id
+                LEFT JOIN (
+                    SELECT token_id, index_set FROM read_parquet('{TOKEN_MAP}/**/*.parquet')
+                ) tok_index ON a.token_id = tok_index.token_id
+                WHERE a.is_v2
         ),
         enriched AS (
                 SELECT
@@ -505,14 +529,14 @@ def _build_partition_sql(k_val: int, leg_paths: list[tuple[dict, str]]) -> str:
                         token_id,
                         condition_id,
                         market_id,
-                        index_set,
                         is_taker,
                         match_key,
                         taker_buys,
                         net_yes_tokens,
                         gross_usdc,
                         fee_usdc,
-                        price_rank
+                        price_rank,
+                        _suppressed
                 FROM enriched_v1
                 UNION ALL
                 SELECT
@@ -523,21 +547,28 @@ def _build_partition_sql(k_val: int, leg_paths: list[tuple[dict, str]]) -> str:
                         token_id,
                         condition_id,
                         market_id,
-                        index_set,
                         is_taker,
                         match_key,
                         taker_buys,
                         net_yes_tokens,
                         gross_usdc,
                         fee_usdc,
-                        price_rank
+                        price_rank,
+                        _suppressed
                 FROM enriched_v2
+    ),
+    tok_index_all AS (
+        SELECT DISTINCT token_id, index_set FROM read_parquet('{TOKEN_MAP}/**/*.parquet')
     ),
     keyed AS (
         SELECT
-            *,
-            MIN(log_index) OVER (PARTITION BY block_number, transaction_index, match_key) AS match_order_key
-        FROM enriched
+            e.*,
+            COALESCE(e.match_key, e.order_hash) AS match_order_key,
+            tok.index_set,
+            MIN(e.log_index) OVER (PARTITION BY e.block_number, e.transaction_index, e.match_key) AS match_min_log
+        FROM enriched e
+        LEFT JOIN tok_index_all tok ON e.token_id = tok.token_id
+        WHERE NOT e._suppressed AND e.condition_id IS NOT NULL
     ),
     indexed AS (
         SELECT
@@ -573,8 +604,7 @@ def _build_partition_sql(k_val: int, leg_paths: list[tuple[dict, str]]) -> str:
                 ORDER BY block_number, logical_fill_index
                 ROWS UNBOUNDED PRECEDING)
             AS BIGINT)                        AS net_yes_position_after,
-        index_set,
-        condition_id IS NULL                  AS _missing_token
+        index_set
     FROM indexed
     LEFT JOIN balances bal USING (account, condition_id)
     ORDER BY block_number, logical_fill_index
@@ -585,87 +615,92 @@ def _build_partition_sql(k_val: int, leg_paths: list[tuple[dict, str]]) -> str:
 # token_id_map + running-balance state
 # ============================================================================
 
-def _load_token_map(con: duckdb.DuckDBPyConnection, log: logging.Logger) -> None:
-    """Load token_id -> (condition_id, index_set, market_id) into a temp table once."""
-    glob = f"{TOKEN_MAP}/**/*.parquet"
+def _build_unified_token_cache(con: duckdb.DuckDBPyConnection, log: logging.Logger, frontier: int) -> None:
+    """Build unified token lifecycle cache: token_id → condition_id, market_id, first_seen_block, resolved_block, resolved_log_index.
+    
+    One-time startup operation that creates a temp table used for fill suppression and lifecycle tracking.
+    Table is incrementally updated per partition as new resolutions are encountered.
+    """
+    # Load token_id_map with first-seen block (lowest partition containing the token).
+    # token_id_map partitioning is 1M/10K like fills_v1; minimum block in partition = 10K * lower.
+    tok_glob = f"{TOKEN_MAP}/**/*.parquet"
     con.execute("""
-        CREATE OR REPLACE TEMP TABLE tok (
-            token_id BLOB, condition_id BLOB, index_set UINTEGER, market_id BLOB
+        CREATE OR REPLACE TEMP TABLE token_cache (
+            token_id BLOB,
+            condition_id BLOB,
+            market_id BLOB,
+            first_seen_block UINTEGER,
+            resolved_block UINTEGER,
+            resolved_log_index UINTEGER
         )
     """)
     try:
         con.execute(f"""
-            INSERT INTO tok
-            SELECT token_id, condition_id, index_set, market_id
-            FROM read_parquet('{glob}')
+            INSERT INTO token_cache
+            WITH tok_raw AS (
+                SELECT token_id, condition_id, market_id, "10K" AS partition_10k
+                FROM read_parquet('{tok_glob}', hive_partitioning=1)
+            )
+            SELECT
+                token_id,
+                condition_id,
+                market_id,
+                CAST(MIN(partition_10k) AS UINTEGER) AS first_seen_block,
+                CAST(NULL AS UINTEGER) AS resolved_block,
+                CAST(NULL AS UINTEGER) AS resolved_log_index
+            FROM tok_raw
+            GROUP BY token_id, condition_id, market_id
         """)
     except duckdb.IOException:
         raise RuntimeError(
             "token_id_map_v1 has no parquet files; fills_v1 requires a complete token map. "
             "Run token_id_map_v1 first and ensure TOKEN_ID_MAP_V1_DIR is populated."
         )
-    n = con.execute("SELECT COUNT(*) FROM tok").fetchone()[0]
+    
+    n = con.execute("SELECT COUNT(*) FROM token_cache").fetchone()[0]
     if n == 0:
         raise RuntimeError(
             "token_id_map_v1 is empty; fills_v1 requires a complete token map. "
             "Run token_id_map_v1 first and ensure TOKEN_ID_MAP_V1_DIR is populated."
         )
-    log.info(f"loaded {n:,} token_id_map rows")
-
-
-def _load_condition_resolution(con: duckdb.DuckDBPyConnection, log: logging.Logger, frontier: int) -> None:
-    """Load first resolution block per condition for telemetry-only what-if analysis."""
-    glob = f"{RAW}/ConditionalTokens/condition_resolution/**/*.parquet"
-    con.execute("""
-        CREATE OR REPLACE TEMP TABLE condition_resolution (
-            condition_id BLOB,
-            resolved_block UINTEGER
-        )
-    """)
+    log.info(f"loaded {n:,} tokens into unified cache (first_seen_block assigned)")
+    
+    # Load condition resolutions up to frontier and merge into cache.
+    res_glob = f"{RAW}/ConditionalTokens/condition_resolution/**/*.parquet"
     try:
-        con.execute(
-            f"""
-            INSERT INTO condition_resolution
-            SELECT
-                condition_id,
-                CAST(MIN(block_number) AS UINTEGER) AS resolved_block
-            FROM read_parquet('{glob}')
-            WHERE block_number <= ?
-            GROUP BY condition_id
-            """,
-            [frontier],
-        )
+        con.execute(f"""
+            WITH ordered AS (
+                SELECT
+                    condition_id,
+                    block_number,
+                    log_index,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY condition_id
+                        ORDER BY block_number, log_index
+                    ) AS rn
+                FROM read_parquet('{res_glob}')
+                WHERE block_number <= ?
+            ),
+            resolutions AS (
+                SELECT
+                    condition_id,
+                    CAST(block_number AS UINTEGER) AS resolved_block,
+                    CAST(log_index AS UINTEGER) AS resolved_log_index
+                FROM ordered
+                WHERE rn = 1
+            )
+            UPDATE token_cache tc
+            SET
+                resolved_block = r.resolved_block,
+                resolved_log_index = r.resolved_log_index
+            FROM resolutions r
+            WHERE tc.condition_id = r.condition_id
+        """, [frontier])
     except duckdb.IOException:
-        log.warning("condition_resolution table not found in raw data; resolved-condition telemetry disabled")
-        con.execute("DROP TABLE IF EXISTS condition_resolution")
-        return
-
-    n = con.execute("SELECT COUNT(*) FROM condition_resolution").fetchone()[0]
-
-    # Telemetry clarity: raw condition_resolution universe is not guaranteed to be
-    # a subset of token_id_map_v1 conditions. Report overlap explicitly.
-    overlap = con.execute("""
-        WITH tok_conditions AS (
-            SELECT DISTINCT condition_id
-            FROM tok
-        )
-        SELECT
-            (SELECT COUNT(*) FROM tok_conditions) AS tok_condition_count,
-            (SELECT COUNT(*) FROM condition_resolution) AS resolved_condition_count,
-            (
-                SELECT COUNT(*)
-                FROM condition_resolution r
-                INNER JOIN tok_conditions t USING (condition_id)
-            ) AS resolved_in_token_map
-    """).fetchone()
-
-    log.info(
-        "loaded %s resolved conditions for telemetry (token_map_conditions=%s, overlap=%s, outside_token_map=%s)",
-        f"{n:,}",
-        f"{int(overlap[0]):,}",
-        f"{int(overlap[2]):,}",
-        f"{int(overlap[1] - overlap[2]):,}",
-    )
+        log.info("condition_resolution not found in raw data; tokens will not have resolution bounds")
+    
+    resolved_count = con.execute("SELECT COUNT(*) FROM token_cache WHERE resolved_block IS NOT NULL").fetchone()[0]
+    log.info(f"merged {resolved_count:,} resolved conditions into token cache")
 
 
 def _balances_sidecar_dir() -> Path:
@@ -718,38 +753,14 @@ def _ensure_balances_sidecar(con: duckdb.DuckDBPyConnection, log: logging.Logger
 
     glob = _sql_quote(f"{sidecar_root}/**/*.parquet")
 
-    # Fast path: let DuckDB resolve latest-per-key directly using hive partition
-    # metadata (10K) instead of per-file Python loops.
     t_load_start = time.perf_counter()
     raw_rows = con.execute(f"SELECT COUNT(*) FROM read_parquet('{glob}')").fetchone()[0]
-    try:
-        con.execute(f"""
-            INSERT INTO balances
-            WITH latest AS (
-                SELECT
-                    account,
-                    condition_id,
-                    ending_balance,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY account, condition_id
-                        ORDER BY "10K" DESC
-                    ) AS rn
-                FROM read_parquet('{glob}', hive_partitioning = 1)
-            )
-            SELECT account, condition_id, ending_balance AS bal
-            FROM latest
-            WHERE rn = 1
-        """)
-        log.info(
-            f"sidecar latest-load strategy=one_shot_hive_partition elapsed={_format_seconds(time.perf_counter() - t_load_start)}"
-        )
-    except duckdb.OutOfMemoryException:
+
+    def _load_balances_batched_incremental() -> None:
         # Fallback path: process newest 1M groups first. Each group does an
         # intra-batch latest-per-key collapse then anti-joins against already
         # loaded keys. This is much faster than per-file merging while using
         # substantially less memory than a global one-shot window.
-        log.warning("sidecar one-shot latest-load OOM; falling back to batched incremental merge strategy")
-
         def _m_from_sidecar_path(path: Path) -> int:
             match = re.search(r"1M=([0-9]+)", path.as_posix())
             if not match:
@@ -790,6 +801,41 @@ def _ensure_balances_sidecar(con: duckdb.DuckDBPyConnection, log: logging.Logger
         log.info(
             f"sidecar latest-load strategy=batched_incremental_merge elapsed={_format_seconds(time.perf_counter() - t_load_start)}"
         )
+
+    if raw_rows > _SIDECAR_ONE_SHOT_MAX_ROWS:
+        log.info(
+            "sidecar latest-load skipping one-shot: raw_rows=%s exceeds threshold=%s",
+            f"{raw_rows:,}",
+            f"{_SIDECAR_ONE_SHOT_MAX_ROWS:,}",
+        )
+        _load_balances_batched_incremental()
+    else:
+        # Fast path: let DuckDB resolve latest-per-key directly using hive
+        # partition metadata (10K) instead of per-file Python loops.
+        try:
+            con.execute(f"""
+                INSERT INTO balances
+                WITH latest AS (
+                    SELECT
+                        account,
+                        condition_id,
+                        ending_balance,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY account, condition_id
+                            ORDER BY "10K" DESC
+                        ) AS rn
+                    FROM read_parquet('{glob}', hive_partitioning = 1)
+                )
+                SELECT account, condition_id, ending_balance AS bal
+                FROM latest
+                WHERE rn = 1
+            """)
+            log.info(
+                f"sidecar latest-load strategy=one_shot_hive_partition elapsed={_format_seconds(time.perf_counter() - t_load_start)}"
+            )
+        except duckdb.OutOfMemoryException:
+            log.warning("sidecar one-shot latest-load OOM; falling back to batched incremental merge strategy")
+            _load_balances_batched_incremental()
 
     dup_keys = con.execute("""
         SELECT COUNT(*)
@@ -892,18 +938,36 @@ def _write_balances_sidecar_partition(con: duckdb.DuckDBPyConnection, k_val: int
     # We need the ending balance for exactly the keys that had activity in this partition.
     # We can derive it from chunk_rows (which still exists) or from the updated balances.
     # Using chunk_rows is precise: the last row per key in chunk_rows has the ending value.
-    con.execute(f"""
-        CREATE OR REPLACE TEMP TABLE touched AS
-        SELECT
-            account,
-            condition_id,
-            net_yes_position_after AS ending_balance
-        FROM chunk_rows
-        QUALIFY ROW_NUMBER() OVER (
-            PARTITION BY account, condition_id
-            ORDER BY logical_fill_index DESC
-        ) = 1
-    """)
+    if _table_exists(con, "condition_resolution"):
+        con.execute(f"""
+            CREATE OR REPLACE TEMP TABLE touched AS
+            SELECT
+                c.account,
+                c.condition_id,
+                c.net_yes_position_after AS ending_balance
+            FROM chunk_rows c
+            LEFT JOIN condition_resolution r
+              ON c.condition_id = r.condition_id
+             AND r.resolved_block <= {partition_end(k_val)}
+            WHERE r.condition_id IS NULL
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY c.account, c.condition_id
+                ORDER BY c.logical_fill_index DESC
+            ) = 1
+        """)
+    else:
+        con.execute(f"""
+            CREATE OR REPLACE TEMP TABLE touched AS
+            SELECT
+                account,
+                condition_id,
+                net_yes_position_after AS ending_balance
+            FROM chunk_rows
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY account, condition_id
+                ORDER BY logical_fill_index DESC
+            ) = 1
+        """)
 
     con.execute(f"""
         COPY (SELECT account, condition_id, ending_balance FROM touched)
@@ -943,6 +1007,8 @@ def process_chunk(
     leg_paths = [(exch, path) for exch, path in leg_paths if path]
 
     dropped = 0
+    suppressed_rows = 0
+    suppressed_conditions = 0
     if leg_paths:
         t_build_start = time.perf_counter()
         sql = _build_partition_sql(k_val, leg_paths)
@@ -965,19 +1031,6 @@ def process_chunk(
         if profile_path is not None:
             log.info(f"telemetry 10K={k_val} duckdb_build_profile={profile_path.as_posix()}")
 
-        # Drop legs for token_ids not present in token_id_map_v1; this is an allowed
-        # approximation documented by token_id_map_v1 and fills_v1 contracts.
-        dropped = con.execute("""
-            SELECT COUNT(*)
-            FROM chunk_rows
-            WHERE _missing_token
-        """).fetchone()[0]
-        if dropped:
-            con.execute("DELETE FROM chunk_rows WHERE _missing_token")
-            log.warning(
-                f"10K={k_val}: dropped {dropped} fill legs with token_ids absent from token_id_map_v1"
-            )
-
         # Fail fast: mapped tokens must resolve to a binary condition.
         bad = con.execute("""
             SELECT
@@ -997,18 +1050,6 @@ def process_chunk(
 
     select_cols = ", ".join(_OUTPUT_COLUMNS)
     row_count = con.execute("SELECT COUNT(*) FROM chunk_rows").fetchone()[0]
-
-    post_resolution_rows = 0
-    post_resolution_conditions = 0
-    if _table_exists(con, "condition_resolution"):
-        post_resolution_rows, post_resolution_conditions = con.execute("""
-            SELECT
-                COUNT(*) AS rows_after_resolution,
-                COUNT(DISTINCT c.condition_id) AS conditions_after_resolution
-            FROM chunk_rows c
-            JOIN condition_resolution r USING (condition_id)
-            WHERE c.block_number > r.resolved_block
-        """).fetchone()
 
     temp_loc = create_temp_location(parent_dir=chunk_dir.parent, final_name=chunk_dir.name, temp_suffix=".tmp")
     input_hashes = _partition_input_hashes(k_val)
@@ -1033,43 +1074,28 @@ def process_chunk(
         touched_keys, touched_conditions, new_keys = _update_balances(con)
         t_bal = time.perf_counter() - t_bal_start
 
-        t_sidecar_start = time.perf_counter()
-        _write_balances_sidecar_partition(con, k_val, log)
-        t_sidecar = time.perf_counter() - t_sidecar_start
-
         total_elapsed = time.perf_counter() - t0
         log.info(f"10K={k_val}: wrote {row_count:,} fill legs")
         log.info(
-            "telemetry 10K=%s partition=%s/%s rows=%s dropped_missing=%s touched_keys=%s touched_conditions=%s new_keys=%s post_resolution_rows=%s post_resolution_conditions=%s",
+            "telemetry 10K=%s partition=%s/%s rows=%s touched_keys=%s touched_conditions=%s new_keys=%s",
             k_val,
             partition_idx,
             total_partitions,
             f"{row_count:,}",
-            f"{int(dropped):,}",
             f"{touched_keys:,}",
             f"{touched_conditions:,}",
             f"{new_keys:,}",
-            f"{int(post_resolution_rows):,}",
-            f"{int(post_resolution_conditions):,}",
         )
         log.info(
-            "telemetry 10K=%s timing build=%s write=%s metadata=%s publish=%s update_balances=%s sidecar=%s total=%s",
+            "telemetry 10K=%s timing build=%s write=%s metadata=%s publish=%s update_balances=%s total=%s",
             k_val,
             _format_seconds(t_build),
             _format_seconds(t_write),
             _format_seconds(t_meta),
             _format_seconds(t_publish),
             _format_seconds(t_bal),
-            _format_seconds(t_sidecar),
             _format_seconds(total_elapsed),
         )
-        if telemetry_every > 0 and (
-            partition_idx == 1
-            or partition_idx == total_partitions
-            or partition_idx % telemetry_every == 0
-        ):
-            _log_balances_snapshot(con, log, k_val=k_val)
-            _log_resolved_eviction_snapshot(con, log, k_val=k_val)
         return row_count
     except Exception:
         cleanup_temp(temp_loc)
@@ -1094,8 +1120,7 @@ def _empty_chunk_rows_sql() -> str:
         CAST(NULL AS BIGINT)   AS gross_usdc,
         CAST(NULL AS BIGINT)   AS fee_usdc,
         CAST(NULL AS BIGINT)   AS net_yes_position_after,
-        CAST(NULL AS UINTEGER) AS index_set,
-        FALSE                  AS _missing_token
+        CAST(NULL AS UINTEGER) AS index_set
     WHERE FALSE
     """
 
@@ -1269,9 +1294,10 @@ def main() -> None:
     con.execute(f"SET temp_directory = '{TEMP_DIR}'")
     con.execute("SET preserve_insertion_order = false")
 
-    _load_token_map(con, log)
-    _load_condition_resolution(con, log, frontier)
-    _ensure_balances_sidecar(con, log)
+    # Build unified token cache: one-time startup operation.
+    # This cache tracks token lifecycle: first_seen_block, condition_id, resolved_block/log_index.
+    # Used for deterministic fill suppression (fills outside [first_seen, resolved) are excluded).
+    _build_unified_token_cache(con, log, frontier)
 
     console.print(
         f"frontier={frontier}  |  total={len(all_partitions):,}  |  "
