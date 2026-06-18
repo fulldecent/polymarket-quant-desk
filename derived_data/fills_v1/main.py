@@ -263,7 +263,7 @@ def _log_balances_snapshot(
             COUNT(*) AS keys,
             COUNT(DISTINCT account) AS accounts,
             COUNT(DISTINCT condition_id) AS conditions,
-            COALESCE(SUM(length(account) + length(condition_id) + 8), 0) AS payload_bytes
+            COALESCE(SUM(octet_length(account) + octet_length(condition_id) + 8), 0) AS payload_bytes
         FROM balances
     """).fetchone()
     duckdb_memory_bytes = _duckdb_memory_usage_bytes(con)
