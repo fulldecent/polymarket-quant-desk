@@ -571,8 +571,9 @@ def process_chunk(
     """Process one 10K partition: build legs, assign order/position, write atomically.
 
     Every partition ALWAYS produces an output (data.parquet + metadata.json), even
-    with zero fills. Fails fast if any traded token is missing from token_id_map or
-    has an index_set outside {1, 2} (the binary YES=1/NO=2 invariant).
+    with zero fills. Legs whose token_id is absent from token_id_map_v1 are dropped
+    (token map is high-coverage but not complete). The producer still fails fast if
+    any mapped token has index_set outside {1, 2} (the binary YES=1/NO=2 invariant).
     """
     chunk_dir = Path(OUT_DIR) / partition_dir(k_val)
     chunk_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -584,21 +585,28 @@ def process_chunk(
         sql = _build_partition_sql(k_val, leg_paths)
         con.execute(f"CREATE OR REPLACE TEMP TABLE chunk_rows AS {sql}")
 
-        # Fail fast: every traded token must be present in token_id_map_v1 and resolve to a binary condition.
+        # Drop legs for token_ids not present in token_id_map_v1; this is an allowed
+        # approximation documented by token_id_map_v1 and fills_v1 contracts.
+        dropped = con.execute("""
+            SELECT COUNT(*)
+            FROM chunk_rows
+            WHERE _missing_token
+        """).fetchone()[0]
+        if dropped:
+            con.execute("DELETE FROM chunk_rows WHERE _missing_token")
+            log.warning(
+                f"10K={k_val}: dropped {dropped} fill legs with token_ids absent from token_id_map_v1"
+            )
+
+        # Fail fast: mapped tokens must resolve to a binary condition.
         bad = con.execute("""
             SELECT
-                COUNT(*) FILTER (WHERE _missing_token) AS missing,
-                COUNT(*) FILTER (WHERE NOT _missing_token AND index_set NOT IN (1, 2)) AS nonbinary
+                COUNT(*) FILTER (WHERE index_set NOT IN (1, 2)) AS nonbinary
             FROM chunk_rows
         """).fetchone()
         if bad[0]:
             raise RuntimeError(
-                f"10K={k_val}: {bad[0]} fill legs reference token_ids absent from token_id_map_v1; "
-                f"fills_v1 requires complete token coverage. Advance token_id_map_v1 to this partition first."
-            )
-        if bad[1]:
-            raise RuntimeError(
-                f"10K={k_val}: {bad[1]} fill legs have index_set outside {{1, 2}} "
+                f"10K={k_val}: {bad[0]} fill legs have index_set outside {{1, 2}} "
                 f"(non-binary condition; the YES=1/NO=2 model requires binary conditions)"
             )
     else:
