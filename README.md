@@ -1,5 +1,7 @@
 # Polymarket quant desk
 
+:warning: NOTE: The fills dataset is in early access and may be subject to change. SemVer does not apply to that. The rest is production ready.
+
 An automated suite for analyzing and executing trade strategies against Polymarket
 
 ## Hardware requirements
