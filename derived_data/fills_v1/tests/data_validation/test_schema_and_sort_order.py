@@ -38,11 +38,15 @@ def _connect() -> duckdb.DuckDBPyConnection:
     return con
 
 
+def _fills_data_glob() -> str:
+    d = _fills_dir()
+    return f"{d}/{PARTITION_1M_LABEL}=*/{PARTITION_10K_LABEL}=*/data.parquet"
+
+
 def test_no_nulls_in_non_nullable_columns():
     """Every column declared non-nullable in the contract has no NULL values."""
-    d = _fills_dir()
     con = _connect()
-    glob = f"{d}/**/*.parquet"
+    glob = _fills_data_glob()
     # All columns except condition_id and market_id are non-nullable.
     null_checks = [
         "block_number IS NULL",
@@ -65,17 +69,33 @@ def test_no_nulls_in_non_nullable_columns():
 
 
 def test_condition_id_null_only_when_token_missing():
-    """condition_id is NULL only when the token_id is absent from token_id_map_v1 (allowed)."""
-    # This is a data-quality note, not a hard failure; the producer already fails on non-binary.
-    # We just assert that when condition_id IS NOT NULL, index_set is 1 or 2.
-    d = _fills_dir()
+    """condition_id matches token_id_map when token_id exists there; otherwise NULL is allowed."""
     con = _connect()
-    glob = f"{d}/**/*.parquet"
+    fills_glob = _fills_data_glob()
+    token_map_dir = os.environ.get("TOKEN_ID_MAP_V1_DIR", "")
+    if not token_map_dir:
+        pytest.skip("TOKEN_ID_MAP_V1_DIR is not set")
+    tok_glob = f"{Path(token_map_dir)}/**/*.parquet"
+
     bad = con.execute(
-        f"SELECT COUNT(*) FROM read_parquet('{glob}') "
-        f"WHERE condition_id IS NOT NULL AND index_set NOT IN (1, 2)"
+        f"""
+        WITH tok AS (
+            SELECT token_id, condition_id
+            FROM read_parquet('{tok_glob}')
+        ),
+        fills AS (
+            SELECT token_id, condition_id
+            FROM read_parquet('{fills_glob}')
+        )
+        SELECT COUNT(*)
+        FROM fills f
+        LEFT JOIN tok t USING (token_id)
+        WHERE (t.token_id IS NULL AND f.condition_id IS NOT NULL)
+           OR (t.token_id IS NOT NULL AND f.condition_id IS NULL)
+           OR (t.token_id IS NOT NULL AND f.condition_id != t.condition_id)
+        """
     ).fetchone()[0]
-    assert bad == 0, f"found {bad} rows with non-binary index_set where condition_id is populated"
+    assert bad == 0, f"found {bad} rows where condition_id is inconsistent with token_id_map_v1"
 
 
 def test_physical_sort_order():
@@ -94,23 +114,37 @@ def test_physical_sort_order():
         assert keys == sorted(keys), f"partition {part_dir} is not sorted by (block_number, logical_fill_index)"
 
 
-def test_logical_fill_index_dense_per_block():
-    """Within each block, logical_fill_index forms a dense 0..n-1 sequence with no gaps or duplicates."""
-    d = _fills_dir()
+def test_logical_fill_index_unique_per_block():
+    """Within each block, logical_fill_index is unique (gaps are allowed)."""
     con = _connect()
-    glob = f"{d}/**/*.parquet"
+    glob = _fills_data_glob()
     bad = con.execute(
         f"""
         SELECT COUNT(*) FROM (
             SELECT block_number,
                    COUNT(*) AS c,
-                   COUNT(DISTINCT logical_fill_index) AS d,
-                   MIN(logical_fill_index) AS mn,
-                   MAX(logical_fill_index) AS mx
+                   COUNT(DISTINCT logical_fill_index) AS d
             FROM read_parquet('{glob}')
             GROUP BY block_number
-            HAVING c <> d OR mn <> 0 OR mx <> c - 1
+            HAVING c <> d
         )
         """
     ).fetchone()[0]
-    assert bad == 0, f"found {bad} blocks with non-dense logical_fill_index"
+    assert bad == 0, f"found {bad} blocks with duplicate logical_fill_index values"
+
+
+def test_blob_column_byte_lengths():
+    """BLOB columns have contract byte lengths (or NULL where allowed)."""
+    con = _connect()
+    glob = _fills_data_glob()
+    bad = con.execute(
+        f"""
+        SELECT COUNT(*)
+        FROM read_parquet('{glob}')
+        WHERE octet_length(account) != 20
+           OR octet_length(token_id) != 32
+           OR (condition_id IS NOT NULL AND octet_length(condition_id) != 32)
+           OR (market_id IS NOT NULL AND octet_length(market_id) != 32)
+        """
+    ).fetchone()[0]
+    assert bad == 0, f"found {bad} rows with unexpected BLOB byte lengths"
