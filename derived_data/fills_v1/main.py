@@ -611,49 +611,49 @@ def _ensure_balances_sidecar(con: duckdb.DuckDBPyConnection, log: logging.Logger
             bal HUGEINT
         )
     """)
+    sidecar_files = list(sidecar_root.rglob("balances.parquet"))
+    if not sidecar_files:
+        log.info("balances sidecar has no files; starting with empty carry-in balances")
+        return
+
     glob = f"{sidecar_root}/**/*.parquet"
-    try:
-        raw_rows = con.execute(f"SELECT COUNT(*) FROM read_parquet('{glob}')").fetchone()[0]
-        con.execute(f"""
-            INSERT INTO balances
-            SELECT account, condition_id, ending_balance AS bal
-            FROM (
-                SELECT
-                    account,
-                    condition_id,
-                    ending_balance,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY account, condition_id
-                        ORDER BY CAST(regexp_extract(filename, '10K=([0-9]+)', 1) AS UINTEGER) DESC
-                    ) AS rn
-                FROM read_parquet('{glob}', filename = true)
-            ) s
-            WHERE rn = 1
-        """)
+    raw_rows = con.execute(f"SELECT COUNT(*) FROM read_parquet('{glob}')").fetchone()[0]
+    con.execute(f"""
+        INSERT INTO balances
+        SELECT account, condition_id, ending_balance AS bal
+        FROM (
+            SELECT
+                account,
+                condition_id,
+                ending_balance,
+                ROW_NUMBER() OVER (
+                    PARTITION BY account, condition_id
+                    ORDER BY CAST(regexp_extract(filename, '10K=([0-9]+)', 1) AS UINTEGER) DESC
+                ) AS rn
+            FROM read_parquet('{glob}', filename = true)
+        ) s
+        WHERE rn = 1
+    """)
 
-        dup_keys = con.execute("""
-            SELECT COUNT(*)
-            FROM (
-                SELECT account, condition_id
-                FROM balances
-                GROUP BY account, condition_id
-                HAVING COUNT(*) > 1
-            )
-        """).fetchone()[0]
-        if dup_keys:
-            raise RuntimeError(
-                f"balances carry-in must be unique by (account, condition_id); found {dup_keys:,} duplicate keys"
-            )
-
-        n = con.execute("SELECT COUNT(*) FROM balances").fetchone()[0]
-        log.info(
-            f"loaded {n:,} latest running (account, condition) balances from sidecar "
-            f"({raw_rows:,} historical snapshot rows scanned)"
+    dup_keys = con.execute("""
+        SELECT COUNT(*)
+        FROM (
+            SELECT account, condition_id
+            FROM balances
+            GROUP BY account, condition_id
+            HAVING COUNT(*) > 1
         )
-    except duckdb.IOException:
+    """).fetchone()[0]
+    if dup_keys:
         raise RuntimeError(
-            "balances sidecar is empty after bootstrap; this is a bug in the bootstrap logic"
+            f"balances carry-in must be unique by (account, condition_id); found {dup_keys:,} duplicate keys"
         )
+
+    n = con.execute("SELECT COUNT(*) FROM balances").fetchone()[0]
+    log.info(
+        f"loaded {n:,} latest running (account, condition) balances from sidecar "
+        f"({raw_rows:,} historical snapshot rows scanned)"
+    )
 
 
 def _bootstrap_balances_sidecar(con: duckdb.DuckDBPyConnection, log: logging.Logger) -> None:
