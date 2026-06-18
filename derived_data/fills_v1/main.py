@@ -443,6 +443,7 @@ def _build_partition_sql(k_val: int, leg_paths: list[tuple[dict, str]]) -> str:
             a.log_index,
             a.account,
             a.token_id,
+            a.order_hash,
             tc.condition_id,
             tc.market_id,
             a.is_taker,
@@ -486,6 +487,7 @@ def _build_partition_sql(k_val: int, leg_paths: list[tuple[dict, str]]) -> str:
                         a.log_index,
                         a.account,
                         a.token_id,
+                        a.order_hash,
                         tc.condition_id,
                         tc.market_id,
                         a.is_taker,
@@ -518,7 +520,7 @@ def _build_partition_sql(k_val: int, leg_paths: list[tuple[dict, str]]) -> str:
                 LEFT JOIN (
                     SELECT token_id, index_set FROM read_parquet('{TOKEN_MAP}/**/*.parquet')
                 ) tok_index ON a.token_id = tok_index.token_id
-                WHERE a.is_v2
+                WHERE NOT a.is_v1
         ),
         enriched AS (
                 SELECT
@@ -527,6 +529,7 @@ def _build_partition_sql(k_val: int, leg_paths: list[tuple[dict, str]]) -> str:
                         log_index,
                         account,
                         token_id,
+                        order_hash,
                         condition_id,
                         market_id,
                         is_taker,
@@ -545,6 +548,7 @@ def _build_partition_sql(k_val: int, leg_paths: list[tuple[dict, str]]) -> str:
                         log_index,
                         account,
                         token_id,
+                        order_hash,
                         condition_id,
                         market_id,
                         is_taker,
@@ -563,9 +567,8 @@ def _build_partition_sql(k_val: int, leg_paths: list[tuple[dict, str]]) -> str:
     keyed AS (
         SELECT
             e.*,
-            COALESCE(e.match_key, e.order_hash) AS match_order_key,
             tok.index_set,
-            MIN(e.log_index) OVER (PARTITION BY e.block_number, e.transaction_index, e.match_key) AS match_min_log
+            COALESCE(e.match_key, e.order_hash) AS match_order_key
         FROM enriched e
         LEFT JOIN tok_index_all tok ON e.token_id = tok.token_id
         WHERE NOT e._suppressed AND e.condition_id IS NOT NULL
