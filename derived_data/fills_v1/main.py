@@ -71,6 +71,7 @@ USAGE
 
 import argparse
 import logging
+import re
 import signal
 import sys
 import threading
@@ -162,6 +163,20 @@ TEMP_DIR  = require_env("TEMP_DIR")
 
 BALANCES_SUBDIR = "_balances"
 
+_SIZE_UNITS = {
+    "bytes": 1,
+    "byte": 1,
+    "b": 1,
+    "kib": 1024,
+    "mib": 1024**2,
+    "gib": 1024**3,
+    "tib": 1024**4,
+    "kb": 1000,
+    "mb": 1000**2,
+    "gb": 1000**3,
+    "tb": 1000**4,
+}
+
 
 # ============================================================================
 # input discovery
@@ -176,6 +191,121 @@ def _existing(table: str, k_val: int) -> str | None:
     """Return the data.parquet path for this table+partition if it exists, else None."""
     p = _partition_file(table, k_val)
     return str(p) if p.exists() else None
+
+
+def _format_seconds(seconds: float) -> str:
+    """Human-friendly fixed precision for timing telemetry."""
+    return f"{seconds:.3f}s"
+
+
+def _format_bytes(n_bytes: int | None) -> str:
+    """Render byte counts in IEC units for consistent telemetry logs."""
+    if n_bytes is None:
+        return "unknown"
+    if n_bytes < 1024:
+        return f"{n_bytes} B"
+    value = float(n_bytes)
+    for unit in ("KiB", "MiB", "GiB", "TiB"):
+        value /= 1024.0
+        if value < 1024.0 or unit == "TiB":
+            return f"{value:.2f} {unit}"
+    return f"{n_bytes} B"
+
+
+def _parse_size_text_to_bytes(size_text: str | None) -> int | None:
+    """Parse DuckDB size strings (e.g. '123.4 MiB') into bytes."""
+    if size_text is None:
+        return None
+    match = re.match(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z]+)\s*$", size_text)
+    if not match:
+        return None
+    magnitude = float(match.group(1))
+    unit = match.group(2).lower()
+    factor = _SIZE_UNITS.get(unit)
+    if factor is None:
+        return None
+    return int(magnitude * factor)
+
+
+def _duckdb_memory_usage_bytes(con: duckdb.DuckDBPyConnection) -> int | None:
+    """Best-effort process memory telemetry from DuckDB runtime state."""
+    try:
+        row = con.execute("SELECT memory_usage FROM pragma_database_size() LIMIT 1").fetchone()
+    except duckdb.Error:
+        return None
+    if not row:
+        return None
+    return _parse_size_text_to_bytes(row[0])
+
+
+def _table_exists(con: duckdb.DuckDBPyConnection, table_name: str) -> bool:
+    """Return whether a table exists in the current DuckDB connection."""
+    row = con.execute(
+        """
+        SELECT COUNT(*)
+        FROM information_schema.tables
+        WHERE table_name = ?
+        """,
+        [table_name],
+    ).fetchone()
+    return bool(row and row[0])
+
+
+def _log_balances_snapshot(
+    con: duckdb.DuckDBPyConnection,
+    log: logging.Logger,
+    *,
+    k_val: int,
+) -> None:
+    """Log current balance-store cardinality and rough memory envelope."""
+    stats = con.execute("""
+        SELECT
+            COUNT(*) AS keys,
+            COUNT(DISTINCT account) AS accounts,
+            COUNT(DISTINCT condition_id) AS conditions,
+            COALESCE(SUM(length(account) + length(condition_id) + 8), 0) AS payload_bytes
+        FROM balances
+    """).fetchone()
+    duckdb_memory_bytes = _duckdb_memory_usage_bytes(con)
+    log.info(
+        "telemetry 10K=%s balances: keys=%s accounts=%s conditions=%s payload~%s duckdb_memory=%s",
+        k_val,
+        f"{int(stats[0]):,}",
+        f"{int(stats[1]):,}",
+        f"{int(stats[2]):,}",
+        _format_bytes(int(stats[3])),
+        _format_bytes(duckdb_memory_bytes),
+    )
+
+
+def _log_resolved_eviction_snapshot(
+    con: duckdb.DuckDBPyConnection,
+    log: logging.Logger,
+    *,
+    k_val: int,
+) -> None:
+    """Log how much in-memory state would be evictable by resolved-condition policy."""
+    if not _table_exists(con, "condition_resolution"):
+        return
+    up_to_block = partition_end(k_val)
+    stats = con.execute(
+        """
+        SELECT
+            COUNT(*) AS evictable_keys,
+            COUNT(DISTINCT b.condition_id) AS evictable_conditions
+        FROM balances b
+        JOIN condition_resolution r USING (condition_id)
+        WHERE r.resolved_block <= ?
+        """,
+        [up_to_block],
+    ).fetchone()
+    log.info(
+        "telemetry 10K=%s resolved-eviction: evictable_keys=%s evictable_conditions=%s (resolved_block<=%s)",
+        k_val,
+        f"{int(stats[0]):,}",
+        f"{int(stats[1]):,}",
+        up_to_block,
+    )
 
 
 # ============================================================================
@@ -407,6 +537,37 @@ def _load_token_map(con: duckdb.DuckDBPyConnection, log: logging.Logger) -> None
     log.info(f"loaded {n:,} token_id_map rows")
 
 
+def _load_condition_resolution(con: duckdb.DuckDBPyConnection, log: logging.Logger, frontier: int) -> None:
+    """Load first resolution block per condition for telemetry-only what-if analysis."""
+    glob = f"{RAW}/ConditionalTokens/condition_resolution/**/*.parquet"
+    con.execute("""
+        CREATE OR REPLACE TEMP TABLE condition_resolution (
+            condition_id BLOB,
+            resolved_block UINTEGER
+        )
+    """)
+    try:
+        con.execute(
+            f"""
+            INSERT INTO condition_resolution
+            SELECT
+                condition_id,
+                CAST(MIN(block_number) AS UINTEGER) AS resolved_block
+            FROM read_parquet('{glob}')
+            WHERE block_number <= ?
+            GROUP BY condition_id
+            """,
+            [frontier],
+        )
+    except duckdb.IOException:
+        log.warning("condition_resolution table not found in raw data; resolved-condition telemetry disabled")
+        con.execute("DROP TABLE IF EXISTS condition_resolution")
+        return
+
+    n = con.execute("SELECT COUNT(*) FROM condition_resolution").fetchone()[0]
+    log.info(f"loaded {n:,} resolved conditions for telemetry")
+
+
 def _balances_sidecar_dir() -> Path:
     """Root directory for the internal balances sidecar (implementation detail)."""
     return Path(OUT_DIR) / BALANCES_SUBDIR
@@ -567,6 +728,10 @@ def process_chunk(
     m_val: int,
     k_val: int,
     log: logging.Logger,
+    *,
+    partition_idx: int,
+    total_partitions: int,
+    telemetry_every: int,
 ) -> int:
     """Process one 10K partition: build legs, assign order/position, write atomically.
 
@@ -575,15 +740,19 @@ def process_chunk(
     (token map is high-coverage but not complete). The producer still fails fast if
     any mapped token has index_set outside {1, 2} (the binary YES=1/NO=2 invariant).
     """
+    t0 = time.perf_counter()
     chunk_dir = Path(OUT_DIR) / partition_dir(k_val)
     chunk_dir.parent.mkdir(parents=True, exist_ok=True)
 
     leg_paths = [(exch, _existing(f"{exch['name']}/order_filled", k_val)) for exch in EXCHANGES]
     leg_paths = [(exch, path) for exch, path in leg_paths if path]
 
+    dropped = 0
     if leg_paths:
+        t_build_start = time.perf_counter()
         sql = _build_partition_sql(k_val, leg_paths)
         con.execute(f"CREATE OR REPLACE TEMP TABLE chunk_rows AS {sql}")
+        t_build = time.perf_counter() - t_build_start
 
         # Drop legs for token_ids not present in token_id_map_v1; this is an allowed
         # approximation documented by token_id_map_v1 and fills_v1 contracts.
@@ -610,25 +779,86 @@ def process_chunk(
                 f"(non-binary condition; the YES=1/NO=2 model requires binary conditions)"
             )
     else:
+        t_build_start = time.perf_counter()
         con.execute("DROP TABLE IF EXISTS chunk_rows")
         con.execute(_empty_chunk_rows_sql())
+        t_build = time.perf_counter() - t_build_start
 
     select_cols = ", ".join(_OUTPUT_COLUMNS)
     row_count = con.execute("SELECT COUNT(*) FROM chunk_rows").fetchone()[0]
+
+    post_resolution_rows = 0
+    post_resolution_conditions = 0
+    if _table_exists(con, "condition_resolution"):
+        post_resolution_rows, post_resolution_conditions = con.execute("""
+            SELECT
+                COUNT(*) AS rows_after_resolution,
+                COUNT(DISTINCT c.condition_id) AS conditions_after_resolution
+            FROM chunk_rows c
+            JOIN condition_resolution r USING (condition_id)
+            WHERE c.block_number > r.resolved_block
+        """).fetchone()
 
     temp_loc = create_temp_location(parent_dir=chunk_dir.parent, final_name=chunk_dir.name, temp_suffix=".tmp")
     input_hashes = _partition_input_hashes(k_val)
     try:
         out_parquet = temp_loc.path / "data.parquet"
+        t_write_start = time.perf_counter()
         con.execute(f"""
             COPY (SELECT {select_cols} FROM chunk_rows ORDER BY block_number, logical_fill_index)
             TO '{out_parquet.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
         """)
+        t_write = time.perf_counter() - t_write_start
+
+        t_meta_start = time.perf_counter()
         _write_metadata(con, temp_loc.path, m_val, k_val, input_hashes, log)
+        t_meta = time.perf_counter() - t_meta_start
+
+        t_publish_start = time.perf_counter()
         publish_atomically(temp_loc)
-        _update_balances(con)
+        t_publish = time.perf_counter() - t_publish_start
+
+        t_bal_start = time.perf_counter()
+        touched_keys, touched_conditions, new_keys = _update_balances(con)
+        t_bal = time.perf_counter() - t_bal_start
+
+        t_sidecar_start = time.perf_counter()
         _write_balances_sidecar_partition(con, k_val, log)
+        t_sidecar = time.perf_counter() - t_sidecar_start
+
+        total_elapsed = time.perf_counter() - t0
         log.info(f"10K={k_val}: wrote {row_count:,} fill legs")
+        log.info(
+            "telemetry 10K=%s partition=%s/%s rows=%s dropped_missing=%s touched_keys=%s touched_conditions=%s new_keys=%s post_resolution_rows=%s post_resolution_conditions=%s",
+            k_val,
+            partition_idx,
+            total_partitions,
+            f"{row_count:,}",
+            f"{int(dropped):,}",
+            f"{touched_keys:,}",
+            f"{touched_conditions:,}",
+            f"{new_keys:,}",
+            f"{int(post_resolution_rows):,}",
+            f"{int(post_resolution_conditions):,}",
+        )
+        log.info(
+            "telemetry 10K=%s timing build=%s write=%s metadata=%s publish=%s update_balances=%s sidecar=%s total=%s",
+            k_val,
+            _format_seconds(t_build),
+            _format_seconds(t_write),
+            _format_seconds(t_meta),
+            _format_seconds(t_publish),
+            _format_seconds(t_bal),
+            _format_seconds(t_sidecar),
+            _format_seconds(total_elapsed),
+        )
+        if telemetry_every > 0 and (
+            partition_idx == 1
+            or partition_idx == total_partitions
+            or partition_idx % telemetry_every == 0
+        ):
+            _log_balances_snapshot(con, log, k_val=k_val)
+            _log_resolved_eviction_snapshot(con, log, k_val=k_val)
         return row_count
     except Exception:
         cleanup_temp(temp_loc)
@@ -659,13 +889,29 @@ def _empty_chunk_rows_sql() -> str:
     """
 
 
-def _update_balances(con: duckdb.DuckDBPyConnection) -> None:
-    """Fold this partition's net_yes_tokens deltas into the running balance table."""
+def _update_balances(con: duckdb.DuckDBPyConnection) -> tuple[int, int, int]:
+    """Fold this partition's net_yes_tokens deltas into the running balance table.
+
+    Returns:
+        touched_keys, touched_conditions, new_keys
+    """
     con.execute("""
         CREATE OR REPLACE TEMP TABLE deltas AS
         SELECT account, condition_id, SUM(net_yes_tokens)::HUGEINT AS delta
         FROM chunk_rows GROUP BY account, condition_id
     """)
+    touched_stats = con.execute("""
+        SELECT
+            COUNT(*) AS touched_keys,
+            COUNT(DISTINCT condition_id) AS touched_conditions
+        FROM deltas
+    """).fetchone()
+    new_keys = con.execute("""
+        SELECT COUNT(*)
+        FROM deltas d
+        LEFT JOIN balances b ON b.account = d.account AND b.condition_id = d.condition_id
+        WHERE b.account IS NULL
+    """).fetchone()[0]
     con.execute("""
         UPDATE balances b SET bal = b.bal + d.delta
         FROM deltas d WHERE b.account = d.account AND b.condition_id = d.condition_id
@@ -677,6 +923,7 @@ def _update_balances(con: duckdb.DuckDBPyConnection) -> None:
         LEFT JOIN balances b ON b.account = d.account AND b.condition_id = d.condition_id
         WHERE b.account IS NULL
     """)
+    return int(touched_stats[0]), int(touched_stats[1]), int(new_keys)
 
 
 # ============================================================================
@@ -722,6 +969,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Materialize fills_v1")
     parser.add_argument("--dry-run", action="store_true", help="print work plan without writing")
     parser.add_argument("--sample", type=int, default=0, help="process only first N partitions")
+    parser.add_argument(
+        "--telemetry-every",
+        type=int,
+        default=10,
+        help="log full balances snapshot every N processed partitions (0 disables periodic snapshots)",
+    )
     args = parser.parse_args()
 
     assert_git_clean(_project_root)
@@ -786,6 +1039,7 @@ def main() -> None:
     con.execute("SET preserve_insertion_order = false")
 
     _load_token_map(con, log)
+    _load_condition_resolution(con, log, frontier)
     _ensure_balances_sidecar(con, log)
 
     console.print(
@@ -800,11 +1054,19 @@ def main() -> None:
     with make_progress(console) as progress:
         task = progress.add_task("Materializing fills_v1", total=len(todo))
         processed = 0
-        for m_val, k_val in todo:
+        for partition_idx, (m_val, k_val) in enumerate(todo, start=1):
             if _stop_event.is_set():
                 log.info("interrupted by user")
                 break
-            process_chunk(con, m_val, k_val, log)
+            process_chunk(
+                con,
+                m_val,
+                k_val,
+                log,
+                partition_idx=partition_idx,
+                total_partitions=len(todo),
+                telemetry_every=args.telemetry_every,
+            )
             processed += 1
             progress.update(task, advance=1)
 
