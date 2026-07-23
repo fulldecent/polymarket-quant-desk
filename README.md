@@ -17,17 +17,12 @@ I use the Samsung T9 and it works great ([Amazon link (affiliate)](https://amzn.
 1. Create and activate a virtual environment:
 
    ```sh
-   python3 -m venv .venv
+   brew install uv # your python manager
+   uv sync
    source .venv/bin/activate
    ```
 
-2. Install dependencies:
-
-   ```sh
-   pip install -r requirements.txt
-   ```
-
-3. Configure environment variables:
+2. Configure environment variables:
 
    ```sh
    cp .env.example .env
