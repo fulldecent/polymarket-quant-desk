@@ -740,6 +740,11 @@ class _SinkOrchestrator:
             max_workers=max_workers,
             thread_name_prefix="sink",
         )
+        self._sink_connect_config = {
+            "memory_limit": self._store.config.duckdb_memory_limit,
+            "threads": str(self._store.config.duckdb_threads),
+            "temp_directory": self._store.config.duckdb_temp_dir,
+        }
         self._in_flight: dict[Future[PartitionWriteResult], int] = {}
         self._completed: dict[int, PartitionWriteResult] = {}
         self._submitted_partitions: set[int] = set()
@@ -773,16 +778,15 @@ class _SinkOrchestrator:
         if _stop_event.is_set():
             return
         self._submitted_partitions.add(partition_start)
-        # Pass the orchestrator's hot-DB connection so the worker can open a cursor on it (DuckDB
-        # does not permit a second ``duckdb.connect()`` against an already-open ``.db`` file in
-        # the same process, but cursors off the same connection are thread-safe and see committed
-        # rows via MVCC).
+        # Sink workers use their own DuckDB connection with matching config.
+        # This avoids cross-thread transactional contention on a shared
+        # connection while still reading a consistent snapshot via MVCC.
         future = self._executor.submit(
             write_partition_files,
             self._db_path,
             self._cold_root,
             partition_start,
-            connection=self._store.connection,
+            duckdb_connect_config=self._sink_connect_config,
             stop_event=_stop_event,
         )
         self._in_flight[future] = partition_start

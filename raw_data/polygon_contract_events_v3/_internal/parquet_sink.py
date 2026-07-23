@@ -519,7 +519,7 @@ def write_partition_files(
     cold_root: str,
     partition_start: int,
     *,
-    connection: "duckdb.DuckDBPyConnection | None" = None,
+    duckdb_connect_config: dict[str, str] | None = None,
     progress_cb: ProgressCallback | None = None,
     stop_event: threading.Event | None = None,
 ) -> PartitionWriteResult:
@@ -634,44 +634,17 @@ def write_partition_files(
     rows_total = 0
     bytes_total = 0
 
-    # Get a DB handle for this worker.
-    #
-    # DuckDB does not actually support opening a second
-    # ``duckdb.connect()`` against the same ``.db`` file from the same
-    # process — even with matched config, the second call raises a
-    # ``Connection Error: Can't open a connection to same database file
-    # with a different configuration``. The pattern that does work is
-    # ``existing_connection.cursor()``: a cursor shares the underlying
-    # database but has its own transaction state, is safe to use from
-    # a different thread, and reads committed rows via MVCC just like
-    # a separate connection would.
-    #
-    # So: if the caller passes a ``connection`` (the orchestrator's
-    # ``HotStore`` connection), we use a cursor of it. The cursor is
-    # local to this worker and is closed below regardless of outcome.
-    # ``opened_locally`` is False in this path because the caller owns
-    # the parent connection's lifecycle.
+    # Open a dedicated worker connection using the same connect config as
+    # the writer connection to avoid DuckDB config mismatch errors.
     opened_locally = False
-    if connection is not None:
-        try:
-            con = connection.cursor()
-        except Exception as e:
-            raise V3Error(
-                f"could not open cursor on orchestrator connection: {e}"
-            ) from e
-    else:
-        # Fallback: no orchestrator connection supplied. Open our own.
-        # This path is used when ``write_partition_files`` is invoked
-        # standalone (e.g. one-off scripts, tests) against a ``.db``
-        # that no other process or connection is currently holding
-        # open.
-        try:
-            con = duckdb.connect(db_path, config={"access_mode": "READ_ONLY"})
-            opened_locally = True
-        except Exception as e:
-            raise V3Error(
-                f"could not open read-only connection to {db_path!r}: {e}"
-            ) from e
+    connect_config = dict(duckdb_connect_config or {})
+    try:
+        con = duckdb.connect(db_path, config=connect_config)
+        opened_locally = True
+    except Exception as e:
+        raise V3Error(
+            f"could not open worker connection to {db_path!r}: {e}"
+        ) from e
 
     try:
         for contract, event in targets:
@@ -763,7 +736,8 @@ def write_partition_files(
                 tmp_path.unlink(missing_ok=True)
             except OSError:
                 pass
-        con.close()
+        if opened_locally:
+            con.close()
         raise
     except Exception as e:
         for tmp_path, _ in pending_renames:
@@ -771,7 +745,8 @@ def write_partition_files(
                 tmp_path.unlink(missing_ok=True)
             except OSError:
                 pass
-        con.close()
+        if opened_locally:
+            con.close()
         raise V3Error(
             f"write_partition_files failed for partition {partition_start}: {e}"
         ) from e
@@ -783,12 +758,14 @@ def write_partition_files(
         for tmp_path, dst_path in pending_renames:
             os.replace(tmp_path, dst_path)
     except Exception as e:
-        con.close()
+        if opened_locally:
+            con.close()
         raise V3Error(
             f"rename failed during write_partition_files partition {partition_start}: {e}"
         ) from e
 
-    con.close()
+    if opened_locally:
+        con.close()
 
     # Phase 3: write metadata.json for each renamed parquet file.
     # This must happen after the atomic renames so the parquet path used for
