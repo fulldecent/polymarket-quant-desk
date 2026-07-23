@@ -239,6 +239,18 @@ def _validate_or_prepare_partition_data_dir(partition_dir: Path) -> bool:
     if not partition_dir.is_dir():
         raise V3Error(f"partition path is not a directory: {partition_dir}")
 
+    entries = list(partition_dir.iterdir())
+    if not entries:
+        # Recover from interrupted runs that created the partition directory
+        # but never wrote any files.
+        try:
+            partition_dir.rmdir()
+        except OSError as e:
+            raise V3Error(
+                f"empty partition folder could not be removed: {partition_dir}: {e}"
+            ) from e
+        return False
+
     parquet = partition_dir / "data.parquet"
     metadata = partition_dir / "metadata.json"
 
@@ -248,7 +260,6 @@ def _validate_or_prepare_partition_data_dir(partition_dir: Path) -> bool:
         raise V3Error(f"partition folder missing required metadata.json: {partition_dir}")
 
     allowed = {"data.parquet", "metadata.json"}
-    entries = list(partition_dir.iterdir())
     extras = [p.name for p in entries if p.name not in allowed]
     if extras:
         raise V3Error(
