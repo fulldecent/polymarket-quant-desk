@@ -198,8 +198,7 @@ def _load_environment() -> dict[str, str]:
         sys.exit(
             "Missing required environment variables: "
             + ", ".join(missing)
-            + "\nSet them in the repo-root .env file. See raw_data/"
-            "polygon_contract_events_v3/main.py docstring."
+            + "\nSet them in the repo-root .env file."
         )
 
     db_path = os.environ["POLYGON_CONTRACT_EVENTS_V3_HOT_DB"]

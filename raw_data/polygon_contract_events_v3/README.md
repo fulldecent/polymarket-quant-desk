@@ -36,8 +36,12 @@ Given identical source data (immutable blockchain and faithful RPC responses), t
 You can download the smart contract source code for all the contracts we scrape. Get an Etherscan key and set `ETHERSCAN_API_KEY` in your .env. Then install [Foundry](https://www.getfoundry.sh/) (we recommend Homebrew for macOS rather than Foundry's proposed `curl | bash` installer) and run the `cast source` commands below. This is useful for auditing, debugging and understanding the events we scrape.
 
 ```sh
+brew install foundry
 source .env
 export SOURCE_DIR=./raw_data/polygon_contract_events_v3/deployed_contract_source_code
+
+set -e
+[ -n "$ETHERSCAN_API_KEY" ] || { echo "Missing ETHERSCAN_API_KEY in .env"; exit 1; }
 
 ADDR=0x4D97DCd97eC945f40cF65F87097ACe5EA0476045; cast source $ADDR --chain polygon -d "$SOURCE_DIR/ConditionalTokens-$ADDR"
 ADDR=0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E; cast source $ADDR --chain polygon -d "$SOURCE_DIR/CTFExchange-$ADDR"

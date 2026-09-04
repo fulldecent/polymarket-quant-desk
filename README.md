@@ -8,9 +8,9 @@ An automated suite for analyzing and executing trade strategies against Polymark
 
 This project scrapes raw events from the Polygon blockchain, derived table analysis and trade execution.
 
-Overall, Polymarket is a small enough dataset that you can run the entire analysis and trading suite on a MacBook Pro M5 Pro with 24 GB of RAM and an external 2TB SSD for data storage. Less RAM may be possible but will require more disk space for DuckDB spill files.
+Overall, the Polymarket dataset is small enough to run the entire analysis and trading suite on a MacBook Pro M5 Pro with 24 GB of RAM and 2 TB external SSD. Less RAM may be possible with 200 GB+ of internal NVME storage for the "hot" folder.
 
-I use the Samsung T9 and it works great ([Amazon link (affiliate)](https://amzn.to/4sbBeOp)). If you are using a cloud service, note that there is a hot folder for the DuckDB database, and a cold folder for the immutable Parquet files (can use object storage).
+I use the Samsung T9 and it works great ([Amazon link (affiliate)](https://amzn.to/4sbBeOp)). Advanced cloud setups with object and block storage are also documented in the .env.
 
 ## One-time setup
 
@@ -25,15 +25,11 @@ I use the Samsung T9 and it works great ([Amazon link (affiliate)](https://amzn.
 2. Configure environment variables:
 
    ```sh
-   cp .env.example .env
-   # Edit .env with your RPC endpoint and settings
+   [ -f .env ] || cp .env.example .env
+   # Study and edit your .env file, estimated setup time: 30+ minutes
    ```
 
-   I can recommend dRPC, Infura and Chainstack as excellent RPC providers.
-
-   You will also need an Etherscan account, which is also great and allows you to download contract source code.
-
-## Scraping and derived data
+## Scrape and derive data
 
 Repeat this process periodically to get new data as it is available from the market. This will allow you to run your backtesting analysis against recent data.
 
