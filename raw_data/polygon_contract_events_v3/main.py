@@ -73,7 +73,7 @@ from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any
 
 from rich.console import Console, Group
 from rich.live import Live
@@ -501,31 +501,24 @@ class RichRunStatus:
 status_ui = RichRunStatus()
 
 # Persistent run log (opened once per invocation)
-_log_file: TextIO | None = None
 _run_logger: JSONLRunLogger | None = None
 
 
 def _open_run_log() -> None:
     """Create and open a timestamped .log file for this scraper run."""
-    global _log_file, _run_logger
-    if _log_file is not None:
+    global _run_logger
+    if _run_logger is not None:
         return
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
     log_dir = Path(__file__).resolve().parent / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"main-{ts}.log"
-    _log_file = open(log_path, "a", encoding="utf-8")
-    _run_logger = JSONLRunLogger(log_path)
-    _log_file.flush()
+    _run_logger = JSONLRunLogger(log_dir / f"main-{ts}.log")
 
 
 def _log_event(event: str, message: str, **extra: Any) -> None:
     """Record one run event. Never touches the screen."""
     if _run_logger is not None:
         _run_logger.log(event, message=message, **extra)
-    if _log_file is not None:
-        _log_file.write(message + "\n")
-        _log_file.flush()
 
 
 def _print_message(text: str | Text) -> None:
@@ -1831,16 +1824,9 @@ def main() -> None:
             pass
 
         # 7. Close the run log last so shutdown and the summary are recorded.
-        global _log_file, _run_logger
-        if _log_file is not None:
-            try:
-                _log_file.write("# main finished\n")
-                _log_file.flush()
-                _log_file.close()
-            except Exception:  # noqa: BLE001
-                pass
-            _log_file = None
+        global _run_logger
         if _run_logger is not None:
+            _run_logger.log("finished", message="main finished")
             _run_logger.close()
             _run_logger = None
 
