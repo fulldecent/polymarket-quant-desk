@@ -11,6 +11,42 @@ source .venv/bin/activate
 python raw_data/polygon_contract_events_v3/main.py
 ```
 
+Run it again whenever you want fresh data. It resumes from the sunk frontier, so an interrupted
+run costs you nothing beyond the partition it was working on.
+
+These options exist, and none of them is needed for a normal run:
+
+| Option | Default | What it does |
+| --- | --- | --- |
+| `--sink-workers N` | 1 | Parquet partitions written concurrently. |
+| `--max-calls N` | no limit | Stop after N RPC calls. Useful for a smoke test. |
+| `--lag-tolerance N` | 2 | Treat the scrape as caught up within N blocks of the chain head. |
+
+## How it tunes itself
+
+Request rate, concurrency and block span are not configurable, because no single setting is right
+for the whole chain. Event density swings by orders of magnitude — early history holds one event
+per thousands of blocks, busy periods run to hundreds of events per block, and outages leave
+stretches with none at all — and every provider enforces different limits.
+
+So the scraper measures instead of assuming:
+
+- Each request is sized from a running estimate of events per block, aimed at a result budget, so
+  a request covers thousands of blocks in quiet history and a few dozen in a busy stretch.
+- Provider limits are discovered from refusals and held as brackets, then narrowed by binary
+  search. A refusal caused by response size is distinguished from one caused by block count, so a
+  limit learned in a busy region does not hold back the sparse regions that follow.
+- Concurrency ramps from a single request, doubling once per round trip, and stops when the
+  provider pushes back or when latency per block starts climbing.
+- After the ramp, throughput is measured in fixed-parameter epochs and the parameters are
+  hill-climbed on blocks per second.
+
+HTTP 429 and 5xx responses are treated as back-pressure: concurrency drops and a pause is
+introduced between requests. Permanent errors such as a bad API key stop the run immediately
+rather than burning through the backlog.
+
+Each run writes a timestamped log to `logs/`, including every parameter change and epoch score.
+
 ## How to test it
 
 Run unit tests for the program:

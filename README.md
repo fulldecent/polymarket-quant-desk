@@ -37,8 +37,13 @@ Repeat this process periodically to get new data as it is available from the mar
 
    ```sh
    source .venv/bin/activate
-   python raw_data/polygon_contract_events_v3/main.py --parallel 25
+   python raw_data/polygon_contract_events_v3/main.py
    ```
+
+   There is nothing to tune. The scraper starts at one request of one block and measures its way
+   up to whatever your RPC provider will bear, so the same command suits a free endpoint and a
+   paid one. See [the scraper README](raw_data/polygon_contract_events_v3/README.md) for the
+   options that do exist.
 
 2. Build the derived datasets
 

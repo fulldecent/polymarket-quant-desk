@@ -239,6 +239,12 @@ def _validate_or_prepare_partition_data_dir(partition_dir: Path) -> bool:
     if not partition_dir.is_dir():
         raise V3Error(f"partition path is not a directory: {partition_dir}")
 
+    # A ``data.parquet.tmp-*`` file is an interrupted write, never published content. Dropping it
+    # here keeps crash recovery O(1) per partition instead of a full scan of the cold tier.
+    for entry in list(partition_dir.iterdir()):
+        if entry.is_file() and entry.name.startswith("data.parquet.tmp-"):
+            entry.unlink(missing_ok=True)
+
     entries = list(partition_dir.iterdir())
     if not entries:
         # Recover from interrupted runs that created the partition directory
@@ -395,6 +401,7 @@ def roll_forward_manifests_to_exhaustion(
                     op="manifest",
                     phase="stop",
                     rows_done=written,
+                    partition=pstart,
                     message=f"stopped before 10K={pstart} (incomplete)",
                 )
             break
@@ -405,6 +412,7 @@ def roll_forward_manifests_to_exhaustion(
                 op="manifest",
                 phase="publish",
                 rows_done=written,
+                partition=pstart,
                 message=(
                     f"published manifests/{partition_dir(pstart)} "
                     f"for blocks [{pstart}, {partition_end(pstart)}]"
@@ -449,6 +457,7 @@ def cleanup_temp_dirs_after_frontier(
             op="manifest",
             phase="cleanup",
             rows_done=removed,
+            partition=pstart,
             message=f"cleaned temp dirs for 10K={pstart}",
         )
     return removed
@@ -520,8 +529,9 @@ def read_manifest_frontier(
             progress_cb(
                 op="manifest",
                 phase="read",
-                rows_done=pstart,
+                rows_done=idx,
                 rows_total=len(existing_partitions),
+                partition=pstart,
                 message=f"10K={pstart}",
             )
 
@@ -683,6 +693,17 @@ def write_partition_files(
             if stop_event and stop_event.is_set():
                 raise OperationCancelled("write_partition_files interrupted")
 
+            # Report before the COPY so the caller can show which file is being written.
+            if progress_cb:
+                progress_cb(
+                    op="sink",
+                    phase="copy",
+                    rows_done=len(pending_renames),
+                    rows_total=len(targets),
+                    partition=partition_start,
+                    message=f"{contract}/{event}",
+                )
+
             tbl = table_name(contract, event)
             cols = all_columns(contract, event)
             col_list = ", ".join(cols)
@@ -758,6 +779,7 @@ def write_partition_files(
                     phase="copy",
                     rows_done=len(pending_renames),
                     rows_total=len(targets),
+                    partition=partition_start,
                     message=f"{contract}/{event}",
                 )
 

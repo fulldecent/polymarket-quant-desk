@@ -22,8 +22,9 @@ The control loop is:
       orchestrator's ``commit_sink`` is recovered automatically.
   2. Ask the chain for the current head block.
   3. Compute gaps from ``SCRAPE_START_BLOCK`` to the head, print the startup banner.
-  4. Schedule ``eth_getLogs`` requests covering those gaps, adaptively growing concurrency and
-      block span on success and backing off on adverse signals (see ``_internal.adaptive_controller``).
+  4. Carve requests off those gaps, sizing each one from measured event density
+      (``_internal.chunk_planner``) and hill-climbing concurrency, result budget and post-response
+      sleep on blocks/second in fixed-parameter epochs (``_internal.epoch_optimizer``).
   5. As each RPC completes, decode the logs and call ``store.persist`` in a single atomic
       transaction. Any 10K partition that just became ready is submitted to the sink pool.
   6. As sink workers complete (in commit-frontier order), call
@@ -41,16 +42,17 @@ picked up by ``reconcile_with_cold_tier`` on the next startup.
 USAGE
     python main.py                          # all contracts, all gaps to head
     python main.py --max-calls 100          # stop after 100 RPC calls
-    python main.py --parallel 4             # concurrent worker ceiling
     python main.py --lag-tolerance 10       # stop when within 10 blocks
     python main.py --sink-workers 2         # concurrent sink workers
+
+Concurrency, request size and request rate are not configurable. Event density varies by orders of
+magnitude along the chain and every provider enforces different limits, so the scraper starts at
+one request of one block and measures its way up, discovering the provider's limits from refusals.
 
 ENVIRONMENT (all required, set in .env)
     POLYGON_CONTRACT_EVENTS_V3_HOT_DB    hot DuckDB ``.db`` file
     POLYGON_CONTRACT_EVENTS_V3_DIR       cold-tier root directory
     POLYGON_RPC_URL                      Polygon JSON-RPC endpoint
-    POLYGON_RPC_MAX_GETLOGS_BLOCK_SPAN   ceiling on per-call block span
-    POLYGON_RPC_MAX_REQUESTS_PER_SECOND  rate limit
     TEMP_DIR                             DuckDB spill directory
 """
 
@@ -58,17 +60,36 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import json
+import math
 import os
-import shutil
 import signal
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
+from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TextIO
+from typing import Any, TextIO
+
+from rich.console import Console, Group
+from rich.live import Live
+from rich.progress import (
+    BarColumn,
+    Progress,
+    ProgressColumn,
+    SpinnerColumn,
+    Task,
+    TaskID,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+from rich.text import Text
+from rich.theme import Theme
 
 from dotenv import load_dotenv
 
@@ -79,7 +100,8 @@ sys.path.insert(0, str(_project_root))
 
 from lib.git_utils import assert_git_clean  # noqa: E402
 
-from _internal.adaptive_controller import AdaptiveController
+from _internal.chunk_planner import ChunkPlanner
+from _internal.epoch_optimizer import MAX_WORKERS, EpochOptimizer
 from _internal.errors import (
     DuplicateRowError,
     OperationCancelled,
@@ -98,7 +120,6 @@ from _internal.parquet_sink import (
     get_sunk_frontier as get_manifest_frontier,
     publish_manifest,
     read_manifest_frontier,
-    remove_orphan_temp_files,
     roll_forward_manifests_to_exhaustion,
     write_partition_files,
 )
@@ -106,6 +127,7 @@ from _internal.persistence import HotStore, HotStoreConfig
 from _internal.rpc_client import (
     RpcClient,
     RpcClientConfig,
+    HTTPError,
     RPCError,
     RPCTimeout,
     TooManyResults,
@@ -124,28 +146,15 @@ from _internal.tables import (
 _SCHEMA_SQL = str(Path(__file__).resolve().parent / "schema.sql")
 
 # Tuning knobs that are stable enough to live as constants rather than CLI flags.
-SLOW_FETCH_THRESHOLD_SEC: float = 20.0
-"""An ``eth_getLogs`` that succeeds but takes longer than this is treated as a "slow" outcome by
-the adaptive controller — the request itself is kept, but the controller shrinks the per-call
-block span."""
-
 RPC_CALL_TIMEOUT_SEC: float = 30.0
 RPC_BLOCK_NUMBER_TIMEOUT_SEC: float = 5.0
 RPC_MAX_RETRIES: int = 3
 RPC_BACKOFF_BASE_SEC: float = 0.5
 
 POLL_TIMEOUT_SEC: float = 0.5
-"""How long ``concurrent.futures.wait`` blocks before re-rendering the status line.
+"""How long ``concurrent.futures.wait`` blocks before the loop refreshes the footer.
 
-Picked at half the user-visible refresh rate so the heartbeat thread is the one driving display
-updates, not this loop.
-"""
-
-HEARTBEAT_INTERVAL_SEC: float = 0.5
-"""Status line refresh interval.
-
-The user-stated requirement is "at least every 1000 ms"; we run at twice that rate so a single
-slow tick does not blow the budget.
+Kept well under a second so progress never looks stalled.
 """
 
 FORCE_EXIT_AFTER_INTERRUPTS: int = 2
@@ -163,8 +172,8 @@ POLYGON_BLOCK_TIME_SEC: float = 2.0
 
 
 # ---------------------------------------------------------------------------
-# Stop event — accessed by signal handler, heartbeat thread, RPC client, sink workers, and
-# persistence layer. Single source of truth for "should we be shutting down right now."
+# Stop event — accessed by signal handler, RPC client, sink workers, and persistence layer.
+# Single source of truth for "should we be shutting down right now."
 # ---------------------------------------------------------------------------
 
 _stop_event = threading.Event()
@@ -190,8 +199,6 @@ def _load_environment() -> dict[str, str]:
         "POLYGON_CONTRACT_EVENTS_V3_HOT_DB",
         "POLYGON_CONTRACT_EVENTS_V3_DIR",
         "POLYGON_RPC_URL",
-        "POLYGON_RPC_MAX_GETLOGS_BLOCK_SPAN",
-        "POLYGON_RPC_MAX_REQUESTS_PER_SECOND",
         "TEMP_DIR",
     ]
     missing = [k for k in required if not os.environ.get(k)]
@@ -227,81 +234,17 @@ def _load_environment() -> dict[str, str]:
             f"TEMP_DIR does not exist: {temp_dir}\nCreate it before running."
         )
 
-    try:
-        max_span = int(os.environ["POLYGON_RPC_MAX_GETLOGS_BLOCK_SPAN"])
-        max_rps = int(os.environ["POLYGON_RPC_MAX_REQUESTS_PER_SECOND"])
-    except ValueError as e:
-        sys.exit(f"Failed to parse RPC limits as integers: {e}")
-    if max_span < 1:
-        sys.exit(f"POLYGON_RPC_MAX_GETLOGS_BLOCK_SPAN must be >= 1; got {max_span}")
-    if max_rps < 1:
-        sys.exit(f"POLYGON_RPC_MAX_REQUESTS_PER_SECOND must be >= 1; got {max_rps}")
-
     return {
         "db_path": db_path,
         "cold_root": cold_root,
         "rpc_url": os.environ["POLYGON_RPC_URL"],
-        "max_block_span": str(max_span),
-        "max_rps": str(max_rps),
         "temp_dir": temp_dir,
     }
 
 
 # ---------------------------------------------------------------------------
-# Rate limiter
-# ---------------------------------------------------------------------------
-
-class RateLimiter:
-    """Token-bucket-ish rate limiter shared across worker threads.
-
-    Keeps a global "ideal time at which the next call should have happened" and sleeps the caller
-    until we have caught up. Simple, fair, and avoids the "burst then idle" pattern of a naive
-    sliding window.
-
-    Thread-safe.
-    """
-
-    def __init__(self, max_calls_per_sec: float) -> None:
-        self._max_calls_per_sec = max_calls_per_sec
-        self._start_time: float | None = None
-        self._total_calls = 0
-        self._lock = threading.Lock()
-
-    @property
-    def total_calls(self) -> int:
-        return self._total_calls
-
-    def wait(self) -> None:
-        """Block until it is safe to issue one more call.
-
-        Sleeps in short slices so a CTRL-C can interrupt promptly.
-        """
-        with self._lock:
-            if self._start_time is None:
-                self._start_time = time.monotonic()
-            self._total_calls += 1
-            required = self._total_calls / self._max_calls_per_sec
-            actual = time.monotonic() - self._start_time
-            sleep_for = required - actual
-        while sleep_for > 0:
-            if _stop_event.is_set():
-                return
-            chunk = min(sleep_for, 0.1)
-            time.sleep(chunk)
-            sleep_for -= chunk
-
-
-# ---------------------------------------------------------------------------
 # Display helpers
 # ---------------------------------------------------------------------------
-
-def _term_width() -> int:
-    try:
-        w = shutil.get_terminal_size().columns
-        return w if w > 0 else 120
-    except OSError:
-        return 120
-
 
 def _format_duration(seconds: float) -> str:
     if seconds < 0 or seconds != seconds:  # NaN-safe
@@ -339,67 +282,232 @@ def _fmt_range(from_block: int, to_block: int) -> str:
     return f"{from_block:,}\u2013{to_block:,}"
 
 
-def _next_partition_fill_pct(
-    *,
-    store: HotStore,
-    sunk_frontier: int,
-    chain_head: int,
-) -> float | None:
-    """Return fill percentage for the next sink partition.
+def _next_partition_progress(store: HotStore, sunk_frontier: int) -> tuple[int, int]:
+    """Return ``(partition_start, blocks_loaded)`` for the partition currently being filled.
 
-    Counts how many blocks in the next 10k partition are present in hot DB unsunk ranges,
-    regardless of contiguity.
+    Counts blocks present in hot-DB unsunk ranges regardless of contiguity.
     """
-    if chain_head < SCRAPE_START_BLOCK:
-        return None
-
-    next_partition_start = (
+    next_start = (
         (max(sunk_frontier, SCRAPE_START_BLOCK - 1) + 1) // PARTITION_SIZE_10K
     ) * PARTITION_SIZE_10K
-    next_partition_end = next_partition_start + PARTITION_SIZE_10K - 1
+    next_end = next_start + PARTITION_SIZE_10K - 1
 
     loaded = 0
     for from_b, to_b, _ in store.list_loaded_ranges(include_sunk=False):
-        if to_b < next_partition_start:
+        if to_b < next_start:
             continue
-        if from_b > next_partition_end:
+        if from_b > next_end:
             break
-        overlap_start = max(from_b, next_partition_start)
-        overlap_end = min(to_b, next_partition_end)
+        overlap_start = max(from_b, next_start)
+        overlap_end = min(to_b, next_end)
         if overlap_start <= overlap_end:
             loaded += overlap_end - overlap_start + 1
 
-    return min(100.0, (loaded / PARTITION_SIZE_10K) * 100.0)
+    return next_start, min(loaded, PARTITION_SIZE_10K)
 
 
 # ---------------------------------------------------------------------------
-# Status line state and rendering
+# Console output
 # ---------------------------------------------------------------------------
 #
-# A single ``_live`` dict is updated from the main loop; the heartbeat thread reads it and
-# re-prints the status line. Updates are coarse-grained and racy by design — the values are scalar
-# and the worst that happens on a torn read is one stale digit on screen for ~500 ms before the
-# next refresh.
-#
-# ``_print_lock`` serializes the only two writers to stdout: the heartbeat thread (status line)
-# and ``_print_message`` (log lines). Without it, an inline log line printed during a heartbeat
-# re-render would interleave its bytes with the status line.
+# One sticky footer holds every activity that is running right now. A row is added when work
+# starts and removed when it finishes, so the footer never shows a completed step. Everything
+# else — including the full startup detail the footer omits — goes to the per-run JSONL log.
 
-_live: dict[str, object] = {}
+_COLOR_DONE = "green"
+_COLOR_TODO = "magenta"
+
+console = Console(
+    theme=Theme({"progress.elapsed": _COLOR_DONE, "progress.remaining": _COLOR_TODO})
+)
 _print_lock = threading.Lock()
+
+
+def _mask_partition(partition_start: int) -> str:
+    """Render a 10K partition start with its four variable digits masked: ``92,93X,XXX``."""
+    out: list[str] = []
+    masked = 0
+    for ch in reversed(f"{partition_start:,}"):
+        if ch.isdigit() and masked < 4:
+            out.append("X")
+            masked += 1
+        else:
+            out.append(ch)
+    return "".join(reversed(out))
+
+
+class JSONLRunLogger:
+    """Write machine-readable run events to a per-run JSONL file."""
+
+    def __init__(self, log_path: Path) -> None:
+        self._path = log_path
+        self._handle = open(log_path, "a", encoding="utf-8")
+
+    def log(self, event: str, *, message: str, **extra: Any) -> None:
+        payload = {
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "event": event,
+            "message": message,
+            **extra,
+        }
+        self._handle.write(json.dumps(payload, separators=(",", ":"), ensure_ascii=False) + "\n")
+        self._handle.flush()
+
+    def close(self) -> None:
+        try:
+            self._handle.close()
+        except Exception:
+            pass
+
+
+class _DoneOfTotalColumn(ProgressColumn):
+    """``done/total``, each number coloured like the bar segment it stands for."""
+
+    def render(self, task: Task) -> Text:
+        total = int(task.total) if task.total is not None else 0
+        return Text.assemble(
+            (f"{int(task.completed):,}", _COLOR_DONE),
+            "/",
+            (f"{total:,}", _COLOR_TODO),
+        )
+
+
+def _shannon_entropy(text: str) -> float:
+    counts = Counter(text)
+    length = len(text)
+    return -sum((n / length) * math.log2(n / length) for n in counts.values())
+
+
+def _describe_rpc_endpoint(url: str) -> str:
+    """Return ``host key`` with the key masked, e.g. ``lb.drpc.live AmP...UMv``.
+
+    The key is whichever part of the URL looks least like a word: API keys are long and
+    high-entropy, while path components such as ``polygon`` or ``v3`` are neither. Only the first
+    and last three characters are shown, so a screen recording or a pasted log never carries the
+    whole credential.
+    """
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname or url
+
+    candidates = [segment for segment in parsed.path.split("/") if len(segment) >= 8]
+    candidates += [value for _, value in urllib.parse.parse_qsl(parsed.query) if len(value) >= 8]
+    if not candidates:
+        return host
+
+    key = max(candidates, key=lambda c: (_shannon_entropy(c), len(c)))
+    return f"{host} {key[:3]}...{key[-3:]}"
+
+
+# Footer rows, top to bottom. The overall run bar sits at the very bottom.
+_BAR_ORDER = ("partition", "main")
+
+
+class RichRunStatus:
+    """Sticky footer showing only the work that is running right now.
+
+    A row is added when an activity starts and removed when it finishes, so a completed step
+    never lingers on screen. Log lines printed through ``console`` scroll above the footer.
+    """
+
+    def __init__(self) -> None:
+        self._spinners = Progress(
+            SpinnerColumn(),
+            TextColumn("{task.description}"),
+            console=console,
+        )
+        self._bars: dict[str, Progress] = {}
+        self._live = Live(console=console, refresh_per_second=8, transient=True)
+        self._lock = threading.Lock()
+        self._spinner_tasks: dict[str, TaskID] = {}
+        self._bar_tasks: dict[str, TaskID] = {}
+        self._bar_descriptions: dict[str, str] = {}
+
+    def start(self) -> None:
+        self._live.start()
+
+    def stop(self) -> None:
+        self._live.stop()
+
+    def spinner(self, key: str, description: str) -> None:
+        """Show an indeterminate row for ``key``, replacing any earlier text for it."""
+        with self._lock:
+            task_id = self._spinner_tasks.get(key)
+            if task_id is None:
+                task_id = self._spinners.add_task(description, total=None)
+                self._spinner_tasks[key] = task_id
+            self._spinners.update(task_id, description=description)
+            self._refresh()
+
+    def bar(self, key: str, description: str, completed: int, total: int) -> None:
+        """Update the ``key`` bar.
+
+        A changed description means a new unit of work (the next partition), so the row's
+        elapsed time and ETA restart from zero rather than carrying the previous one's clock.
+        """
+        with self._lock:
+            progress = self._bars.get(key)
+            if progress is None:
+                progress = self._make_bar()
+                self._bars[key] = progress
+                self._bar_tasks[key] = progress.add_task(description, total=max(total, 1))
+                self._bar_descriptions[key] = description
+            task_id = self._bar_tasks[key]
+            if self._bar_descriptions[key] != description:
+                progress.reset(
+                    task_id,
+                    description=description,
+                    completed=completed,
+                    total=max(total, 1),
+                )
+                self._bar_descriptions[key] = description
+            else:
+                progress.update(
+                    task_id,
+                    description=description,
+                    completed=completed,
+                    total=max(total, 1),
+                )
+            self._refresh()
+
+    def clear(self, key: str) -> None:
+        with self._lock:
+            task_id = self._spinner_tasks.pop(key, None)
+            if task_id is not None:
+                self._spinners.remove_task(task_id)
+            self._bars.pop(key, None)
+            self._bar_tasks.pop(key, None)
+            self._bar_descriptions.pop(key, None)
+            self._refresh()
+
+    def _make_bar(self) -> Progress:
+        return Progress(
+            SpinnerColumn(),
+            TextColumn("{task.description}"),
+            BarColumn(complete_style=_COLOR_DONE, finished_style=_COLOR_DONE, style=_COLOR_TODO),
+            _DoneOfTotalColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+        )
+
+    def _refresh(self) -> None:
+        rows: list[Progress] = []
+        if self._spinners.tasks:
+            rows.append(self._spinners)
+        rows.extend(self._bars[key] for key in _BAR_ORDER if key in self._bars)
+        self._live.update(Group(*rows))
+
+
+status_ui = RichRunStatus()
 
 # Persistent run log (opened once per invocation)
 _log_file: TextIO | None = None
-
-
-def _set_phase(text: str) -> None:
-    _live["phase"] = text
-    _live["phase_since"] = time.monotonic()
+_run_logger: JSONLRunLogger | None = None
 
 
 def _open_run_log() -> None:
     """Create and open a timestamped .log file for this scraper run."""
-    global _log_file
+    global _log_file, _run_logger
     if _log_file is not None:
         return
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
@@ -407,128 +515,24 @@ def _open_run_log() -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"main-{ts}.log"
     _log_file = open(log_path, "a", encoding="utf-8")
-    # Do not write a header here — _print_banner will be the first real content.
+    _run_logger = JSONLRunLogger(log_path)
     _log_file.flush()
 
 
-def _print_status_line(text: str) -> None:
-    """Re-render the current status line in place (no newline)."""
-    width = _term_width()
-    with _print_lock:
-        print(f"\r{text}".ljust(width)[:width], end="", flush=True)
-
-
-def _print_message(text: str) -> None:
-    """Print a normal log line above the status line.
-
-    Wipes the status line first, prints the message, then re-renders
-    the status line so the live display does not appear to scroll.
-    Also appends the line to the persistent .log file if open.
-    """
-    width = _term_width()
-    with _print_lock:
-        print(f"\r{' ' * width}\r{text}", flush=True)
-        line = _build_status_line()
-        if line:
-            print(f"\r{line}".ljust(width)[:width], end="", flush=True)
-    # Also write to the run log (plain text, no carriage returns)
-    global _log_file
+def _log_event(event: str, message: str, **extra: Any) -> None:
+    """Record one run event. Never touches the screen."""
+    if _run_logger is not None:
+        _run_logger.log(event, message=message, **extra)
     if _log_file is not None:
-        _log_file.write(text + "\n")
+        _log_file.write(message + "\n")
         _log_file.flush()
 
 
-def _build_status_line() -> str:
-    s = _live
-    run_start_value = s.get("run_start", 0)
-    run_start = float(run_start_value) if isinstance(run_start_value, (int, float)) else 0.0
-    if not run_start:
-        return ""
-    elapsed = time.monotonic() - run_start
-
-    phase = str(s.get("phase", "")) or "running"
-
-    # Startup phases want a different layout: no throughput is meaningful yet, just show what we
-    # are waiting on.
-    startup_task = s.get("startup_task")
-    if startup_task:
-        sunk_to_value = s.get("sunk_to", -1)
-        sunk_to = int(sunk_to_value) if isinstance(sunk_to_value, int) else -1
-        has_sunk = sunk_to > (SCRAPE_START_BLOCK - 1)
-        parts = [
-            f"[{_format_duration(elapsed)}]",
-            f"sunk: {sunk_to:,}" if has_sunk else "sunk: none",
-            f"phase:{phase}",
-        ]
-        startup_done = s.get("startup_done")
-        startup_total = s.get("startup_total")
-        startup_detail = s.get("startup_detail")
-        if startup_total is not None and startup_done is not None:
-            parts.append(f"{startup_task}:{startup_done:,}/{startup_total:,}")
-        elif startup_done is not None:
-            parts.append(f"{startup_task}:{startup_done:,}")
-        if startup_detail:
-            parts.append(str(startup_detail))
-        return "  ".join(parts)
-
-    blocks_done_value = s.get("blocks_done", 0)
-    events_inserted_value = s.get("events_inserted", 0)
-    calls_value = s.get("calls", 0)
-    chain_head_value = s.get("chain_head", 0)
-    sunk_to_value = s.get("sunk_to", -1)
-    blocks_done = int(blocks_done_value) if isinstance(blocks_done_value, int) else 0
-    events_inserted = int(events_inserted_value) if isinstance(events_inserted_value, int) else 0
-    calls = int(calls_value) if isinstance(calls_value, int) else 0
-    chain_head = int(chain_head_value) if isinstance(chain_head_value, int) else 0
-    sunk_to = int(sunk_to_value) if isinstance(sunk_to_value, int) else -1
-    next_pct = s.get("next_pct")
-    has_sunk = sunk_to > (SCRAPE_START_BLOCK - 1)
-
-    blk_s = blocks_done / elapsed if elapsed > 1 and blocks_done > 0 else 0.0
-    ev_s = events_inserted / elapsed if elapsed > 1 else 0.0
-    req_s = calls / elapsed if elapsed > 1 and calls > 0 else 0.0
-
-    remaining_to_head = max(0, chain_head - max(sunk_to, SCRAPE_START_BLOCK - 1))
-    eta = (
-        _format_duration(remaining_to_head / blk_s)
-        if blk_s > 0 and remaining_to_head > 0
-        else "--:--:--"
-    )
-
-    if chain_head >= SCRAPE_START_BLOCK:
-        head_text = f"{chain_head:,}"
-        if isinstance(next_pct, (int, float)):
-            next_text = f"{float(next_pct):.2f}%"
-        else:
-            next_text = "n/a"
-    else:
-        head_text = "n/a"
-        next_text = "n/a"
-
-    parts = [
-        f"[{_format_duration(elapsed)}]",
-        f"sunk: {sunk_to:,}" if has_sunk else "sunk: none",
-        f"next: {next_text}",
-        f"head: {head_text}",
-        f"eta: {eta}",
-    ]
-    if phase and phase != "running":
-        parts.append(f"phase:{phase}")
-
-    return "  ".join(parts)
-
-
-def _heartbeat_loop(stop: threading.Event) -> None:
-    """Re-render the status line on a fixed cadence.
-
-    Runs on its own thread until ``stop`` fires. The interval is ``HEARTBEAT_INTERVAL_SEC``
-    (500 ms by default) which satisfies the "status output at least every 1000 ms" mission
-    requirement with room to spare.
-    """
-    while not stop.wait(HEARTBEAT_INTERVAL_SEC):
-        line = _build_status_line()
-        if line:
-            _print_status_line(line)
+def _print_message(text: str | Text) -> None:
+    """Print one line above the sticky footer and record it to the run log."""
+    with _print_lock:
+        console.print(text, markup=False, highlight=False)
+    _log_event("message", text.plain if isinstance(text, Text) else text)
 
 
 # ---------------------------------------------------------------------------
@@ -556,38 +560,49 @@ def _get_worker_id() -> int:
         return _worker_ids[tid]
 
 
+def _interruptible_sleep(seconds: float) -> None:
+    """Sleep in short slices so a CTRL-C is honored promptly."""
+    remaining = seconds
+    while remaining > 0:
+        if _stop_event.is_set():
+            return
+        slice_sec = min(remaining, 0.1)
+        time.sleep(slice_sec)
+        remaining -= slice_sec
+
+
 def _fetch_range(
     *,
     from_block: int,
     to_block: int,
     rpc_client: RpcClient,
-    rate_limiter: RateLimiter,
+    sleep_after_response_sec: float,
 ) -> dict:
     """Fetch and decode logs for one block range.
 
     Returns a dict with a ``status`` field, one of:
 
-      * ``"ok"``        — fetch succeeded within ``SLOW_FETCH_THRESHOLD_SEC``.
-      * ``"slow"``      — fetch succeeded but was over the threshold.
+      * ``"ok"``        — fetch succeeded.
       * ``"split"``     — provider rejected the range as too large.
       * ``"timeout"``   — provider timed out.
-      * ``"error"``     — any other transport-level error.
+      * ``"throttled"`` — provider pushed back (HTTP 429, or a 5xx that outlived the client's
+        retries). Carries ``http_status``.
+      * ``"error"``     — other transport-level error, worth a bounded retry.
+      * ``"fatal"``     — permanent failure (bad credentials, malformed request, decoder bug).
+        Carries ``error_message``.
       * ``"cancelled"`` — ``_stop_event`` was set before the request finished.
 
-    For ``ok`` and ``slow``, the dict also has ``rows_by_target``
-    (``dict[(contract, event), list[row]]``), ``raw_log_count``, and
-    ``elapsed_sec``.
-
-    For ``error``, the dict has ``error_message``.
+    For ``ok`` the dict also has ``rows_by_target`` (``dict[(contract, event), list[row]]``),
+    ``raw_log_count``, and ``elapsed_sec``.
 
     The function never raises: the caller deals with structured outcomes only. Mid-flight
     cancellation via ``_stop_event`` returns ``"cancelled"`` rather than propagating
     ``OperationCancelled``.
+
+    ``sleep_after_response_sec`` is the optimizer's throttle: this thread pauses for that long
+    after the provider answers, before the orchestrator can hand it more work.
     """
     wid = _get_worker_id()
-    if _stop_event.is_set():
-        return {"status": "cancelled", "wid": wid, "elapsed_sec": 0.0}
-    rate_limiter.wait()
     if _stop_event.is_set():
         return {"status": "cancelled", "wid": wid, "elapsed_sec": 0.0}
 
@@ -600,12 +615,32 @@ def _fetch_range(
             topics=[WANTED_TOPICS],
         )
     except TooManyResults:
+        _interruptible_sleep(sleep_after_response_sec)
         return {"status": "split", "wid": wid, "elapsed_sec": time.monotonic() - t0}
     except RPCTimeout:
+        _interruptible_sleep(sleep_after_response_sec)
         return {"status": "timeout", "wid": wid, "elapsed_sec": time.monotonic() - t0}
     except OperationCancelled:
         return {"status": "cancelled", "wid": wid, "elapsed_sec": time.monotonic() - t0}
+    except HTTPError as e:
+        _interruptible_sleep(sleep_after_response_sec)
+        if e.is_retryable:
+            # Survived the client's own retries, so the provider is genuinely overloaded.
+            return {
+                "status": "throttled",
+                "wid": wid,
+                "elapsed_sec": time.monotonic() - t0,
+                "http_status": e.status_code,
+            }
+        # 401/403 and friends never fix themselves; retrying just burns the backlog.
+        return {
+            "status": "fatal",
+            "wid": wid,
+            "elapsed_sec": time.monotonic() - t0,
+            "error_message": f"HTTP {e.status_code} from the RPC provider",
+        }
     except (RPCError, RuntimeError) as e:
+        _interruptible_sleep(sleep_after_response_sec)
         return {
             "status": "error",
             "wid": wid,
@@ -623,19 +658,20 @@ def _fetch_range(
         triples = decode_batch_strict(logs)
     except Exception as e:
         return {
-            "status": "error",
+            "status": "fatal",
             "wid": wid,
             "elapsed_sec": elapsed,
             "error_message": f"decode failure: {type(e).__name__}: {e}",
-            "fatal": True,
         }
 
     rows_by_target: dict[tuple[str, str], list[dict]] = {}
     for contract, event, row in triples:
         rows_by_target.setdefault((contract, event), []).append(row)
 
+    _interruptible_sleep(sleep_after_response_sec)
+
     return {
-        "status": "slow" if elapsed > SLOW_FETCH_THRESHOLD_SEC else "ok",
+        "status": "ok",
         "wid": wid,
         "elapsed_sec": elapsed,
         "rows_by_target": rows_by_target,
@@ -647,53 +683,24 @@ def _fetch_range(
 # Work queue helpers
 # ---------------------------------------------------------------------------
 
-def _build_chunks(
-    gaps: list[tuple[int, int]],
-    block_span: int,
-) -> list[tuple[int, int]]:
-    """Slice each gap into ``block_span``-sized chunks.
-
-    Always preserves chunk boundaries within a gap: a gap of 17 blocks with span 5 becomes
-    ``[(g, g+4), (g+5, g+9), (g+10, g+14), (g+15, g+16)]``.
-    Gaps are never merged across non-contiguous boundaries.
-    """
-    out: list[tuple[int, int]] = []
-    for gap_from, gap_to in gaps:
-        cursor = gap_from
-        while cursor <= gap_to:
-            chunk_to = min(cursor + block_span - 1, gap_to)
-            out.append((cursor, chunk_to))
-            cursor = chunk_to + 1
-    return out
+def _take_chunk(ranges: list[tuple[int, int]], span: int) -> tuple[int, int]:
+    """Carve up to ``span`` blocks off the front of ``ranges``, shrinking it in place."""
+    from_block, to_block = ranges[0]
+    chunk_to = min(from_block + span - 1, to_block)
+    if chunk_to >= to_block:
+        ranges.pop(0)
+    else:
+        ranges[0] = (chunk_to + 1, to_block)
+    return from_block, chunk_to
 
 
-def _rechunk_pending(
-    pending: list[tuple[int, int]],
-    block_span: int,
-) -> list[tuple[int, int]]:
-    """Merge contiguous pending chunks and re-slice at the new ``block_span``.
-
-    Called whenever the adaptive controller changes the block span: chunks that were sized for the
-    old span are coalesced into runs and then re-cut at the new size so the queue reflects the new
-    policy.
-
-    The input may be in arbitrary order — SPLIT and TIMEOUT outcomes push retry chunks to the
-    front of the queue, so by the time we rechunk, ``pending`` is not sorted. We sort first, then
-    run the merge-pass over the sorted list. Without this, the merge would drop any chunk whose
-    ``from`` block is below the running ``runs[-1][1]`` watermark — exactly the SPLIT halves that
-    need to be retried, which has been observed leaving "swiss cheese" gaps in
-    ``loaded_block_ranges``.
-    """
-    if not pending:
-        return []
-    sorted_pending = sorted(pending)
-    runs = [[sorted_pending[0][0], sorted_pending[0][1]]]
-    for a, b in sorted_pending[1:]:
-        if a <= runs[-1][1] + 1:
-            runs[-1][1] = max(runs[-1][1], b)
-        else:
-            runs.append([a, b])
-    return _build_chunks([(r[0], r[1]) for r in runs], block_span)
+def _return_chunk(ranges: list[tuple[int, int]], chunk: tuple[int, int]) -> None:
+    """Put an unfinished chunk back at the front, merging with what follows it."""
+    from_block, to_block = chunk
+    if ranges and ranges[0][0] == to_block + 1:
+        ranges[0] = (from_block, ranges[0][1])
+    else:
+        ranges.insert(0, chunk)
 
 
 # ---------------------------------------------------------------------------
@@ -732,10 +739,12 @@ class _SinkOrchestrator:
         db_path: str,
         cold_root: str,
         max_workers: int,
+        progress_cb: Any | None = None,
     ) -> None:
         self._store = store
         self._db_path = db_path
         self._cold_root = cold_root
+        self._progress_cb = progress_cb
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix="sink",
@@ -787,6 +796,7 @@ class _SinkOrchestrator:
             self._cold_root,
             partition_start,
             duckdb_connect_config=self._sink_connect_config,
+            progress_cb=self._progress_cb,
             stop_event=_stop_event,
         )
         self._in_flight[future] = partition_start
@@ -934,12 +944,13 @@ def _print_banner(
         banner_lines.append("blocks to scrape:     0 (caught up)")
     banner_lines.append("")
 
+    # Only the paths go on screen; the frontier/gap detail belongs in the run log.
+    console.print(
+        f"hot db:               {db_path} ({_file_size_str(db_path)})", highlight=False
+    )
+    console.print(f"cold root:            {cold_root}", highlight=False)
     for line in banner_lines:
-        print(line)
-        if _log_file is not None:
-            _log_file.write(line + "\n")
-    if _log_file is not None:
-        _log_file.flush()
+        _log_event("banner", line)
 
 
 # ---------------------------------------------------------------------------
@@ -954,7 +965,7 @@ def _print_summary(
     caught_up_confirmed: bool,
     blocks_done: int,
     events_inserted: int,
-    rate_limiter: RateLimiter,
+    calls_made: int,
     elapsed: float,
     fatal_reason: str | None,
 ) -> None:
@@ -1005,17 +1016,14 @@ def _print_summary(
     summary_lines.append("throughput")
     blk_s = blocks_done / elapsed if elapsed > 1 and blocks_done > 0 else 0.0
     ev_s = events_inserted / elapsed if elapsed > 1 else 0.0
-    cps = rate_limiter.total_calls / elapsed if elapsed > 1 and rate_limiter.total_calls else 0.0
+    cps = calls_made / elapsed if elapsed > 1 and calls_made else 0.0
     summary_lines.append(f"  blocks/sec:  {blk_s:,.0f}")
     summary_lines.append(f"  events/sec:  {ev_s:,.0f}")
-    summary_lines.append(f"  API calls:   {rate_limiter.total_calls:,}  ({cps:.1f}/s effective)")
+    summary_lines.append(f"  API calls:   {calls_made:,}  ({cps:.1f}/s effective)")
 
     for line in summary_lines:
-        print(line)
-        if _log_file is not None:
-            _log_file.write(line + "\n")
-    if _log_file is not None:
-        _log_file.flush()
+        console.print(line, highlight=False)
+        _log_event("summary", line)
 
 
 # ---------------------------------------------------------------------------
@@ -1033,7 +1041,7 @@ def main() -> None:
         if interrupt_count[0] >= FORCE_EXIT_AFTER_INTERRUPTS:
             # User said "really, stop". Bypass orderly shutdown — every file in flight has either
             # been renamed atomically (visible only after success) or is a ``.tmp-*`` file that
-            # ``remove_orphan_temp_files`` will clean at next startup.
+            # the next startup drops when it inspects that partition.
             print("\n  Force exit (second interrupt).")
             os._exit(1)
         # First interrupt: raise so cooperating code can shut down cleanly.
@@ -1045,10 +1053,6 @@ def main() -> None:
     # ----- Parse args ------------------------------------------------
     parser = argparse.ArgumentParser(
         description="Scrape Polymarket event logs from Polygon JSON-RPC into the v3 hot DB and cold Parquet tree.",
-    )
-    parser.add_argument(
-        "--parallel", type=int, default=8,
-        help="ceiling on concurrent RPC workers (default: 8)",
     )
     parser.add_argument(
         "--sink-workers", type=int, default=1,
@@ -1064,8 +1068,6 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.parallel < 1:
-        sys.exit(f"--parallel must be >= 1; got {args.parallel}")
     if args.sink_workers < 1:
         sys.exit(f"--sink-workers must be >= 1; got {args.sink_workers}")
     if args.max_calls is not None and args.max_calls < 1:
@@ -1074,30 +1076,16 @@ def main() -> None:
         sys.exit(f"--lag-tolerance must be >= 0; got {args.lag_tolerance}")
 
     env = _load_environment()
-    max_block_span = int(env["max_block_span"])
-    max_rps = int(env["max_rps"])
 
     # ----- Wire up state --------------------------------------------
     run_start = time.monotonic()
-    _live.update({
-        "run_start": run_start,
-        "phase": "startup",
-        "phase_since": run_start,
-        "max_workers": args.parallel,
-        "max_span": max_block_span,
-    })
-
-    heartbeat_stop = threading.Event()
-    heartbeat = threading.Thread(
-        target=_heartbeat_loop, args=(heartbeat_stop,),
-        name="heartbeat", daemon=True,
-    )
-    heartbeat.start()
 
     # Open the persistent run log as early as possible
     _open_run_log()
+    status_ui.start()
+    status_ui.spinner("head", "Querying chain head")
+    status_ui.spinner("startup", "Opening hot database")
 
-    rate_limiter = RateLimiter(max_rps)
     rpc_client = RpcClient(
         env["rpc_url"],
         config=RpcClientConfig(
@@ -1108,6 +1096,12 @@ def main() -> None:
         ),
         stop_event=_stop_event,
     )
+
+    def _query_chain_head() -> int:
+        return rpc_client.get_block_number()
+
+    head_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="startup-head")
+    head_future = head_executor.submit(_query_chain_head)
 
     store: HotStore | None = None
     sink: _SinkOrchestrator | None = None
@@ -1122,11 +1116,11 @@ def main() -> None:
     caught_up_confirmed = False
     blocks_done = 0
     events_inserted = 0
+    calls_made = 0
     chain_head = 0
 
     try:
         # --- HotStore -----------------------------------------------
-        _set_phase("opening hot db")
         try:
             store = HotStore(
                 env["db_path"],
@@ -1141,101 +1135,38 @@ def main() -> None:
         except (FileNotFoundError, V3Error) as e:
             sys.exit(f"Could not open hot DB at {env['db_path']}: {e}")
 
-        # Seed status line with current sunk frontier so startup phases can show it.
-        start_sunk_frontier = store.get_sunk_frontier()
-        _live["sunk_to"] = (
-            start_sunk_frontier if start_sunk_frontier > (SCRAPE_START_BLOCK - 1) else -1
-        )
-
-        # --- Chain head and gap discovery ---------------------------
-        # Read the chain head early so startup can prove whether the cold tier is already caught
-        # up even if later startup phases return early.
-        _set_phase("querying chain head")
-        try:
-            chain_head = rpc_client.get_block_number()
-        except (RPCError, RuntimeError) as e:
-            sys.exit(f"FATAL: could not read chain head: {type(e).__name__}: {e}")
-
-        if chain_head < SCRAPE_START_BLOCK:
-            sys.exit(
-                f"FATAL: RPC returned chain head {chain_head:,}, which is before "
-                f"SCRAPE_START_BLOCK {SCRAPE_START_BLOCK:,}. The RPC endpoint may be "
-                f"returning incorrect data or is in a failed state."
-            )
-
-        _print_message(f"Chain head query complete: {chain_head:,}.")
-
-        # --- Clean orphan temp files left over from prior crashes ----
-        _live["startup_task"] = "cleaning"
-        _live["startup_detail"] = "scanning for .tmp-* files"
-        try:
-            orphans = remove_orphan_temp_files(env["cold_root"], older_than_seconds=60.0)
-        except OSError as e:
-            sys.exit(f"FATAL: could not scan cold tier for orphan temp files: {e}")
-        _live["startup_task"] = None
-        _live["startup_detail"] = None
-        if orphans:
-            _print_message(f"Removed {orphans} orphaned ``.tmp-*`` file(s) from prior runs.")
-
         # --- Read manifest frontier --------------------------------
-        _set_phase("reading frontier")
+        # Temp files under already-sunk partitions are not second-guessed: a published manifest
+        # means that partition is final. An interrupted write is dropped when the partition it
+        # belongs to is inspected.
+        status_ui.spinner("startup", "Reading manifest frontier")
 
         def _frontier_progress(*, op, phase, rows_done=None, rows_total=None,
-                               elapsed_ms=None, message=""):
-            _live["startup_task"] = "frontier"
-            if rows_total is not None and rows_done is not None:
-                _live["startup_detail"] = f"{phase}:{rows_done:,}/{rows_total:,}"
-            elif rows_done is not None:
-                _live["startup_detail"] = f"{phase}:{rows_done:,}"
-            else:
-                _live["startup_detail"] = phase
-            if message:
-                _live["startup_detail"] = f"{_live['startup_detail']} {message}"
-            _live["startup_done"] = rows_done
-            _live["startup_total"] = rows_total
-            # As manifest partitions are validated, reflect the implied sunk
-            # frontier live in the sticky status line.
-            if rows_done is not None:
-                try:
-                    candidate_partition = int(rows_done)
-                    _live["sunk_to"] = candidate_partition + PARTITION_SIZE_10K - 1
-                except (TypeError, ValueError):
-                    pass
+                               elapsed_ms=None, message="", partition=None):
+            if partition is not None:
+                status_ui.spinner(
+                    "startup", f"Finding sunk partition {_mask_partition(partition)}"
+                )
 
         try:
-            manifest_frontier, manifest_partition_count = read_manifest_frontier(
+            manifest_frontier, _ = read_manifest_frontier(
                 env["cold_root"],
                 progress_cb=_frontier_progress,
             )
         except V3Error as e:
             sys.exit(f"FATAL: manifest frontier read failed: {e}")
-        finally:
-            _live["startup_task"] = None
-            _live["startup_done"] = None
-            _live["startup_total"] = None
-            _live["startup_detail"] = None
 
-        _print_message(
-            "Manifest frontier read complete: "
-            f"frontier={manifest_frontier:,}, partitions={manifest_partition_count:,}."
-        )
+        _print_message(f"Manifest frontier read complete: frontier={manifest_frontier:,}.")
 
         # --- Roll manifest frontier forward -------------------------
-        _set_phase("rolling forward frontier")
+        status_ui.spinner("startup", "Touching up sunk partitions")
 
         def _manifest_progress(*, op, phase, rows_done=None, rows_total=None,
-                               elapsed_ms=None, message=""):
-            _live["startup_task"] = "manifest"
-            if rows_total is not None and rows_done is not None:
-                _live["startup_detail"] = f"{phase}:{rows_done:,}/{rows_total:,}"
-            elif rows_done is not None:
-                _live["startup_detail"] = f"{phase}:{rows_done:,}"
-            else:
-                _live["startup_detail"] = phase
-            if message:
-                _live["startup_detail"] = f"{_live['startup_detail']} {message}"
-            _live["startup_done"] = rows_done
-            _live["startup_total"] = rows_total
+                               elapsed_ms=None, message="", partition=None):
+            if partition is not None:
+                status_ui.spinner(
+                    "startup", f"Touching up sunk partition {_mask_partition(partition)}"
+                )
 
         try:
             published_manifests = roll_forward_manifests_to_exhaustion(
@@ -1247,11 +1178,6 @@ def main() -> None:
             raise KeyboardInterrupt
         except V3Error as e:
             sys.exit(f"FATAL: manifest startup checks failed: {e}")
-        finally:
-            _live["startup_task"] = None
-            _live["startup_done"] = None
-            _live["startup_total"] = None
-            _live["startup_detail"] = None
 
         _print_message(
             "Manifest roll-forward complete: "
@@ -1259,21 +1185,23 @@ def main() -> None:
         )
 
         # --- Cleanup after frontier ---------------------------------
-        _set_phase("cleanup after frontier")
-        _live["startup_task"] = "cleanup"
-        _live["startup_detail"] = "post-frontier temp cleanup"
+        status_ui.spinner("startup", "Cleaning temporary files at the frontier")
+
+        def _cleanup_progress(*, op, phase, rows_done=None, rows_total=None,
+                              elapsed_ms=None, message="", partition=None):
+            if partition is not None:
+                status_ui.spinner(
+                    "startup",
+                    f"Cleaning temporary files for partition {_mask_partition(partition)}",
+                )
+
         try:
             cleaned_manifest = cleanup_temp_dirs_after_frontier(
                 env["cold_root"],
-                progress_cb=_manifest_progress,
+                progress_cb=_cleanup_progress,
             )
         except V3Error as e:
             sys.exit(f"FATAL: post-frontier cleanup failed: {e}")
-        finally:
-            _live["startup_task"] = None
-            _live["startup_done"] = None
-            _live["startup_total"] = None
-            _live["startup_detail"] = None
 
         _print_message(
             "Post-frontier cleanup complete: "
@@ -1283,31 +1211,21 @@ def main() -> None:
         manifest_frontier = get_manifest_frontier(env["cold_root"])
         # Manifest is the durable source of truth for sunk frontier at startup.
         store.sunk_frontier = manifest_frontier
-        _live["sunk_to"] = manifest_frontier if manifest_frontier > (SCRAPE_START_BLOCK - 1) else -1
-        _live["manifest_to"] = manifest_frontier if manifest_frontier >= 0 else -1
 
         # --- Reconcile hot DB progress with cold tier ----------------
         # If we crashed between a sink worker's rename and the orchestrator's commit_sink, the
         # Parquet files reached disk but the hot DB still has the rows. Reconcile fixes that
         # without re-scraping.
-        _set_phase("reconciling cold tier")
+        status_ui.spinner("startup", "Reading sunk partitions from the hot database")
 
         def _reconcile_progress(*, op, phase, rows_done=None, rows_total=None,
-                                elapsed_ms=None, message=""):
-            _live["startup_task"] = "reconciling"
+                                elapsed_ms=None, message="", partition=None):
             if phase == "scan":
-                _live["startup_detail"] = f"scan:{rows_done or 0:,}"
-                if rows_total:
-                    _live["startup_detail"] = f"scan:{rows_done or 0:,}/{rows_total:,}"
+                status_ui.spinner("startup", "Scanning the cold tier for sunk partitions")
             elif phase == "update":
-                _live["startup_detail"] = f"update:{rows_done or 0:,}"
-            else:
-                _live["startup_detail"] = message or phase
-            _live["startup_done"] = rows_done
-            _live["startup_total"] = rows_total
-            # Keep sunk frontier live during reconcile so startup status reflects progress.
-            current_sunk = store.get_sunk_frontier()
-            _live["sunk_to"] = current_sunk if current_sunk > (SCRAPE_START_BLOCK - 1) else -1
+                status_ui.spinner(
+                    "startup", "Recording sunk partitions in the hot database"
+                )
 
         try:
             newly_sunk = store.reconcile_with_cold_tier(
@@ -1320,20 +1238,27 @@ def main() -> None:
             raise KeyboardInterrupt
         except V3Error as e:
             sys.exit(f"FATAL: reconcile_with_cold_tier failed: {e}")
-        finally:
-            _live["startup_task"] = None
-            _live["startup_done"] = None
-            _live["startup_total"] = None
-            _live["startup_detail"] = None
         if newly_sunk:
             _print_message(f"Reconciled {newly_sunk:,} partition(s) from existing cold-tier files.")
 
         # --- Sink orchestrator --------------------------------------
+        def _sink_progress_cb(*, op, phase, rows_done=None, rows_total=None,
+                              elapsed_ms=None, message="", partition=None):
+            # Takes over the partition row: by the time a partition is being written, it is full.
+            if op == "sink" and phase == "copy" and partition is not None:
+                status_ui.bar(
+                    "partition",
+                    f"Sinking partition {_mask_partition(partition)}",
+                    rows_done or 0,
+                    rows_total or 1,
+                )
+
         sink = _SinkOrchestrator(
             store=store,
             db_path=env["db_path"],
             cold_root=env["cold_root"],
             max_workers=args.sink_workers,
+            progress_cb=_sink_progress_cb,
         )
 
         # Anything already in the hot DB and ready to sink at startup (e.g. a clean shutdown after
@@ -1343,6 +1268,28 @@ def main() -> None:
             sink.submit(p)
         if backlog:
             _print_message(f"Submitted {len(backlog):,} pre-existing ready partition(s) to the sink pool.")
+
+        status_ui.clear("startup")
+
+        # --- Chain head ---------------------------------------------
+        # Queried in parallel with all of the startup disk work above; needed only now, to plan
+        # the scrape. Any failure is fatal.
+        try:
+            chain_head = head_future.result()
+        except Exception as e:  # noqa: BLE001
+            sys.exit(f"FATAL: could not read chain head: {type(e).__name__}: {e}")
+        finally:
+            head_executor.shutdown(wait=False)
+            status_ui.clear("head")
+
+        if chain_head < SCRAPE_START_BLOCK:
+            sys.exit(
+                f"FATAL: RPC returned chain head {chain_head:,}, which is before "
+                f"SCRAPE_START_BLOCK {SCRAPE_START_BLOCK:,}. The RPC endpoint may be "
+                f"returning incorrect data or is in a failed state."
+            )
+
+        _print_message(f"Chain head: {chain_head:,}")
 
         # Work planning must ignore already-sunk history and only consider
         # unsunk coverage above the sunk frontier.
@@ -1363,24 +1310,9 @@ def main() -> None:
             unsunk_ranges=unsunk_ranges,
         )
 
-        _live.update({
-            "total_blocks": total_gap_blocks,
-            "blocks_done": 0,
-            "events_inserted": 0,
-            "calls": 0,
-            "active_workers": 1,
-            "span": 1,
-            "in_flight_rpc": 0,
-            "sink_pending": sink.in_flight,
-            "sunk_to": sunk_frontier if sunk_frontier >= 0 else -1,
-            "next_pct": _next_partition_fill_pct(
-                store=store,
-                sunk_frontier=sunk_frontier,
-                chain_head=chain_head,
-            ),
-            "chain_head": chain_head,
-        })
-        _set_phase("running")
+        # The main bar counts only the blocks this run has to scrape, starting at zero.
+        total_target = max(total_gap_blocks, 1)
+        status_ui.bar("main", "Total progress", 0, total_target)
 
         if not gaps and sink.in_flight == 0 and sink.pending_commit == 0:
             caught_up_confirmed = True
@@ -1395,69 +1327,109 @@ def main() -> None:
                 total_gap_blocks=0,
                 unsunk_ranges=unsunk_ranges,
             )
-            print(
+            _print_message(
                 "caught-up proof: "
-                f"manifest_frontier={manifest_frontier:,} "
                 f"sunk_frontier={sunk_frontier:,} "
                 f"loaded_frontier={loaded_frontier:,} "
                 f"chain_head={chain_head:,} "
-                f"lag={lag:,} blocks",
-                flush=True,
+                f"lag={lag:,} blocks"
             )
-            print()
-            print("=" * 70)
-            print("ALREADY CAUGHT UP")
-            print("=" * 70)
-            print(f"  loaded frontier:  {loaded_frontier:,}")
-            print(f"  manifest frontier: {manifest_frontier:,}")
-            print(f"  chain head:       {chain_head:,}")
-            print(f"  lag:              {lag:,} blocks (tolerance: {args.lag_tolerance})")
-            print()
-            print("No new work to do. Exiting cleanly.")
-            print()
+            _print_message("")
+            _print_message("=" * 70)
+            _print_message("ALREADY CAUGHT UP")
+            _print_message("=" * 70)
+            _print_message(f"  sunk frontier:    {sunk_frontier:,}")
+            _print_message(f"  loaded frontier:  {loaded_frontier:,}")
+            _print_message(f"  chain head:       {chain_head:,}")
+            _print_message(
+                f"  lag:              {lag:,} blocks (tolerance: {args.lag_tolerance})"
+            )
+            _print_message("")
+            _print_message("No new work to do. Exiting cleanly.")
+            _print_message("")
             return
 
-        # --- Set up the adaptive controller and work queue ----------
-        controller = AdaptiveController(
-            worker_ceiling=args.parallel,
-            max_block_span=max_block_span,
-        )
-        pending_chunks: list[tuple[int, int]] = _build_chunks(gaps, controller.block_span)
+        # --- Set up the optimizer and work queue --------------------
+        optimizer = EpochOptimizer()
+        planner = ChunkPlanner()
+        endpoint_label = _describe_rpc_endpoint(env["rpc_url"])
+        # Ranges still to scrape, ascending. Chunks are carved off the front as workers free up,
+        # so each request is sized for the density where it actually lands.
+        pending_ranges: list[tuple[int, int]] = list(gaps)
         chunk_failures: dict[tuple[int, int], int] = {}
+        draining_epoch = False
+        probe_in_flight: tuple[int, int] | None = None
 
-        # RPC worker pool. We don't use ``concurrent.futures.wait``'s timeout-only-on-
-        # FIRST_COMPLETED with a huge pool; one pool sized to ``--parallel`` is plenty. The
-        # controller's ``active_workers`` value caps how many we submit at once.
+        # Sized to the safety cap; the optimizer decides how many of these threads are ever busy.
         rpc_pool = ThreadPoolExecutor(
-            max_workers=args.parallel,
+            max_workers=MAX_WORKERS,
             thread_name_prefix="rpc",
         )
 
         def _submit_one(chunk: tuple[int, int]) -> bool:
             """Submit one chunk. Returns False on call-count limit."""
+            nonlocal calls_made
             if _stop_event.is_set():
                 return False
-            if args.max_calls is not None and rate_limiter.total_calls >= args.max_calls:
+            if args.max_calls is not None and calls_made >= args.max_calls:
                 return False
             fut = rpc_pool.submit(
                 _fetch_range,
                 from_block=chunk[0], to_block=chunk[1],
-                rpc_client=rpc_client, rate_limiter=rate_limiter,
+                rpc_client=rpc_client,
+                sleep_after_response_sec=optimizer.params.sleep_after_response_sec,
             )
             rpc_futures[fut] = chunk
+            calls_made += 1
             return True
 
-        def _top_up_in_flight() -> None:
-            """Keep ``len(rpc_futures) == controller.active_workers``
-            by submitting from the pending queue.
-            """
-            while pending_chunks and len(rpc_futures) < controller.active_workers:
-                chunk = pending_chunks.pop(0)
-                if not _submit_one(chunk):
-                    # Put it back so we don't lose it.
-                    pending_chunks.insert(0, chunk)
-                    return
+        def _refresh_bars() -> None:
+            """Repaint the footer from current progress."""
+            if sink.in_flight == 0:
+                # While a partition is being written the sink owns this row.
+                partition_start_now, partition_loaded = _next_partition_progress(
+                    store, store.get_sunk_frontier()
+                )
+                status_ui.bar(
+                    "partition",
+                    f"Partition {_mask_partition(partition_start_now)}",
+                    partition_loaded,
+                    PARTITION_SIZE_10K,
+                )
+            status_ui.bar(
+                "main", "Total progress", min(blocks_done, total_target), total_target
+            )
+            if rpc_futures:
+                run_seconds = time.monotonic() - run_start
+                rate = blocks_done / run_seconds if run_seconds > 0 else 0.0
+                status_ui.spinner(
+                    "scrape", f"Scraping {endpoint_label}  {rate:,.0f} blk/s"
+                )
+            else:
+                status_ui.clear("scrape")
 
+        def _top_up_in_flight() -> None:
+            """Fill the in-flight set up to the optimizer's worker count.
+
+            Submits nothing while the epoch is draining, so the drain can actually finish.
+            """
+            nonlocal probe_in_flight
+            if draining_epoch:
+                return
+            while pending_ranges and len(rpc_futures) < optimizer.params.workers:
+                budget = optimizer.params.result_budget
+                # Only one request at a time may try a span beyond proven ground, so a refusal
+                # costs one request instead of every request currently in flight.
+                probing = not probe_in_flight and planner.would_probe(budget)
+                span = planner.next_span(budget, probe=probing)
+                chunk = _take_chunk(pending_ranges, span)
+                if not _submit_one(chunk):
+                    _return_chunk(pending_ranges, chunk)
+                    return
+                if probing:
+                    probe_in_flight = chunk
+
+        optimizer.start_epoch()
         _top_up_in_flight()
         if not rpc_futures:
             fatal_reason = (
@@ -1468,12 +1440,15 @@ def main() -> None:
             return
 
         # --- Main loop ----------------------------------------------
-        while rpc_futures and not _stop_event.is_set() and sink.fatal_error is None:
-            done, _ = concurrent.futures.wait(
-                rpc_futures,
-                timeout=POLL_TIMEOUT_SEC,
-                return_when=concurrent.futures.FIRST_COMPLETED,
-            )
+        while not _stop_event.is_set() and sink.fatal_error is None:
+            if rpc_futures:
+                done, _ = concurrent.futures.wait(
+                    rpc_futures,
+                    timeout=POLL_TIMEOUT_SEC,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+            else:
+                done = set()
 
             # Even if no RPC future completed, run sink bookkeeping so
             # commits don't pile up.
@@ -1484,30 +1459,14 @@ def main() -> None:
                 _stop_event.set()
                 break
 
-            _live["in_flight_rpc"] = len(rpc_futures)
-            _live["sink_pending"] = sink.in_flight + sink.pending_commit
-            _live["calls"] = rate_limiter.total_calls
-            _live["active_workers"] = controller.active_workers
-            _live["span"] = controller.block_span
-            _live["blocks_done"] = blocks_done
-            _live["events_inserted"] = events_inserted
-            sf = store.get_sunk_frontier()
-            _live["sunk_to"] = sf if sf >= 0 else -1
-            _live["next_pct"] = _next_partition_fill_pct(
-                store=store,
-                sunk_frontier=sf,
-                chain_head=chain_head,
-            )
-
-            if not done:
-                continue
-
-            span_changed_any = False
+            _refresh_bars()
 
             for fut in done:
                 chunk = rpc_futures.pop(fut)
                 from_b, to_b = chunk
                 chunk_span = to_b - from_b + 1
+                if probe_in_flight == chunk:
+                    probe_in_flight = None
                 try:
                     result = fut.result()
                 except BaseException as e:  # noqa: BLE001
@@ -1530,7 +1489,7 @@ def main() -> None:
                     # because nothing was committed for this range.)
                     continue
 
-                if status in ("ok", "slow"):
+                if status == "ok":
                     raw_log_count = int(result["raw_log_count"])
                     elapsed_s = float(result["elapsed_sec"])
                     rows_by_target: dict[tuple[str, str], list[dict]] = result["rows_by_target"]
@@ -1570,17 +1529,16 @@ def main() -> None:
 
                     events_inserted += persist_result.rows_inserted
                     blocks_done += chunk_span
-
-                    # Refresh next_pct for accurate status line display
+                    optimizer.record_blocks(chunk_span)
+                    planner.record_success(blocks=chunk_span, logs=raw_log_count)
+                    if optimizer.record_ok(
+                        blocks=chunk_span, logs=raw_log_count, elapsed_sec=elapsed_s
+                    ):
+                        _print_message(f"  ramp -> {optimizer.params.describe()}")
+                    _refresh_bars()
                     sf = store.get_sunk_frontier()
-                    _live["next_pct"] = _next_partition_fill_pct(
-                        store=store,
-                        sunk_frontier=sf,
-                        chain_head=chain_head,
-                    )
 
-                    # Compute how many blocks in this chunk do not contribute to the
-                    # "next: xx.xx%" statistic (i.e., fall outside the next partition).
+                    # Blocks in this chunk that land beyond the partition being filled next.
                     next_partition_start = (
                         (max(sf, SCRAPE_START_BLOCK - 1) + 1) // PARTITION_SIZE_10K
                     ) * PARTITION_SIZE_10K
@@ -1592,63 +1550,34 @@ def main() -> None:
 
                     # Print after persist succeeds
                     _suffix = f" (beyond next: {beyond_blks:,} blks)" if beyond_blks > 0 else ""
-                    _print_message(
-                        f"  -> blks: {chunk_span:,}"
-                        f"  evts: {raw_log_count:,}"
-                        f"  {elapsed_s:.1f}s"
-                        f"{_suffix}"
+                    line = Text("  -> blks: ")
+                    line.append(f"{chunk_span:,}", style=_COLOR_DONE)
+                    line.append(
+                        f"  evts: {raw_log_count:,}  {elapsed_s:.1f}s{_suffix}"
                     )
+                    _print_message(line)
 
                     for p in persist_result.ready_partitions:
                         sink.submit(p)
 
-                    # Tell the controller. ``record_ok``/``record_slow`` return whether the targets
-                    # changed.
-                    if status == "ok":
-                        span_changed, workers_changed = controller.record_ok(
-                            chunk_span=chunk_span,
-                            raw_log_count=raw_log_count,
-                        )
-                    else:
-                        span_changed, workers_changed = controller.record_slow(
-                            chunk_span=chunk_span,
-                        )
-                    if span_changed:
-                        _print_message(
-                            f"  span -> {controller.block_span:,}"
-                            f"  (slow-start={'on' if controller.span_in_slow_start else 'off'})"
-                        )
-                        span_changed_any = True
-                    if workers_changed:
-                        _print_message(
-                            f"  workers -> {controller.active_workers}"
-                            f"  (slow-start={'on' if controller.workers_in_slow_start else 'off'})"
-                        )
-
                 elif status == "split":
                     elapsed_s = float(result["elapsed_sec"])
                     wid = int(result["wid"])
+                    charged = planner.record_rejection(blocks=chunk_span)
+                    optimizer.record_rejection()
                     _print_message(
-                        f"  SPLIT  w:{wid}  blks:{chunk_span:,}  "
-                        f"[{from_b:,}-{to_b:,}]  {elapsed_s:.1f}s"
+                        f"  REFUSED  w:{wid}  blks:{chunk_span:,}  "
+                        f"[{from_b:,}-{to_b:,}]  too many {charged}; {planner.describe()}"
                     )
                     if chunk_span <= 1:
-                        # Provider rejected a single-block range. Skip rather than loop forever;
-                        # the chunk stays out of ``loaded_block_ranges`` so the next run will retry
-                        # it via ``find_gaps``.
+                        # A single block cannot be split further. Leave it out of
+                        # ``loaded_block_ranges`` so the next run retries it.
                         _print_message(
-                            f"  Single-block range {from_b} rejected. "
+                            f"  Single-block range {from_b} refused. "
                             "Skipping; will be retried on next run."
                         )
-                        controller.record_split()
                         continue
-                    mid = (from_b + to_b) // 2
-                    pending_chunks.insert(0, (mid + 1, to_b))
-                    pending_chunks.insert(0, (from_b, mid))
-                    span_changed, _ = controller.record_split()
-                    if span_changed:
-                        _print_message(f"  span -> {controller.block_span:,}  (after SPLIT)")
-                        span_changed_any = True
+                    _return_chunk(pending_ranges, chunk)
 
                 elif status == "timeout":
                     elapsed_s = float(result["elapsed_sec"])
@@ -1657,36 +1586,41 @@ def main() -> None:
                         f"  TMOUT  w:{wid}  blks:{chunk_span:,}  "
                         f"[{from_b:,}-{to_b:,}]  {elapsed_s:.1f}s"
                     )
-                    pending_chunks.insert(0, chunk)
-                    span_changed, workers_changed = controller.record_timeout()
-                    if span_changed:
-                        _print_message(f"  span -> {controller.block_span:,}  (after TMOUT)")
-                        span_changed_any = True
-                    if workers_changed:
-                        _print_message(f"  workers -> {controller.active_workers}  (after TMOUT)")
+                    _return_chunk(pending_ranges, chunk)
+                    optimizer.record_timeout()
+                    _print_message(f"  backing off -> {optimizer.params.describe()}")
+
+                elif status == "throttled":
+                    http_status = result.get("http_status")
+                    wid = int(result["wid"])
+                    _print_message(
+                        f"  THROTTLED  w:{wid}  HTTP {http_status}  "
+                        f"[{from_b:,}-{to_b:,}]"
+                    )
+                    _return_chunk(pending_ranges, chunk)
+                    optimizer.record_throttled(http_status)
+                    _print_message(f"  backing off -> {optimizer.params.describe()}")
+
+                elif status == "fatal":
+                    fatal_reason = (
+                        f"fatal error on [{from_b:,}-{to_b:,}]: "
+                        f"{result.get('error_message', '')}"
+                    )
+                    _print_message(f"FATAL: {fatal_reason}")
+                    _stop_event.set()
+                    break
 
                 elif status == "error":
                     err_msg = str(result.get("error_message", ""))
                     wid = int(result["wid"])
                     elapsed_s = float(result["elapsed_sec"])
-                    fatal = bool(result.get("fatal", False))
-                    if fatal:
-                        # Decode failure: never retry — there's a code bug to fix first.
-                        fatal_reason = (
-                            f"fatal error on [{from_b:,}-{to_b:,}]: {err_msg}"
-                        )
-                        _print_message(f"FATAL: {fatal_reason}")
-                        _stop_event.set()
-                        break
-
                     _print_message(
                         f"  ERROR  w:{wid}  blks:{chunk_span:,}  "
                         f"[{from_b:,}-{to_b:,}]  {elapsed_s:.1f}s  err: {err_msg}"
                     )
-                    controller.record_error()
                     chunk_failures[chunk] = chunk_failures.get(chunk, 0) + 1
                     if chunk_failures[chunk] < MAX_CHUNK_RETRIES:
-                        pending_chunks.insert(0, chunk)
+                        _return_chunk(pending_ranges, chunk)
                     else:
                         _print_message(
                             f"  Giving up on [{from_b:,}-{to_b:,}] "
@@ -1704,10 +1638,17 @@ def main() -> None:
                     _stop_event.set()
                     break
 
-            # If the span changed, the remaining queue is sized to the
-            # old span. Re-cut at the new size.
-            if span_changed_any:
-                pending_chunks = _rechunk_pending(pending_chunks, controller.block_span)
+            # --- Epoch boundary -------------------------------------
+            # Stop submitting at the deadline, let in-flight work drain, then score the epoch: the
+            # drain belongs inside the measurement it was caused by.
+            if not draining_epoch and optimizer.should_end_epoch():
+                draining_epoch = True
+            if draining_epoch and not rpc_futures:
+                report = optimizer.end_epoch()
+                _print_message(f"  epoch: {report.describe()}")
+                _print_message(f"  next:  {report.next_params.describe()}  {planner.describe()}")
+                draining_epoch = False
+                optimizer.start_epoch()
 
             # Top up in-flight work and run sink bookkeeping again.
             _top_up_in_flight()
@@ -1718,21 +1659,18 @@ def main() -> None:
                 _stop_event.set()
                 break
 
-            # If we've exhausted the call limit, drain in-flight and stop.
-            if (
-                args.max_calls is not None
-                and rate_limiter.total_calls >= args.max_calls
-                and not pending_chunks
-            ):
-                _print_message(
-                    f"  Reached --max-calls limit ({args.max_calls}). "
-                    "Draining in-flight work."
-                )
+            if pending_ranges and not rpc_futures and not draining_epoch:
+                # Nothing could be submitted, so the call budget is spent.
+                if args.max_calls is not None:
+                    _print_message(
+                        f"  Reached --max-calls limit ({args.max_calls}). Stopping."
+                    )
+                break
 
             # If the queue is empty and nothing is in flight, check the chain head and either
             # rebuild the queue or stop.
-            if not pending_chunks and not rpc_futures:
-                _set_phase("rechecking chain head")
+            if not pending_ranges and not rpc_futures and not draining_epoch:
+                status_ui.spinner("head", "Rechecking chain head")
                 try:
                     new_head = rpc_client.get_block_number()
                 except (RPCError, RuntimeError) as e:
@@ -1740,6 +1678,8 @@ def main() -> None:
                     _print_message(f"FATAL: {fatal_reason}")
                     _stop_event.set()
                     break
+                finally:
+                    status_ui.clear("head")
 
                 # Recompute only unsunk gaps; sunk history is immutable and
                 # must never be re-scheduled.
@@ -1754,7 +1694,7 @@ def main() -> None:
                             f"{sink.in_flight} in-flight / {sink.pending_commit} pending. "
                             "Waiting for sink to drain..."
                         )
-                        _set_phase("draining sink")
+                        status_ui.spinner("drain", "Draining the sink pool")
                         chain_head = new_head
                         # Stay in the loop; we'll fall through with no RPC work and just let sink
                         # complete.
@@ -1775,14 +1715,13 @@ def main() -> None:
                     f"{new_gap_blocks:,} remaining)."
                 )
                 chain_head = new_head
-                _live["chain_head"] = chain_head
                 gaps = new_gaps
-                pending_chunks = _build_chunks(new_gaps, controller.block_span)
-                _live["total_blocks"] = blocks_done + new_gap_blocks
-                _set_phase("running")
+                pending_ranges = list(new_gaps)
+                total_target = max(blocks_done + new_gap_blocks, 1)
+                status_ui.clear("drain")
                 _top_up_in_flight()
                 if not rpc_futures:
-                    if args.max_calls is not None and rate_limiter.total_calls >= args.max_calls:
+                    if args.max_calls is not None and calls_made >= args.max_calls:
                         fatal_reason = (
                             f"--max-calls limit ({args.max_calls}) reached "
                             f"while {new_gap_blocks:,} blocks still behind."
@@ -1819,18 +1758,10 @@ def main() -> None:
         _print_message(_tb.format_exc())
 
     finally:
-        # Close the run log file if it was opened
-        global _log_file
-        if _log_file is not None:
-            try:
-                _log_file.write("# main finished\n")
-                _log_file.flush()
-                _log_file.close()
-            except Exception:
-                pass
-            _log_file = None
-
         # --- Orderly shutdown ---------------------------------------
+        # 0. Stop the startup head-check executor if it is still alive.
+        head_executor.shutdown(wait=False, cancel_futures=True)
+
         # 1. Cancel anything we can in the RPC pool.
         if rpc_pool is not None:
             for f in list(rpc_futures):
@@ -1841,7 +1772,7 @@ def main() -> None:
         #    frontier order. We do NOT submit new sink work past this point; any incomplete
         #    partition will be picked up by ``reconcile_with_cold_tier`` on the next start.
         if sink is not None:
-            _set_phase("draining sink")
+            status_ui.spinner("drain", "Draining the sink pool")
             # Wait for sink futures with a generous timeout. Two CTRL-Cs bypass this via the
             # os._exit in the SIGINT handler.
             sink.shutdown(wait=True)
@@ -1855,15 +1786,10 @@ def main() -> None:
             if sink.fatal_error is not None and fatal_reason is None:
                 fatal_reason = f"sink worker failed: {sink.fatal_error}"
 
-        # 3. Stop the heartbeat.
-        heartbeat_stop.set()
-        heartbeat.join(timeout=2.0)
+        # 3. Tear down the sticky footer so the summary lands on a clean screen.
+        status_ui.stop()
 
-        # 4. Erase the live status line so the terminal isn't ugly.
-        sys.stdout.write(f"\r{' ' * _term_width()}\r")
-        sys.stdout.flush()
-
-        # 5. Print the summary.
+        # 4. Print the summary.
         try:
             if system_exit_requested:
                 pass
@@ -1883,14 +1809,14 @@ def main() -> None:
                     caught_up_confirmed=caught_up_confirmed,
                     blocks_done=blocks_done,
                     events_inserted=events_inserted,
-                    rate_limiter=rate_limiter,
+                    calls_made=calls_made,
                     elapsed=elapsed,
                     fatal_reason=fatal_reason,
                 )
         except Exception as e:  # noqa: BLE001
-            print(f"\n(summary print failed: {type(e).__name__}: {e})")
+            console.print(f"\n(summary print failed: {type(e).__name__}: {e})")
 
-        # 6. Close the hot DB connection. The lib enforces all writes were already committed
+        # 5. Close the hot DB connection. The lib enforces all writes were already committed
         #    atomically, so there's no flush.
         if store is not None:
             try:
@@ -1898,11 +1824,25 @@ def main() -> None:
             except Exception:  # noqa: BLE001
                 pass
 
-        # 7. Close the RPC client (per-thread connections — main thread only).
+        # 6. Close the RPC client (per-thread connections — main thread only).
         try:
             rpc_client.close()
         except Exception:  # noqa: BLE001
             pass
+
+        # 7. Close the run log last so shutdown and the summary are recorded.
+        global _log_file, _run_logger
+        if _log_file is not None:
+            try:
+                _log_file.write("# main finished\n")
+                _log_file.flush()
+                _log_file.close()
+            except Exception:  # noqa: BLE001
+                pass
+            _log_file = None
+        if _run_logger is not None:
+            _run_logger.close()
+            _run_logger = None
 
         sys.stdout.flush()
         sys.exit(1 if fatal_reason else 0)

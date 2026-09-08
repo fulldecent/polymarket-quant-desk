@@ -42,12 +42,6 @@ def main() -> None:
         default=3,
         help="Number of partitions to sink before stopping (default: 3)",
     )
-    parser.add_argument(
-        "--parallel",
-        type=int,
-        default=8,
-        help="Parallelism for RPC calls (default: 8)",
-    )
     args = parser.parse_args()
 
     cold_root = args.cold_root.resolve()
@@ -72,7 +66,6 @@ def main() -> None:
     print(f"  Cold root : {cold_root}")
     print(f"  Hot DB    : {hot_db}")
     print(f"  Target    : {args.partitions} sunk partitions")
-    print(f"  Parallel  : {args.parallel}")
     print()
 
     # We run the scraper with a modest parallelism and let it run until
@@ -91,8 +84,6 @@ def main() -> None:
     cmd = [
         sys.executable,
         str(Path(__file__).resolve().parents[3] / "main.py"),
-        "--parallel",
-        str(args.parallel),
     ]
 
     print("Running:", " ".join(cmd))

@@ -8,8 +8,12 @@ Pure-library modules used by the scraper. No CLI, no `.env` loading, no logging 
 |---|---|
 | `errors.py` | Exception types (`V3Error`, `DuplicateRowError`, `SchemaMismatchError`, `PartitionFrontierError`, `OperationCancelled`) |
 | `tables.py` | Schema as Python data — contracts, events, deployment blocks, column orderings, table-name conventions |
+| `rpc_client.py` | `RpcClient` — thread-safe JSON-RPC client with keep-alive connections and typed errors so the caller can tell a refused range from throttling from a permanent failure |
+| `event_decoders.py` | Decode an `eth_getLogs` response into `(contract, event, row)` triples |
+| `chunk_planner.py` | `ChunkPlanner` — sizes each request from measured events per block, and discovers the provider's result and block-span limits from refusals |
+| `epoch_optimizer.py` | `EpochOptimizer` — ramps concurrency and result budget to the provider's envelope, then hill-climbs blocks per second in fixed-parameter epochs |
 | `persistence.py` | `HotStore` — owns the hot DuckDB connection; atomic event ingestion; `loaded_block_ranges` maintenance; sink commit |
-| `parquet_sink.py` | `write_partition_files` — cold-tier-producer: opens its own read-only DuckDB connection, writes one partition's Parquet files, returns. The orchestrator follows up with `HotStore.commit_sink`. |
+| `parquet_sink.py` | `write_partition_files` — cold-tier-producer: opens its own read-only DuckDB connection, writes one partition's Parquet files, returns. `publish_manifest` then declares the partition sunk, and the orchestrator follows up with `HotStore.commit_sink`. |
 
 ## Integrity model
 

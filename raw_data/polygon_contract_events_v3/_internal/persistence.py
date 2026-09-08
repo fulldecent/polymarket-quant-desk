@@ -333,6 +333,7 @@ class ProgressCallback(Protocol):
         rows_total: int | None = None,
         elapsed_ms: float | None = None,
         message: str = "",
+        partition: int | None = None,
     ) -> None: ...
 
 

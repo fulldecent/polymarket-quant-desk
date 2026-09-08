@@ -74,7 +74,7 @@ def main() -> None:
 
     # Launch the scraper
     scraper = Path(__file__).resolve().parents[3] / "main.py"
-    cmd = [sys.executable, str(scraper), "--parallel", "8"]
+    cmd = [sys.executable, str(scraper)]
 
     print("Starting scraper...")
     print(f"Command: {' '.join(cmd)}")
