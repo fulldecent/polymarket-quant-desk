@@ -122,6 +122,7 @@ import threading
 import time
 
 import duckdb
+import pyarrow as pa
 
 from .errors import (
     DuplicateRowError,
@@ -156,6 +157,17 @@ from .tables import (
 # was observed once in the wild and the retry policy is the standard
 # defensive shape for any OCC database.
 _MVCC_MAX_ATTEMPTS = 5
+_INCOMING_VIEW = "_incoming_rows"
+"""Name the Arrow batch is registered under while a batch of rows is inserted."""
+
+_ARROW_TYPES: dict[str, object] = {
+    "UINTEGER": pa.uint32(),
+    "BLOB": pa.binary(),
+    "VARCHAR": pa.string(),
+}
+"""Declared column type to the Arrow type that matches it exactly. Building the batch with the
+table's own types means DuckDB never has to coerce, so a value that does not fit fails loudly
+instead of being silently widened."""
 _MVCC_RETRY_BASE_SLEEP_SEC = 0.010
 
 
@@ -406,6 +418,7 @@ class HotStore:
         self.progress_cb = progress_cb
         self._conn: duckdb.DuckDBPyConnection | None = None
         self._closed = False
+        self._column_types: dict[str, dict[str, str]] = {}
         self.sunk_frontier = SCRAPE_START_BLOCK - 1  # In-memory sunk frontier, populated at startup
 
         if not os.path.isfile(schema_path):
@@ -469,6 +482,18 @@ class HotStore:
         for tbl in expected_tables:
             if tbl not in actual:
                 raise SchemaMismatchError(f"missing table: {tbl}")
+
+        self._column_types = {tbl: dict(cols) for tbl, cols in actual.items()}
+
+    def _arrow_type(self, table: str, column: str):
+        """Arrow type matching the column's declared type in the hot DB."""
+        declared = self._column_types.get(table, {}).get(column)
+        arrow_type = _ARROW_TYPES.get(declared)
+        if arrow_type is None:
+            raise SchemaMismatchError(
+                f"{table}.{column} is declared {declared!r}, which has no exact Arrow equivalent"
+            )
+        return arrow_type
 
     def _get_conn(self) -> duckdb.DuckDBPyConnection:
         if self._closed or self._conn is None:
@@ -689,18 +714,31 @@ class HotStore:
                 for (contract, event), rows in rows_by_target.items():
                     if not rows:
                         continue
+                    if stop_event and stop_event.is_set():
+                        conn.execute("ROLLBACK")
+                        raise OperationCancelled("persist cancelled during insert")
                     tbl = table_name(contract, event)
                     cols = all_columns(contract, event)
                     col_list = ", ".join(cols)
-                    placeholders = ", ".join(["?"] * len(cols))
-                    sql = f"INSERT INTO {tbl} ({col_list}) VALUES ({placeholders})"
-                    for row in rows:
-                        if stop_event and stop_event.is_set():
-                            conn.execute("ROLLBACK")
-                            raise OperationCancelled("persist cancelled during insert")
-                        vals = [row[c] for c in cols]
-                        conn.execute(sql, vals)
-                        inserted += 1
+                    # One vectorised insert per target. Binding row by row was measured as the
+                    # ceiling on the whole scrape, an order of magnitude below this.
+                    batch = pa.table(
+                        {
+                            col: pa.array(
+                                [row[col] for row in rows], type=self._arrow_type(tbl, col)
+                            )
+                            for col in cols
+                        }
+                    )
+                    conn.register(_INCOMING_VIEW, batch)
+                    try:
+                        conn.execute(
+                            f"INSERT INTO {tbl} ({col_list}) "
+                            f"SELECT {col_list} FROM {_INCOMING_VIEW}"
+                        )
+                    finally:
+                        conn.unregister(_INCOMING_VIEW)
+                    inserted += len(rows)
 
                 # Record the range in loaded_block_ranges
                 conn.execute(
