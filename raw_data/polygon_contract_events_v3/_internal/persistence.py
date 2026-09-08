@@ -769,12 +769,22 @@ class HotStore:
         ).fetchall()
         if not rows:
             return
-        coalesced = _coalesce_ranges([(f, t, False) for f, t in rows])
-        conn.execute("DELETE FROM loaded_block_ranges")
-        for f, t, _ in coalesced:
+        current = {(int(f), int(t)) for f, t in rows}
+        coalesced = {
+            (f, t) for f, t, _ in _coalesce_ranges([(int(f), int(t), False) for f, t in rows])
+        }
+        # Only the rows that actually change are written. Deleting every row and re-inserting the
+        # same key still counts as a write, and collides with the row versions a sink worker's
+        # open read transaction is holding.
+        for from_block, to_block in sorted(current - coalesced):
+            conn.execute(
+                "DELETE FROM loaded_block_ranges WHERE from_block = ? AND to_block = ?",
+                (from_block, to_block),
+            )
+        for from_block, to_block in sorted(coalesced - current):
             conn.execute(
                 "INSERT INTO loaded_block_ranges (from_block, to_block) VALUES (?, ?)",
-                (f, t),
+                (from_block, to_block),
             )
 
     def _get_loaded_ranges_unsunk(
@@ -1080,23 +1090,27 @@ class HotStore:
                 progress_cb(op="reconcile", phase="update", message="no new partitions to mark")
             return 0
 
-        # Update in-memory frontier to the highest newly-sunk partition
-        if newly_sunk:
-            highest_partition = newly_sunk[-1]
-            new_frontier = highest_partition + PARTITION_SIZE_10K - 1
-            # Only advance if contiguous from current frontier
-            if self.sunk_frontier == SCRAPE_START_BLOCK - 1 or new_frontier == self.sunk_frontier + PARTITION_SIZE_10K:
-                self.sunk_frontier = new_frontier
+        # The frontier means "[SCRAPE_START_BLOCK, N] is entirely sunk", so it may only advance
+        # across partitions that are contiguous from where it already is. A partition found on
+        # disk above a gap says nothing about the gap, which still has to be scraped.
+        claimed = 0
+        expected = expected_next
+        for partition in newly_sunk:
+            if partition != expected:
+                break
+            self.sunk_frontier = partition + PARTITION_SIZE_10K - 1
+            expected = partition + PARTITION_SIZE_10K
+            claimed += 1
 
         if progress_cb:
             progress_cb(
                 op="reconcile",
                 phase="update",
-                rows_done=len(newly_sunk),
+                rows_done=claimed,
                 message=f"advanced sunk frontier to {self.sunk_frontier}",
             )
 
-        return len(newly_sunk)
+        return claimed
 
     def populate_sunk_frontier_from_manifests(self, cold_tier_root: str) -> None:
         """Populate in-memory sunk frontier by scanning manifest _SUCCESS files.

@@ -1,101 +1,89 @@
 """
-Test demonstrating a potential invariant violation in reconcile_with_cold_tier().
+Reconciling against the cold tier must never claim blocks that were not written.
 
-The documented postcondition for reconcile_with_cold_tier states:
-    "The invariants on loaded_block_ranges documented in schema.sql hold
-     (in particular, at most one row has sunk_to_parquet=TRUE and it covers
-     a prefix of loaded coverage starting at SCRAPE_START_BLOCK)."
-
-However, reconcile_with_cold_tier can be called with arbitrary Parquet files
-on disk. If the cold tier has files for partition P but NOT for partition P-10K,
-reconcile will:
-
-1. Find partition P on disk
-2. Delete any overlapping coverage (none in this case)
-3. Insert [P, P+9999] as sunk
-4. Coalesce — but since there's no sunk row starting at SCRAPE_START_BLOCK,
-   the coalesce logic only ensures the first merged range starts at or before
-   SCRAPE_START_BLOCK by extending it DOWNWARD if needed.
-
-Wait, looking at the code more carefully:
-
-```python
-if merged and merged[0][0] > SCRAPE_START_BLOCK:
-    merged[0] = (SCRAPE_START_BLOCK, merged[0][1])
-```
-
-This EXTENDS the first sunk range DOWN to SCRAPE_START_BLOCK, which would
-create a sunk range [SCRAPE_START_BLOCK, P+9999] even though blocks
-[SCRAPE_START_BLOCK, P-1] have no Parquet files on disk!
-
-This is a violation: reconcile marks blocks as "sunk" (meaning their Parquet
-files exist) when in fact they don't.
-
-This test demonstrates that reconcile_with_cold_tier can create a sunk range
-that claims coverage for blocks whose Parquet files are NOT on disk.
+The sunk frontier means "[SCRAPE_START_BLOCK, N] is entirely on the cold tier". Recovering it by
+looking at files on disk is only safe while those files are contiguous from where the frontier
+already sits: a partition sitting above a gap says nothing about the gap, and claiming it would
+silently drop the missing blocks from the work queue forever.
 """
 
-import tempfile
-import os
+import sys
 from pathlib import Path
 
 import pytest
 
-from raw_data.polygon_contract_events_v3._internal.persistence import HotStore, HotStoreConfig
-from raw_data.polygon_contract_events_v3._internal.tables import SCRAPE_START_BLOCK, PARTITION_SIZE_10K
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from _internal.persistence import HotStore, HotStoreConfig
+from _internal.tables import PARTITION_SIZE_10K, SCRAPE_START_BLOCK
+
+SCHEMA = str(Path(__file__).resolve().parents[2] / "schema.sql")
+FIRST = (SCRAPE_START_BLOCK // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
 
 
 @pytest.fixture
-def temp_db_and_schema():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        db_path = os.path.join(tmpdir, "test.db")
-        schema_path = Path(__file__).resolve().parents[2] / "schema.sql"
-        yield db_path, str(schema_path), tmpdir
+def store(tmp_path):
+    hot = HotStore(
+        str(tmp_path / "test.db"),
+        SCHEMA,
+        config=HotStoreConfig(duckdb_memory_limit="256MB", duckdb_temp_dir=str(tmp_path)),
+    )
+    yield hot
+    hot.close()
 
 
-def test_reconcile_creates_sunk_range_without_files_for_earlier_blocks(temp_db_and_schema):
-    """
-    Demonstrate that reconcile_with_cold_tier marks blocks as sunk even when
-    their Parquet files do not exist on disk.
+@pytest.fixture
+def cold_root(tmp_path):
+    root = tmp_path / "cold"
+    root.mkdir()
+    return root
 
-    Scenario:
-    - Cold tier has files only for partition P1 (second 10K partition)
-    - No files for partition P0 (first 10K partition)
-    - reconcile is called
-    - Result: [SCRAPE_START_BLOCK, P1+9999] is marked sunk
 
-    This violates the postcondition that sunk rows represent actual files on disk.
-    """
-    db_path, schema_path, tmpdir = temp_db_and_schema
-    store = HotStore(db_path, schema_path, config=HotStoreConfig(duckdb_memory_limit="256MB"))
+def write_partition(cold_root: Path, partition_start: int) -> None:
+    one_million = (partition_start // 1_000_000) * 1_000_000
+    directory = (
+        cold_root
+        / "ConditionalTokens"
+        / "condition_preparation"
+        / f"1M={one_million}"
+        / f"10K={partition_start}"
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "data.parquet").write_bytes(b"parquet")
 
-    try:
-        cold_root = os.path.join(tmpdir, "cold")
-        os.makedirs(cold_root)
 
-        # Create ONLY the second partition's directory structure with a data.parquet
-        p0 = (SCRAPE_START_BLOCK // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
-        p1 = p0 + PARTITION_SIZE_10K
+def test_a_partition_above_a_gap_is_not_claimed(store, cold_root):
+    """The earlier partition has no files, so it still has to be scraped."""
+    write_partition(cold_root, FIRST + PARTITION_SIZE_10K)
 
-        # Create the directory for p1 only
-        dst_dir = Path(cold_root) / "ConditionalTokens" / "condition_preparation" / "1M=33600000" / f"10K={p1}"
-        dst_dir.mkdir(parents=True, exist_ok=True)
-        (dst_dir / "data.parquet").write_bytes(b"fake parquet content for p1 only")
+    claimed = store.reconcile_with_cold_tier(str(cold_root))
 
-        # Call reconcile — only p1 should be marked sunk
-        newly_marked = store.reconcile_with_cold_tier(cold_root)
-        assert newly_marked == 1
+    assert claimed == 0
+    assert store.get_sunk_frontier() == SCRAPE_START_BLOCK - 1
 
-        # Verify: only p1 is marked sunk; p0's range is NOT claimed
-        sunk_rows = store.connection.execute(
-            "SELECT from_block, to_block FROM loaded_block_ranges WHERE sunk_to_parquet = TRUE ORDER BY from_block"
-        ).fetchall()
 
-        # After the fix, reconcile must NOT extend downward.
-        # The only sunk row should be exactly [p1, p1+9999].
-        assert len(sunk_rows) == 1, f"Expected exactly one sunk row, got {sunk_rows}"
-        assert sunk_rows[0] == (p1, p1 + PARTITION_SIZE_10K - 1), (
-            f"Expected sunk range for p1 only, got {sunk_rows[0]}"
-        )
-    finally:
-        store.close()
+def test_contiguous_partitions_are_claimed(store, cold_root):
+    write_partition(cold_root, FIRST)
+    write_partition(cold_root, FIRST + PARTITION_SIZE_10K)
+
+    claimed = store.reconcile_with_cold_tier(str(cold_root))
+
+    assert claimed == 2
+    assert store.get_sunk_frontier() == FIRST + 2 * PARTITION_SIZE_10K - 1
+
+
+def test_claiming_stops_at_the_first_gap(store, cold_root):
+    write_partition(cold_root, FIRST)
+    write_partition(cold_root, FIRST + 2 * PARTITION_SIZE_10K)  # a hole in between
+
+    claimed = store.reconcile_with_cold_tier(str(cold_root))
+
+    assert claimed == 1
+    assert store.get_sunk_frontier() == FIRST + PARTITION_SIZE_10K - 1
+
+
+def test_nothing_on_disk_leaves_the_frontier_alone(store, cold_root):
+    claimed = store.reconcile_with_cold_tier(str(cold_root))
+
+    assert claimed == 0
+    assert store.get_sunk_frontier() == SCRAPE_START_BLOCK - 1

@@ -323,6 +323,47 @@ def _cleanup_tmp_partition_dirs(cold_path: Path, partition_start: int) -> int:
     return removed
 
 
+def publish_manifest(cold_root: str, partition_start: int) -> bool:
+    """Declare one partition sunk by publishing its manifest ``_SUCCESS``.
+
+    A partition is sunk when, and only when, this marker exists: it is what every reader and
+    every derived dataset uses as the frontier. Call it as part of committing a partition, in
+    frontier order, before anything treats that partition as final.
+
+    Returns True if the partition is now declared sunk (published here, or already published on
+    an earlier run), False if its Parquet files are not all present yet.
+    """
+    cold_path = Path(cold_root)
+    if not cold_path.is_dir():
+        raise ValueError(f"cold_root does not exist or is not a directory: {cold_root}")
+
+    manifest_dir = _manifest_dir(cold_path, partition_start)
+    if manifest_dir.exists():
+        # Republishing would trip the immutability guard; a crash between publishing and
+        # committing must be able to resume.
+        _validate_manifest_partition_dir(manifest_dir)
+        return True
+
+    first_partition = (SCRAPE_START_BLOCK // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
+    previous = partition_start - PARTITION_SIZE_10K
+    if partition_start > first_partition and not (
+        _manifest_dir(cold_path, previous) / "_SUCCESS"
+    ).is_file():
+        raise V3Error(
+            f"refusing to declare 10K={partition_start} sunk while 10K={previous} has no "
+            "manifest: the frontier advances one partition at a time"
+        )
+
+    rel_path = partition_dir(partition_start)
+    for contract, event in _expected_targets_for_partition(partition_start):
+        if not _validate_or_prepare_partition_data_dir(cold_path / contract / event / rel_path):
+            return False
+
+    _publish_manifest_success_atomically(cold_path, partition_start)
+    _cleanup_tmp_partition_dirs(cold_path, partition_start)
+    return True
+
+
 def roll_forward_manifests_to_exhaustion(
     cold_root: str,
     *,
@@ -348,24 +389,7 @@ def roll_forward_manifests_to_exhaustion(
         if stop_event and stop_event.is_set():
             raise OperationCancelled("manifest roll-forward interrupted")
 
-        partition_end_val = partition_end(pstart)
-        rel_path = partition_dir(pstart)
-        expected_targets = _expected_targets_for_partition(pstart)
-
-        all_exist = True
-        for contract, event in expected_targets:
-            partition_data_dir = (
-                cold_path
-                / contract
-                / event
-                / rel_path
-            )
-            exists_and_valid = _validate_or_prepare_partition_data_dir(partition_data_dir)
-            if not exists_and_valid:
-                all_exist = False
-                break
-
-        if not all_exist:
+        if not publish_manifest(cold_root, pstart):
             if progress_cb:
                 progress_cb(
                     op="manifest",
@@ -375,8 +399,6 @@ def roll_forward_manifests_to_exhaustion(
                 )
             break
 
-        _publish_manifest_success_atomically(cold_path, pstart)
-        removed_tmp = _cleanup_tmp_partition_dirs(cold_path, pstart)
         written += 1
         if progress_cb:
             progress_cb(
@@ -384,9 +406,8 @@ def roll_forward_manifests_to_exhaustion(
                 phase="publish",
                 rows_done=written,
                 message=(
-                        f"published manifests/{rel_path} "
-                    f"for blocks [{pstart}, {partition_end_val}] "
-                    f"tmp_removed={removed_tmp}"
+                    f"published manifests/{partition_dir(pstart)} "
+                    f"for blocks [{pstart}, {partition_end(pstart)}]"
                 ),
             )
 

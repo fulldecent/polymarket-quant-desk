@@ -96,6 +96,7 @@ from _internal.parquet_sink import (
     PartitionWriteResult,
     cleanup_temp_dirs_after_frontier,
     get_sunk_frontier as get_manifest_frontier,
+    publish_manifest,
     read_manifest_frontier,
     remove_orphan_temp_files,
     roll_forward_manifests_to_exhaustion,
@@ -837,6 +838,13 @@ class _SinkOrchestrator:
                 return n_committed
             write_result = self._completed.pop(expected_next)
             try:
+                # The manifest is what makes a partition sunk, so it goes first and in frontier
+                # order. Only then may anything treat this partition as final.
+                if not publish_manifest(self._cold_root, expected_next):
+                    raise V3Error(
+                        f"partition {expected_next} is missing Parquet files for one or more "
+                        "targets, so it cannot be declared sunk"
+                    )
                 self._store.commit_sink(expected_next)
             except PartitionFrontierError as e:
                 # The library should not get here if we are computing ``expected_next`` correctly,
@@ -877,7 +885,6 @@ def _print_banner(
     *,
     db_path: str,
     cold_root: str,
-    manifest_frontier: int,
     sunk_frontier: int,
     loaded_frontier: int,
     chain_head: int,
@@ -902,13 +909,9 @@ def _print_banner(
         "",
     ]
     if sunk_frontier <= SCRAPE_START_BLOCK - 1:
-        banner_lines.append("sunk parquet to:      none")
+        banner_lines.append("sunk frontier:        none")
     else:
-        banner_lines.append(f"sunk parquet to:      {sunk_frontier:,}")
-    if manifest_frontier < 0:
-        banner_lines.append("manifest frontier:    none")
-    else:
-        banner_lines.append(f"manifest frontier:    {manifest_frontier:,}")
+        banner_lines.append(f"sunk frontier:        {sunk_frontier:,}")
     if loaded_frontier < 0:
         banner_lines.append("loaded hot frontier:  none")
     else:
@@ -946,7 +949,7 @@ def _print_banner(
 def _print_summary(
     *,
     store: HotStore | None,
-    manifest_frontier: int,
+    cold_root: str,
     chain_head: int,
     caught_up_confirmed: bool,
     blocks_done: int,
@@ -982,7 +985,8 @@ def _print_summary(
     loaded = None
     lag = chain_head - SCRAPE_START_BLOCK
     if store is not None:
-        sunk = store.get_sunk_frontier()
+        # Read it back from the manifests rather than trusting in-memory state.
+        sunk = get_manifest_frontier(cold_root)
         hot_db_blocks = sum(
             (to_b - from_b + 1)
             for from_b, to_b, _ in store.list_loaded_ranges(include_sunk=False)
@@ -990,14 +994,9 @@ def _print_summary(
         summary_lines.append("")
         summary_lines.append("progress")
         summary_lines.append(
-            f"  sunk parquet to:      {sunk:,}"
-            if sunk is not None and sunk > (SCRAPE_START_BLOCK - 1)
-            else "  sunk parquet to:      none"
-        )
-        summary_lines.append(
-            f"  manifest frontier:    {manifest_frontier:,}"
-            if manifest_frontier >= 0
-            else "  manifest frontier:    none"
+            f"  sunk frontier:        {sunk:,}"
+            if sunk > (SCRAPE_START_BLOCK - 1)
+            else "  sunk frontier:        none"
         )
         summary_lines.append(f"  hot database:         {hot_db_blocks:,} blocks")
         summary_lines.append(f"  chain head:           {chain_head:,}")
@@ -1356,7 +1355,6 @@ def main() -> None:
         _print_banner(
             db_path=env["db_path"],
             cold_root=env["cold_root"],
-            manifest_frontier=manifest_frontier,
             sunk_frontier=sunk_frontier,
             loaded_frontier=loaded_frontier,
             chain_head=chain_head,
@@ -1390,7 +1388,6 @@ def main() -> None:
             _print_banner(
                 db_path=env["db_path"],
                 cold_root=env["cold_root"],
-                manifest_frontier=manifest_frontier,
                 sunk_frontier=sunk_frontier,
                 loaded_frontier=loaded_frontier,
                 chain_head=chain_head,
@@ -1881,7 +1878,7 @@ def main() -> None:
                 elapsed = time.monotonic() - run_start
                 _print_summary(
                     store=store,
-                    manifest_frontier=manifest_frontier,
+                    cold_root=env["cold_root"],
                     chain_head=head_for_output,
                     caught_up_confirmed=caught_up_confirmed,
                     blocks_done=blocks_done,
