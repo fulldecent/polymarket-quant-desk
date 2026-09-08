@@ -302,18 +302,40 @@ def test_a_step_always_moves_at_least_one_whole_unit():
 # Adverse signals
 # ---------------------------------------------------------------------------
 
-def test_a_refused_range_ends_the_budget_ramp_and_spoils_the_epoch():
+def test_a_refused_range_ends_the_budget_ramp_without_discarding_the_epoch():
+    """Refusals are routine while the planner tracks density, and they change no tuned parameter.
+
+    A live run took 848 requests and 3 refusals; discarding every epoch containing one left the
+    search with nothing to score.
+    """
     opt, clock = make_optimizer()
     finish_ramp(opt)
-    run_epoch(opt, clock, blocks=100)
+    baseline = run_epoch(opt, clock, blocks=100)
+    assert baseline.reason == "baseline"
 
+    before = opt.params
     opt.start_epoch()
+    opt.record_blocks(400)
     opt.record_rejection()
+    during = opt.params
     clock.advance(20.0)
     report = opt.end_epoch()
 
-    assert not report.accepted
-    assert "refused" in report.reason
+    assert during == before, "a refusal must not move the parameters being measured"
+    assert "backed off" not in report.reason
+    assert report.score == pytest.approx(20.0), "the window still measured one parameter set"
+
+
+def test_a_refusal_still_stops_the_budget_ramp():
+    opt, _ = make_optimizer()
+    feed_ok(opt, 4)
+    assert opt.is_ramping
+
+    opt.record_rejection()
+    budget = opt.params.result_budget
+    opt.record_ok(blocks=100, logs=10**9, elapsed_sec=0.1)
+
+    assert opt.params.result_budget == budget, "the budget has met a wall and must stop growing"
 
 
 def test_timeout_eases_off_concurrency_and_response_size():

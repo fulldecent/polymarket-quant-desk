@@ -319,9 +319,12 @@ class EpochOptimizer:
 
         Which limit was hit, and what span to use next, is ``chunk_planner``'s business. All that
         matters here is that the budget has met a wall, so it stops ramping.
+
+        The epoch is not spoiled: none of the tuned parameters changed, so the window still
+        measured one parameter set. Refusals are routine while the planner tracks density, and
+        discarding every epoch containing one would leave the search nothing to score.
         """
         self._budget_ramping = False
-        self._spoil("range refused")
         self._maybe_begin_search()
 
     def record_timeout(self) -> None:
