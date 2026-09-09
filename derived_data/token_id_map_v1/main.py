@@ -53,6 +53,18 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from dotenv import load_dotenv
 from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    Progress,
+    ProgressColumn,
+    SpinnerColumn,
+    Task,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+from rich.text import Text
+from rich.theme import Theme
 
 _project_root = Path(__file__).resolve().parent.parent.parent
 load_dotenv(_project_root / ".env")
@@ -72,7 +84,7 @@ from lib.partition_utils import (  # noqa: E402
 )
 from lib.derived_frontier import scan_frontier_1M_10K_folders  # noqa: E402
 
-from lib.run_logging import make_progress, setup_logging  # noqa: E402
+from lib.run_logging import setup_logging  # noqa: E402
 from lib.atomic_publish import (  # noqa: E402
     create_temp_location,
     publish_atomically,
@@ -142,7 +154,43 @@ _OUTPUT_SCHEMA = pa.schema([
     pa.field("market_id",             pa.binary(), nullable=True),
 ])
 
-console = Console()
+# Status-line colors match raw_data/polygon_contract_events_v3/main.py: completed
+# work is green, remaining work is magenta (including elapsed vs remaining time).
+_COLOR_DONE = "green"
+_COLOR_TODO = "magenta"
+
+console = Console(
+    theme=Theme({"progress.elapsed": _COLOR_DONE, "progress.remaining": _COLOR_TODO})
+)
+
+
+class _DoneOfTotalColumn(ProgressColumn):
+    """``done/total``, each number coloured like the bar segment it stands for."""
+
+    def render(self, task: Task) -> Text:
+        total = int(task.total) if task.total is not None else 0
+        return Text.assemble(
+            (f"{int(task.completed):,}", _COLOR_DONE),
+            "/",
+            (f"{total:,}", _COLOR_TODO),
+        )
+
+
+def _make_total_progress() -> Progress:
+    """Sticky Total progress bar matching the raw scraper status line.
+
+    Counts 10K partitions rather than blocks.
+    """
+    return Progress(
+        SpinnerColumn(),
+        TextColumn("{task.description}"),
+        BarColumn(complete_style=_COLOR_DONE, finished_style=_COLOR_DONE, style=_COLOR_TODO),
+        _DoneOfTotalColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    )
+
 
 # Global stop event used by the SIGINT handler and long-running loops
 _stop_event = threading.Event()
@@ -507,18 +555,19 @@ def main() -> None:
     condition_to_market = _load_negrisk_market_lookup(con)
     log.info(f"loaded {len(condition_to_market)} NegRisk condition->market mappings")
 
+    already_landed = len(all_partitions) - len(todo)
     console.print(
         f"frontier={frontier}  |  total={len(all_partitions):,}  |  "
-        f"[green]{len(all_partitions) - len(todo):,} already landed[/green]  |  "
-        f"[yellow]{len(todo):,} to process[/yellow]"
+        f"[{_COLOR_DONE}]{already_landed:,} already landed[/{_COLOR_DONE}]  |  "
+        f"[{_COLOR_TODO}]{len(todo):,} to process[/{_COLOR_TODO}]"
     )
 
     if not todo:
-        console.print("[green]Nothing to do.[/green]")
+        console.print(f"[{_COLOR_DONE}]Nothing to do.[/{_COLOR_DONE}]")
         return
 
-    with make_progress(console) as progress:
-        task = progress.add_task("Materializing token_id_map_v1", total=len(todo))
+    with _make_total_progress() as progress:
+        task = progress.add_task("Total progress", total=len(todo))
 
         processed = 0
         for m_val, k_val in todo:
@@ -531,7 +580,7 @@ def main() -> None:
             progress.update(task, advance=1)
 
     log.info(f"token_id_map_v1 materializer finished. Processed {processed} partitions.")
-    console.print(f"[green]Complete! Processed {processed} partitions.[/green]")
+    console.print(f"[{_COLOR_DONE}]Complete! Processed {processed} partitions.[/{_COLOR_DONE}]")
 
 
 if __name__ == "__main__":
