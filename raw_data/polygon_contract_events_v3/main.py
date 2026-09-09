@@ -496,15 +496,16 @@ status_ui = RichRunStatus()
 _run_logger: JSONLRunLogger | None = None
 
 
-def _open_run_log() -> None:
+def _open_run_log() -> Path:
     """Create and open a timestamped .log file for this scraper run."""
     global _run_logger
     if _run_logger is not None:
-        return
+        return _run_logger._path
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
     log_dir = Path(__file__).resolve().parent / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     _run_logger = JSONLRunLogger(log_dir / f"main-{ts}.log")
+    return _run_logger._path
 
 
 def _log_event(event: str, message: str, **extra: Any) -> None:
@@ -880,6 +881,8 @@ def _print_banner(
     *,
     db_path: str,
     cold_root: str,
+    scratch_dir: str,
+    log_path: Path,
     sunk_frontier: int,
     loaded_frontier: int,
     chain_head: int,
@@ -899,8 +902,10 @@ def _print_banner(
     now = datetime.now(timezone.utc).isoformat()
     banner_lines = [
         f"# main — start at {now}",
-        f"hot db:               {db_path} ({_file_size_str(db_path)})",
-        f"cold root:            {cold_root}",
+        f"hot database:         {db_path} ({_file_size_str(db_path)})",
+        f"raw:                  {cold_root}",
+        f"scratch:              {scratch_dir}",
+        f"log:                  {log_path}",
         "",
     ]
     if sunk_frontier <= SCRAPE_START_BLOCK - 1:
@@ -931,9 +936,11 @@ def _print_banner(
 
     # Only the paths go on screen; the frontier/gap detail belongs in the run log.
     console.print(
-        f"hot db:               {db_path} ({_file_size_str(db_path)})", highlight=False
+        f"hot database:         {db_path} ({_file_size_str(db_path)})", highlight=False
     )
-    console.print(f"cold root:            {cold_root}", highlight=False)
+    console.print(f"raw:                  {cold_root}", highlight=False)
+    console.print(f"scratch:              {scratch_dir}", highlight=False)
+    console.print(f"log:                  {log_path}", highlight=False)
     for line in banner_lines:
         _log_event("banner", line)
 
@@ -967,11 +974,11 @@ def _print_summary(
     elif caught_up_confirmed:
         summary_lines.append("")
         summary_lines.append("status")
-        summary_lines.append("  CAUGHT UP - no new blocks to scrape")
+        summary_lines.append("  caught up")
     elif blocks_done == 0:
         summary_lines.append("")
         summary_lines.append("status")
-        summary_lines.append("  NO PROGRESS - run ended without confirmed caught-up state")
+        summary_lines.append("  no progress - run ended without confirmed caught-up state")
     else:
         summary_lines.append("")
         summary_lines.append("status")
@@ -1066,7 +1073,7 @@ def main() -> None:
     run_start = time.monotonic()
 
     # Open the persistent run log as early as possible
-    _open_run_log()
+    log_path = _open_run_log()
     status_ui.start()
     status_ui.spinner("head", "Querying chain head")
     status_ui.spinner("startup", "Opening hot database")
@@ -1287,6 +1294,8 @@ def main() -> None:
         _print_banner(
             db_path=env["db_path"],
             cold_root=env["cold_root"],
+            scratch_dir=env["scratch_dir"],
+            log_path=log_path,
             sunk_frontier=sunk_frontier,
             loaded_frontier=loaded_frontier,
             chain_head=chain_head,
@@ -1305,6 +1314,8 @@ def main() -> None:
             _print_banner(
                 db_path=env["db_path"],
                 cold_root=env["cold_root"],
+                scratch_dir=env["scratch_dir"],
+                log_path=log_path,
                 sunk_frontier=sunk_frontier,
                 loaded_frontier=loaded_frontier,
                 chain_head=chain_head,
@@ -1321,7 +1332,7 @@ def main() -> None:
             )
             _print_message("")
             _print_message("=" * 70)
-            _print_message("ALREADY CAUGHT UP")
+            _print_message("already caught up")
             _print_message("=" * 70)
             _print_message(f"  sunk frontier:    {sunk_frontier:,}")
             _print_message(f"  loaded frontier:  {loaded_frontier:,}")
