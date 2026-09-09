@@ -280,12 +280,13 @@ class HotStoreConfig:
             internal parallelism inside one query. Default is 4.
         duckdb_temp_dir:
             Value passed to DuckDB's ``SET temp_directory``. Must point at
-            a path with at least several GB free for spill files.
+            a path with at least several GB free for spill files. Required:
+            there is no sensible default, since it depends on the deployment.
     """
 
+    duckdb_temp_dir: str
     duckdb_memory_limit: str = "8GB"
     duckdb_threads: int = 4
-    duckdb_temp_dir: str = "/Volumes/polymarket-quant-desk/tmp"
 
 
 @dataclass(frozen=True)
@@ -378,7 +379,7 @@ class HotStore:
         db_path: str,
         schema_path: str,
         *,
-        config: HotStoreConfig | None = None,
+        config: HotStoreConfig,
         progress_cb: ProgressCallback | None = None,
     ) -> None:
         """Open or create the hot DuckDB database at ``db_path``.
@@ -397,7 +398,8 @@ class HotStore:
             db_path: Absolute path to the hot ``.db`` file. The parent
                 directory must exist.
             schema_path: Absolute path to ``schema.sql``. Must be readable.
-            config: Optional ``HotStoreConfig``; defaults are used otherwise.
+            config: ``HotStoreConfig``; its ``duckdb_temp_dir`` says where DuckDB
+                may spill, which depends on the deployment and has no default.
             progress_cb: Optional ``ProgressCallback`` for visibility into
                 operations that take more than ~1 second.
 
@@ -415,7 +417,7 @@ class HotStore:
         """
         self.db_path = db_path
         self.schema_path = schema_path
-        self.config = config or HotStoreConfig()
+        self.config = config
         self.progress_cb = progress_cb
         self._conn: duckdb.DuckDBPyConnection | None = None
         self._closed = False

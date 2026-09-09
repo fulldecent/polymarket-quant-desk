@@ -31,10 +31,16 @@ def main() -> None:
         help="Path to the (seeded) cold tier root",
     )
     parser.add_argument(
-        "--hot-db",
+        "--hot-dir",
         type=Path,
         required=True,
-        help="Path to the hot DuckDB file to use (will be deleted if exists)",
+        help="Directory holding the hot DuckDB file (the file is deleted if it exists)",
+    )
+    parser.add_argument(
+        "--scratch-dir",
+        type=Path,
+        required=True,
+        help="Directory DuckDB may spill to",
     )
     parser.add_argument(
         "--partitions",
@@ -45,27 +51,34 @@ def main() -> None:
     args = parser.parse_args()
 
     cold_root = args.cold_root.resolve()
-    hot_db = args.hot_db.resolve()
+    hot_dir = args.hot_dir.resolve()
+    scratch_dir = args.scratch_dir.resolve()
 
     if not cold_root.is_dir():
         parser.error(f"cold-root does not exist: {cold_root}")
 
+    hot_dir.mkdir(parents=True, exist_ok=True)
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+
     # Fresh hot DB
+    hot_db = hot_dir / "polygon_contract_events_v3.db"
     if hot_db.exists():
         print(f"Removing existing hot DB: {hot_db}")
         hot_db.unlink()
 
     # Set required environment variables
     env = os.environ.copy()
-    env["POLYGON_CONTRACT_EVENTS_V3_HOT_DB"] = str(hot_db)
+    env["HOT_DIR"] = str(hot_dir)
+    env["SCRATCH_DIR"] = str(scratch_dir)
     env["POLYGON_CONTRACT_EVENTS_V3_DIR"] = str(cold_root)
     # Use the same RPC URL as the main environment
     # (main.py loads .env itself)
 
     print(f"Starting reproducibility scrape")
-    print(f"  Cold root : {cold_root}")
-    print(f"  Hot DB    : {hot_db}")
-    print(f"  Target    : {args.partitions} sunk partitions")
+    print(f"  Cold root   : {cold_root}")
+    print(f"  Hot dir     : {hot_dir}")
+    print(f"  Scratch dir : {scratch_dir}")
+    print(f"  Target      : {args.partitions} sunk partitions")
     print()
 
     # We run the scraper with a modest parallelism and let it run until
@@ -88,7 +101,8 @@ def main() -> None:
 
     print("Running:", " ".join(cmd))
     print("Environment overrides:")
-    print(f"  POLYGON_CONTRACT_EVENTS_V3_HOT_DB={hot_db}")
+    print(f"  HOT_DIR={hot_dir}")
+    print(f"  SCRATCH_DIR={scratch_dir}")
     print(f"  POLYGON_CONTRACT_EVENTS_V3_DIR={cold_root}")
     print()
 

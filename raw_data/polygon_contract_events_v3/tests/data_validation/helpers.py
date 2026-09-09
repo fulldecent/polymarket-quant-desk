@@ -21,7 +21,10 @@ RAW = os.environ.get("POLYGON_CONTRACT_EVENTS_V3_DIR", "")
 if not RAW:
     sys.exit("POLYGON_CONTRACT_EVENTS_V3_DIR not set in .env")
 
-TEMP_DIR = "/Volumes/polymarket-quant-desk/tmp"
+SCRATCH_DIR = os.environ.get("SCRATCH_DIR", "")
+if not SCRATCH_DIR:
+    sys.exit("SCRATCH_DIR not set in .env")
+
 _10K_DIRS_PER_1M = 100
 
 # SQL expression for the 32-byte zero blob representing USDC (collateral).

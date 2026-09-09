@@ -21,6 +21,12 @@ import time
 from pathlib import Path
 from typing import Set
 
+from dotenv import load_dotenv
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[5]))
+
+from lib.env import require_env
+
 
 def find_sunk_partitions(cold_root: Path) -> Set[int]:
     """Return the set of 10K partition start blocks that have at least one data.parquet."""
@@ -36,10 +42,11 @@ def find_sunk_partitions(cold_root: Path) -> Set[int]:
 
 
 def main() -> None:
-    # Paths (on the data volume for performance)
-    seeded_cold = Path("/Volumes/polymarket-quant-desk/tmp/repro_cold_v3")
-    fresh_hot = Path("/Volumes/polymarket-quant-desk/tmp/repro_hot.db")
-    live_cold = Path("/Volumes/polymarket-quant-desk/raw_data/cold/polygon_contract_events_v3")
+    load_dotenv()
+    scratch_dir = Path(require_env("SCRATCH_DIR"))
+    seeded_cold = scratch_dir / "repro_cold_v3"
+    fresh_hot_dir = scratch_dir / "repro_hot"
+    live_cold = Path(require_env("POLYGON_CONTRACT_EVENTS_V3_DIR"))
 
     if not seeded_cold.is_dir():
         print(f"ERROR: Seeded cold tier not found at {seeded_cold}")
@@ -47,13 +54,16 @@ def main() -> None:
         sys.exit(1)
 
     # Fresh hot DB
+    fresh_hot_dir.mkdir(parents=True, exist_ok=True)
+    fresh_hot = fresh_hot_dir / "polygon_contract_events_v3.db"
     if fresh_hot.exists():
         print(f"Removing stale hot DB: {fresh_hot}")
         fresh_hot.unlink()
 
     # Environment for the scraper
     env = os.environ.copy()
-    env["POLYGON_CONTRACT_EVENTS_V3_HOT_DB"] = str(fresh_hot)
+    env["HOT_DIR"] = str(fresh_hot_dir)
+    env["SCRATCH_DIR"] = str(scratch_dir)
     env["POLYGON_CONTRACT_EVENTS_V3_DIR"] = str(seeded_cold)
     # Keep the same RPC URL from the main .env
 

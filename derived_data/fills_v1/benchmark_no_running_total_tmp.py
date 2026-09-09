@@ -2,7 +2,7 @@
 """Temporary benchmark harness for fills_v1 running-total cost.
 
 This script benchmarks two SQL variants on the same recent partitions and writes
-results to temporary parquet outputs under TEMP_DIR:
+results to temporary parquet outputs under SCRATCH_DIR:
 
 - baseline: current production SQL with net_yes_position_after running window
 - no_running_total: same pipeline without net_yes_position_after
@@ -53,7 +53,7 @@ _global_con: duckdb.DuckDBPyConnection | None = None
 RAW = require_env("POLYGON_CONTRACT_EVENTS_V3_DIR")
 TOKEN_MAP = require_env("TOKEN_ID_MAP_V1_DIR")
 FILLS_OUT = require_env("FILLS_V1_DIR")
-TEMP_DIR = require_env("TEMP_DIR")
+SCRATCH_DIR = require_env("SCRATCH_DIR")
 
 
 def _build_partition_sql_no_running(k_val: int, leg_paths: list[tuple[dict, str]]) -> str:
@@ -341,14 +341,14 @@ def main() -> None:
         log.info("No partitions selected; exiting")
         return
 
-    out_base = Path(TEMP_DIR) / "fills_v1_benchmark_no_running_total_tmp"
+    out_base = Path(SCRATCH_DIR) / "fills_v1_benchmark_no_running_total_tmp"
     out_base.mkdir(parents=True, exist_ok=True)
     log.info("benchmark output root: %s", out_base)
 
     # Baseline run: includes balances carry state and production SQL shape.
     con_base = duckdb.connect()
     _global_con = con_base
-    con_base.execute(f"SET temp_directory = '{TEMP_DIR}'")
+    con_base.execute(f"SET temp_directory = '{SCRATCH_DIR}'")
     con_base.execute("SET preserve_insertion_order = false")
     _load_token_map(con_base, log)
     frontier = get_sunk_frontier(RAW)
@@ -366,7 +366,7 @@ def main() -> None:
     # No-running-total run: no balances sidecar needed.
     con_nr = duckdb.connect()
     _global_con = con_nr
-    con_nr.execute(f"SET temp_directory = '{TEMP_DIR}'")
+    con_nr.execute(f"SET temp_directory = '{SCRATCH_DIR}'")
     con_nr.execute("SET preserve_insertion_order = false")
     _load_token_map(con_nr, log)
     _load_condition_resolution(con_nr, log, frontier)

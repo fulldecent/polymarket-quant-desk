@@ -59,7 +59,7 @@ REQUIRED ENV VARS
     POLYGON_CONTRACT_EVENTS_V3_DIR   root of raw {contract}/{event}/... parquet
     TOKEN_ID_MAP_V1_DIR              token_id -> (condition_id, index_set, market_id)
     FILLS_V1_DIR                     output directory
-    TEMP_DIR                         DuckDB spill directory
+    SCRATCH_DIR                      DuckDB spill directory; safe to wipe between runs
 
 USAGE
 -----
@@ -159,7 +159,7 @@ _global_con: duckdb.DuckDBPyConnection | None = None
 RAW       = require_env("POLYGON_CONTRACT_EVENTS_V3_DIR")
 TOKEN_MAP = require_env("TOKEN_ID_MAP_V1_DIR")
 OUT_DIR   = require_env("FILLS_V1_DIR")
-TEMP_DIR  = require_env("TEMP_DIR")
+SCRATCH_DIR = require_env("SCRATCH_DIR")
 
 BALANCES_SUBDIR = "_balances"
 
@@ -1333,7 +1333,7 @@ def main() -> None:
 
     con = duckdb.connect()
     _global_con = con
-    con.execute(f"SET temp_directory = '{TEMP_DIR}'")
+    con.execute(f"SET temp_directory = '{SCRATCH_DIR}'")
     con.execute("SET preserve_insertion_order = false")
 
     # Build unified token cache: one-time startup operation.

@@ -9,7 +9,7 @@ import pytest
 # Ensure the assertions directory is on sys.path so helpers.py can be imported
 sys.path.insert(0, os.path.dirname(__file__))
 
-from helpers import TEMP_DIR, complete_1m_ranges_for_paths, set_progress_callback
+from helpers import SCRATCH_DIR, complete_1m_ranges_for_paths, set_progress_callback
 
 
 _TOTAL_TESTS = 0
@@ -75,9 +75,9 @@ def con():
     Installs a SIGINT handler that calls con.interrupt() so Ctrl-C aborts
     long-running DuckDB queries immediately instead of being ignored.
     """
-    os.makedirs(TEMP_DIR, exist_ok=True)
+    os.makedirs(SCRATCH_DIR, exist_ok=True)
     c = duckdb.connect()
-    c.execute(f"SET temp_directory = '{TEMP_DIR}'")
+    c.execute(f"SET temp_directory = '{SCRATCH_DIR}'")
     c.execute("SET memory_limit = '4GB'")
     c.execute("SET threads = 4")
 

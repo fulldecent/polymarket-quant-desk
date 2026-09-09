@@ -32,8 +32,8 @@ a non-reproducibility bug.
 Usage
 -----
     python raw_data/polygon_contract_events_v3/tests/unit_tests/repro/repro_harness.py \
-        --source-cold /Volumes/polymarket-quant-desk/raw_data/cold/polygon_contract_events_v3 \
-        --dest-cold /tmp/repro_cold_v3 \
+        --source-cold "$POLYGON_CONTRACT_EVENTS_V3_DIR" \
+        --dest-cold "$SCRATCH_DIR/repro_cold_v3" \
         --target-size-gb 10
 
 The script prints the exact block number it stopped at and the total
@@ -190,7 +190,7 @@ def main() -> None:
     print(f"Last partition start block: {last_p}")
     print(
         "\nNext steps:\n"
-        f"  1. Create a fresh hot DB (e.g. /tmp/repro_hot.db)\n"
+        f"  1. Point HOT_DIR at an empty directory so a fresh hot DB is created\n"
         f"  2. Run the scraper with POLYGON_CONTRACT_EVENTS_V3_DIR={dest}\n"
         f"     and stop after 3 sunk partitions (use --max-calls or manual stop).\n"
         f"  3. Compare the newly written partitions under {dest} against the\n"

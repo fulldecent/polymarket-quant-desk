@@ -31,9 +31,9 @@ def _fills_dir() -> Path:
 
 def _connect() -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
-    temp_dir = os.environ.get("TEMP_DIR", "")
-    if temp_dir:
-        con.execute(f"SET temp_directory = '{temp_dir}'")
+    scratch_dir = os.environ.get("SCRATCH_DIR", "")
+    if scratch_dir:
+        con.execute(f"SET temp_directory = '{scratch_dir}'")
     con.execute("SET preserve_insertion_order = false")
     return con
 

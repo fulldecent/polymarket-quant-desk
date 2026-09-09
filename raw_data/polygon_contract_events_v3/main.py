@@ -50,10 +50,11 @@ magnitude along the chain and every provider enforces different limits, so the s
 one request of one block and measures its way up, discovering the provider's limits from refusals.
 
 ENVIRONMENT (all required, set in .env)
-    POLYGON_CONTRACT_EVENTS_V3_HOT_DB    hot DuckDB ``.db`` file
+    HOT_DIR                              regenerable working state; this program keeps
+                                         ``polygon_contract_events_v3.db`` there
+    SCRATCH_DIR                          DuckDB spill; safe to wipe between runs
     POLYGON_CONTRACT_EVENTS_V3_DIR       cold-tier root directory
     POLYGON_RPC_URL                      Polygon JSON-RPC endpoint
-    TEMP_DIR                             DuckDB spill directory
 """
 
 from __future__ import annotations
@@ -196,10 +197,10 @@ def _load_environment() -> dict[str, str]:
     load_dotenv(project_root / ".env")
 
     required = [
-        "POLYGON_CONTRACT_EVENTS_V3_HOT_DB",
+        "HOT_DIR",
+        "SCRATCH_DIR",
         "POLYGON_CONTRACT_EVENTS_V3_DIR",
         "POLYGON_RPC_URL",
-        "TEMP_DIR",
     ]
     missing = [k for k in required if not os.environ.get(k)]
     if missing:
@@ -209,15 +210,16 @@ def _load_environment() -> dict[str, str]:
             + "\nSet them in the repo-root .env file."
         )
 
-    db_path = os.environ["POLYGON_CONTRACT_EVENTS_V3_HOT_DB"]
-    db_parent = os.path.dirname(os.path.abspath(db_path))
-    if not os.path.isdir(db_parent):
+    hot_dir = os.environ["HOT_DIR"]
+    if not os.path.isdir(hot_dir):
         sys.exit(
-            f"POLYGON_CONTRACT_EVENTS_V3_HOT_DB parent directory does not exist: {db_parent}\n"
-            f"Create it (e.g. mkdir -p {db_parent}) before running."
+            f"HOT_DIR does not exist: {hot_dir}\n"
+            f"Create it (e.g. mkdir -p {hot_dir}) before running."
         )
-    if not os.access(db_parent, os.W_OK):
-        sys.exit(f"POLYGON_CONTRACT_EVENTS_V3_HOT_DB parent is not writable: {db_parent}")
+    if not os.access(hot_dir, os.W_OK):
+        sys.exit(f"HOT_DIR is not writable: {hot_dir}")
+    # Named after the dataset it serves, so several tools can share one hot directory.
+    db_path = os.path.join(hot_dir, "polygon_contract_events_v3.db")
 
     cold_root = os.environ["POLYGON_CONTRACT_EVENTS_V3_DIR"]
     if not os.path.isdir(cold_root):
@@ -228,17 +230,19 @@ def _load_environment() -> dict[str, str]:
     if not os.access(cold_root, os.W_OK):
         sys.exit(f"POLYGON_CONTRACT_EVENTS_V3_DIR is not writable: {cold_root}")
 
-    temp_dir = os.environ["TEMP_DIR"]
-    if not os.path.isdir(temp_dir):
+    scratch_dir = os.environ["SCRATCH_DIR"]
+    if not os.path.isdir(scratch_dir):
         sys.exit(
-            f"TEMP_DIR does not exist: {temp_dir}\nCreate it before running."
+            f"SCRATCH_DIR does not exist: {scratch_dir}\nCreate it before running."
         )
+    if not os.access(scratch_dir, os.W_OK):
+        sys.exit(f"SCRATCH_DIR is not writable: {scratch_dir}")
 
     return {
         "db_path": db_path,
         "cold_root": cold_root,
         "rpc_url": os.environ["POLYGON_RPC_URL"],
-        "temp_dir": temp_dir,
+        "scratch_dir": scratch_dir,
     }
 
 
@@ -1118,7 +1122,7 @@ def main() -> None:
             store = HotStore(
                 env["db_path"],
                 _SCHEMA_SQL,
-                config=HotStoreConfig(duckdb_temp_dir=env["temp_dir"]),
+                config=HotStoreConfig(duckdb_temp_dir=env["scratch_dir"]),
             )
         except SchemaMismatchError as e:
             sys.exit(

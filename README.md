@@ -29,6 +29,17 @@ I use the Samsung T9 and it works great ([Amazon link (affiliate)](https://amzn.
    # Study and edit your .env file, estimated setup time: 30+ minutes
    ```
 
+3. Create the directories you configured:
+
+   ```sh
+   source .env
+   mkdir -p "$HOT_DIR" "$SCRATCH_DIR"
+   ```
+
+   Every program reads `HOT_DIR` for its working database and `SCRATCH_DIR` for query spill, and
+   names its own files inside them. Both must be on local block storage. Dataset directories are
+   created by the producer that owns them.
+
 ## Scrape and derive data
 
 Repeat this process periodically to get new data as it is available from the market. This will allow you to run your backtesting analysis against recent data.
