@@ -53,13 +53,15 @@ Spec-compliant `metadata.json` provenance next to each `data.parquet` (see [Meta
 
 ### run_logging.py
 
-Operator-facing console and log contract for partition-producing derived jobs. Screen is the cockpit (paths, work plan, sticky Total progress bar, occasional heartbeat, honest end summary). The UTC log file is the full record; every screen line is also in the file. Per-partition chatter stays file-only. (The raw scraper uses a separate status-line renderer and does not use this module.)
+Operator-facing console and log contract for partition-producing derived jobs. Screen is the cockpit: paths, work plan, a two-row sticky footer (current partition with DuckDB % + Total progress), occasional heartbeat, honest end summary. The UTC log file is the full record; every screen line is also in the file. Per-partition chatter stays file-only. (The raw scraper uses a separate status-line renderer and does not use this module.)
 
 | name | description |
 |---|---|
-| `RunOutput(logger_name, script_file)` | themed console + per-run `logs/main-{ts}.log`; `print` writes both, `log_only` writes the file |
-| `make_total_progress(console)` | Total progress bar (green done / magenta remaining, comma `done/total`, elapsed, ETA) |
-| `PartitionHeartbeat(out)` | periodic `-> partitions: N  rows: M  T.Ts` line above the bar |
+| `RunOutput(logger_name, script_file)` | themed console + per-run log + `status` footer; `print` writes screen and file, `log_only` writes the file |
+| `RunStatus` | two-row Live footer: current partition/phase (percent + elapsed) above Total progress |
+| `PhaseWork(status, prefix)` | names a footer phase (`10K=N  building`) and runs SQL with DuckDB `query_progress` |
+| `configure_duckdb_progress(con)` | enable DuckDB progress tracking without stderr bars |
+| `PartitionHeartbeat(out, row_noun=...)` | periodic `-> partitions: N  <noun>: M  T.Ts` line above the footer |
 | `print_paths` / `print_work_plan` / `print_run_summary` | startup paths, one work-plan line, end-of-run summary |
 | `setup_logging(logger_name, script_file, console=None)` | file-only UTC logger; `console` is ignored. Prefer `RunOutput` in producers |
 

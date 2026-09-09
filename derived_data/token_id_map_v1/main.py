@@ -73,10 +73,13 @@ from lib.derived_frontier import scan_frontier_1M_10K_folders  # noqa: E402
 
 from lib.run_logging import (  # noqa: E402
     PartitionHeartbeat,
+    PhaseWork,
     RunOutput,
+    configure_duckdb_progress,
     print_paths,
     print_run_summary,
     print_work_plan,
+    run_sql,
 )
 from lib.atomic_publish import (  # noqa: E402
     create_temp_location,
@@ -199,7 +202,10 @@ def _write_metadata(
 # token ID computation and market_id resolution
 # ============================================================================
 
-def _load_negrisk_market_lookup(con: duckdb.DuckDBPyConnection) -> dict[bytes, bytes]:
+def _load_negrisk_market_lookup(
+    con: duckdb.DuckDBPyConnection,
+    work: PhaseWork | None = None,
+) -> dict[bytes, bytes]:
     """Return condition_id -> market_id for every NegRisk condition.
 
     A condition is NegRisk iff its ConditionalTokens condition_preparation row was
@@ -211,11 +217,11 @@ def _load_negrisk_market_lookup(con: duckdb.DuckDBPyConnection) -> dict[bytes, b
     Non-NegRisk conditions are absent from the result and map to NULL market_id.
     """
     glob = f"{RAW}/ConditionalTokens/condition_preparation/**/data.parquet"
-    rows = con.execute(f"""
+    rows = run_sql(con, f"""
         SELECT condition_id, question_id
         FROM read_parquet('{glob}')
         WHERE oracle = ?
-    """, [NEG_RISK_ADAPTER]).fetchall()
+    """, [NEG_RISK_ADAPTER], work=work).fetchall()
     lookup: dict[bytes, bytes] = {}
     for condition_id, question_id in rows:
         q = bytes(question_id)
@@ -256,7 +262,9 @@ def _partition_input_hashes(k_val: int) -> dict[str, str]:
 
 
 def _discover_partition_tuples(
-    con: duckdb.DuckDBPyConnection, k_val: int
+    con: duckdb.DuckDBPyConnection,
+    k_val: int,
+    work: PhaseWork | None = None,
 ) -> list[tuple[bytes, bytes, bytes, int]]:
     """Discover the token grain tuples introduced by trades in this 10K partition.
 
@@ -273,7 +281,7 @@ def _discover_partition_tuples(
     if not match_paths or not ct_paths:
         return []
 
-    rows = con.execute(f"""
+    rows = run_sql(con, f"""
         WITH match_txs AS (
             SELECT DISTINCT transaction_hash
             FROM read_parquet({_parquet_list_literal(match_paths)})
@@ -290,7 +298,7 @@ def _discover_partition_tuples(
         SELECT DISTINCT collateral_token, parent_collection_id, condition_id, index_set
         FROM ct_ops
         WHERE index_set > 0
-    """).fetchall()
+    """, work=work).fetchall()
     return [(bytes(r[0]), bytes(r[1]), bytes(r[2]), int(r[3])) for r in rows]
 
 
@@ -315,6 +323,7 @@ def process_chunk(
     *,
     condition_to_market: dict[bytes, bytes],
     log: logging.Logger,
+    work: PhaseWork | None = None,
 ) -> tuple[int, dict[str, str]]:
     """Process one 10K partition: discover new tuples, compute token_ids, write atomically.
 
@@ -333,7 +342,9 @@ def process_chunk(
 
     # Discover candidate grain tuples from this partition's trade-linked CT ops,
     # then keep only those not already materialized in an earlier partition.
-    candidates = _discover_partition_tuples(con, k_val)
+    if work is not None:
+        work.phase("discovering")
+    candidates = _discover_partition_tuples(con, k_val, work=work)
     new_grain: list[tuple[bytes, bytes, bytes, int]] = []
     if candidates:
         con.register("candidates", pa.table({
@@ -342,7 +353,7 @@ def process_chunk(
             "condition_id": pa.array([c[2] for c in candidates], type=pa.binary()),
             "index_set": pa.array([c[3] for c in candidates], type=pa.uint32()),
         }))
-        new_rows = con.execute("""
+        new_rows = run_sql(con, """
             SELECT
                 c.collateral_token,
                 c.parent_collection_id,
@@ -355,12 +366,14 @@ def process_chunk(
              AND c.condition_id = s.condition_id
              AND c.index_set = s.index_set
             WHERE s.condition_id IS NULL
-        """).fetchall()
+        """, work=work).fetchall()
         con.unregister("candidates")
         new_grain = [(bytes(r[0]), bytes(r[1]), bytes(r[2]), int(r[3])) for r in new_rows]
 
     # Derive the token_id for each new tuple (cached EC math in ct_helpers) and
     # attach market_id (NULL for non-NegRisk conditions).
+    if work is not None:
+        work.phase("computing")
     out_rows = [
         (
             get_position_id(
@@ -386,19 +399,23 @@ def process_chunk(
         final_name=chunk_name,
         temp_suffix=".tmp",
     )
+    if work is not None:
+        work.phase("hashing")
     input_hashes = _partition_input_hashes(k_val)
     try:
+        if work is not None:
+            work.phase("writing")
         pq.write_table(new_table, temp_loc.path / "data.parquet", compression="zstd")
         _write_metadata(con, temp_loc.path, m_val, k_val, input_hashes, log)
         publish_atomically(temp_loc)
         # Record newly materialized tuples so later partitions suppress duplicates.
         if row_count:
             con.register("new_rows", new_table)
-            con.execute("""
+            run_sql(con, """
                 INSERT INTO seen_tuples
                 SELECT collateral_token, parent_collection_id, condition_id, index_set
                 FROM new_rows
-            """)
+            """, work=work)
             con.unregister("new_rows")
         log.info(f"10K={k_val}: wrote {row_count:,} token mappings")
         return row_count, input_hashes
@@ -411,7 +428,7 @@ def process_chunk(
 # main
 # ============================================================================
 
-def _load_seen_tuples(con: duckdb.DuckDBPyConnection) -> int:
+def _load_seen_tuples(con: duckdb.DuckDBPyConnection, work: PhaseWork | None = None) -> int:
     """Load all previously materialized token_id_map_v1 partitions into a temp table.
 
     Called once at startup. Subsequent partitions suppress duplicates against this
@@ -420,20 +437,20 @@ def _load_seen_tuples(con: duckdb.DuckDBPyConnection) -> int:
     Returns the number of rows in the first-seen table (0 on a first run).
     """
     glob = f"{OUT_DIR}/**/*.parquet"
-    con.execute("""
+    run_sql(con, """
         CREATE OR REPLACE TEMP TABLE seen_tuples (
             collateral_token BLOB,
             parent_collection_id BLOB,
             condition_id BLOB,
             index_set UINTEGER
         )
-    """)
+    """, work=work)
     try:
-        con.execute(f"""
+        run_sql(con, f"""
             INSERT INTO seen_tuples
             SELECT DISTINCT collateral_token, parent_collection_id, condition_id, index_set
             FROM read_parquet('{glob}')
-        """)
+        """, work=work)
     except duckdb.IOException:
         # No output files exist yet (first run) — leave the table empty.
         pass
@@ -543,38 +560,49 @@ def main() -> None:
     con = duckdb.connect()
     _global_con = con
     con.execute(f"SET temp_directory = '{SCRATCH_DIR}'")
-
-    out.print("Loading seen tuples")
-    t_load = time.monotonic()
-    n_seen = _load_seen_tuples(con)
-    out.print(f"loaded {n_seen:,} seen tuples in {time.monotonic() - t_load:.1f}s")
-
-    out.print("Loading NegRisk market lookup")
-    t_load = time.monotonic()
-    condition_to_market = _load_negrisk_market_lookup(con)
-    out.print(
-        f"loaded {len(condition_to_market):,} NegRisk condition->market mappings "
-        f"in {time.monotonic() - t_load:.1f}s"
-    )
+    configure_duckdb_progress(con)
 
     processed = 0
     rows_done = 0
     status = "OK"
-    heartbeat = PartitionHeartbeat(out)
-    with out.make_total_progress() as progress:
-        task = progress.add_task("Total progress", total=len(todo))
+    heartbeat = PartitionHeartbeat(out, row_noun="token mappings")
+    with out.status:
+        out.status.total(0, len(todo))
+        seen_work = PhaseWork(out.status, "Loading seen tuples")
+        seen_work.phase()
+        t_load = time.monotonic()
+        n_seen = _load_seen_tuples(con, work=seen_work)
+        out.print(f"loaded {n_seen:,} seen tuples in {time.monotonic() - t_load:.1f}s")
+
+        nr_work = PhaseWork(out.status, "Loading NegRisk market lookup")
+        nr_work.phase()
+        t_load = time.monotonic()
+        condition_to_market = _load_negrisk_market_lookup(con, work=nr_work)
+        out.print(
+            f"loaded {len(condition_to_market):,} NegRisk condition->market mappings "
+            f"in {time.monotonic() - t_load:.1f}s"
+        )
+
         for m_val, k_val in todo:
             if _stop_event.is_set():
                 status = "interrupted"
                 out.log_only("interrupted by user")
                 break
+            work = PhaseWork(out.status, f"10K={k_val:,}")
+            work.phase("discovering")
             row_count, _ = process_chunk(
-                con, m_val, k_val, condition_to_market=condition_to_market, log=out.log
+                con,
+                m_val,
+                k_val,
+                condition_to_market=condition_to_market,
+                log=out.log,
+                work=work,
             )
             processed += 1
             rows_done += row_count
             heartbeat.update(rows=row_count, done=processed, total=len(todo))
-            progress.update(task, completed=processed)
+            out.status.total(processed, len(todo))
+        out.status.clear_partition()
     heartbeat.flush()
     if _stop_event.is_set():
         status = "interrupted"

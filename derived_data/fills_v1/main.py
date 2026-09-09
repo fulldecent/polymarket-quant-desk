@@ -97,10 +97,13 @@ from lib.partition_utils import (  # noqa: E402
 )
 from lib.run_logging import (  # noqa: E402
     PartitionHeartbeat,
+    PhaseWork,
     RunOutput,
+    configure_duckdb_progress,
     print_paths,
     print_run_summary,
     print_work_plan,
+    run_sql,
 )
 from lib.atomic_publish import (  # noqa: E402
     create_temp_location,
@@ -621,7 +624,12 @@ def _build_partition_sql(k_val: int, leg_paths: list[tuple[dict, str]]) -> str:
 # token_id_map + running-balance state
 # ============================================================================
 
-def _build_unified_token_cache(con: duckdb.DuckDBPyConnection, log: logging.Logger, frontier: int) -> int:
+def _build_unified_token_cache(
+    con: duckdb.DuckDBPyConnection,
+    log: logging.Logger,
+    frontier: int,
+    work: PhaseWork | None = None,
+) -> int:
     """Build unified token lifecycle cache: token_id → condition_id, market_id, first_seen_block, resolved_block, resolved_log_index.
     
     One-time startup operation that creates a temp table used for fill suppression and lifecycle tracking.
@@ -632,7 +640,7 @@ def _build_unified_token_cache(con: duckdb.DuckDBPyConnection, log: logging.Logg
     # Load token_id_map with first-seen block (lowest partition containing the token).
     # token_id_map partitioning is 1M/10K like fills_v1; minimum block in partition = 10K * lower.
     tok_glob = f"{TOKEN_MAP}/**/*.parquet"
-    con.execute("""
+    run_sql(con, """
         CREATE OR REPLACE TEMP TABLE token_cache (
             token_id BLOB,
             condition_id BLOB,
@@ -641,9 +649,11 @@ def _build_unified_token_cache(con: duckdb.DuckDBPyConnection, log: logging.Logg
             resolved_block UINTEGER,
             resolved_log_index UINTEGER
         )
-    """)
+    """, work=work)
     try:
-        con.execute(f"""
+        if work is not None:
+            work.phase("tokens")
+        run_sql(con, f"""
             INSERT INTO token_cache
             WITH tok_raw AS (
                 SELECT token_id, condition_id, market_id, "10K" AS partition_10k
@@ -658,7 +668,7 @@ def _build_unified_token_cache(con: duckdb.DuckDBPyConnection, log: logging.Logg
                 CAST(NULL AS UINTEGER) AS resolved_log_index
             FROM tok_raw
             GROUP BY token_id, condition_id, market_id
-        """)
+        """, work=work)
     except duckdb.IOException:
         raise RuntimeError(
             "token_id_map_v1 has no parquet files; fills_v1 requires a complete token map. "
@@ -676,7 +686,9 @@ def _build_unified_token_cache(con: duckdb.DuckDBPyConnection, log: logging.Logg
     # Load condition resolutions up to frontier and merge into cache.
     res_glob = f"{RAW}/ConditionalTokens/condition_resolution/**/*.parquet"
     try:
-        con.execute(f"""
+        if work is not None:
+            work.phase("resolutions")
+        run_sql(con, f"""
             WITH ordered AS (
                 SELECT
                     condition_id,
@@ -703,7 +715,7 @@ def _build_unified_token_cache(con: duckdb.DuckDBPyConnection, log: logging.Logg
                 resolved_log_index = r.resolved_log_index
             FROM resolutions r
             WHERE tc.condition_id = r.condition_id
-        """, [frontier])
+        """, [frontier], work=work)
     except duckdb.IOException:
         log.info("condition_resolution not found in raw data; tokens will not have resolution bounds")
     
@@ -1000,6 +1012,7 @@ def process_chunk(
     telemetry_every: int,
     profile_build_query: bool,
     profile_output_dir: Path | None,
+    work: PhaseWork | None = None,
 ) -> int:
     """Process one 10K partition: build legs, assign order/position, write atomically.
 
@@ -1018,6 +1031,8 @@ def process_chunk(
     dropped = 0
     suppressed_rows = 0
     suppressed_conditions = 0
+    if work is not None:
+        work.phase("building")
     if leg_paths:
         t_build_start = time.perf_counter()
         sql = _build_partition_sql(k_val, leg_paths)
@@ -1031,7 +1046,7 @@ def process_chunk(
             con.execute(f"PRAGMA profiling_output='{_sql_quote(profile_path.as_posix())}'")
 
         try:
-            con.execute(f"CREATE OR REPLACE TEMP TABLE chunk_rows AS {sql}")
+            run_sql(con, f"CREATE OR REPLACE TEMP TABLE chunk_rows AS {sql}", work=work)
         finally:
             if profile_build_query:
                 con.execute("PRAGMA disable_profiling")
@@ -1061,14 +1076,18 @@ def process_chunk(
     row_count = con.execute("SELECT COUNT(*) FROM chunk_rows").fetchone()[0]
 
     temp_loc = create_temp_location(parent_dir=chunk_dir.parent, final_name=chunk_dir.name, temp_suffix=".tmp")
+    if work is not None:
+        work.phase("hashing")
     input_hashes = _partition_input_hashes(k_val)
     try:
         out_parquet = temp_loc.path / "data.parquet"
+        if work is not None:
+            work.phase("writing")
         t_write_start = time.perf_counter()
-        con.execute(f"""
+        run_sql(con, f"""
             COPY (SELECT {select_cols} FROM chunk_rows ORDER BY block_number, logical_fill_index)
             TO '{out_parquet.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
-        """)
+        """, work=work)
         t_write = time.perf_counter() - t_write_start
 
         t_meta_start = time.perf_counter()
@@ -1079,6 +1098,8 @@ def process_chunk(
         publish_atomically(temp_loc)
         t_publish = time.perf_counter() - t_publish_start
 
+        if work is not None:
+            work.phase("balances")
         t_bal_start = time.perf_counter()
         touched_keys, touched_conditions, new_keys = _update_balances(con)
         
@@ -1403,32 +1424,36 @@ def main() -> None:
     _global_con = con
     con.execute(f"SET temp_directory = '{SCRATCH_DIR}'")
     con.execute("SET preserve_insertion_order = false")
-
-    out.print("Loading token cache")
-    t_load = time.monotonic()
-    n_tokens = _build_unified_token_cache(con, out.log, frontier)
-    out.print(f"loaded {n_tokens:,} tokens in {time.monotonic() - t_load:.1f}s")
-
-    con.execute("""
-        CREATE OR REPLACE TEMP TABLE balances (
-            account BLOB,
-            condition_id BLOB,
-            bal HUGEINT
-        )
-    """)
-    out.log_only("initialized running balance table")
+    configure_duckdb_progress(con)
 
     processed = 0
     rows_done = 0
     status = "OK"
-    heartbeat = PartitionHeartbeat(out)
-    with out.make_total_progress() as progress:
-        task = progress.add_task("Total progress", total=len(todo))
+    heartbeat = PartitionHeartbeat(out, row_noun="fill legs")
+    with out.status:
+        out.status.total(0, len(todo))
+        load = PhaseWork(out.status, "Loading token cache")
+        load.phase()
+        t_load = time.monotonic()
+        n_tokens = _build_unified_token_cache(con, out.log, frontier, work=load)
+        out.print(f"loaded {n_tokens:,} tokens in {time.monotonic() - t_load:.1f}s")
+
+        con.execute("""
+            CREATE OR REPLACE TEMP TABLE balances (
+                account BLOB,
+                condition_id BLOB,
+                bal HUGEINT
+            )
+        """)
+        out.log_only("initialized running balance table")
+
         for partition_idx, (m_val, k_val) in enumerate(todo, start=1):
             if _stop_event.is_set():
                 status = "interrupted"
                 out.log_only("interrupted by user")
                 break
+            work = PhaseWork(out.status, f"10K={k_val:,}")
+            work.phase("building")
             row_count = process_chunk(
                 con,
                 m_val,
@@ -1439,11 +1464,13 @@ def main() -> None:
                 telemetry_every=args.telemetry_every,
                 profile_build_query=args.duckdb_profile_build,
                 profile_output_dir=profile_output_dir,
+                work=work,
             )
             processed += 1
             rows_done += row_count
             heartbeat.update(rows=row_count, done=processed, total=len(todo))
-            progress.update(task, completed=processed)
+            out.status.total(processed, len(todo))
+        out.status.clear_partition()
     heartbeat.flush()
     if _stop_event.is_set():
         status = "interrupted"
