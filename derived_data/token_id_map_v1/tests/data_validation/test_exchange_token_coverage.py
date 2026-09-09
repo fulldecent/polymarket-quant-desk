@@ -59,6 +59,7 @@ def _connect() -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
     scratch_dir = os.environ.get("SCRATCH_DIR", "")
     if scratch_dir:
+        Path(scratch_dir).mkdir(parents=True, exist_ok=True)
         con.execute(f"SET temp_directory = '{scratch_dir}'")
     con.execute("SET preserve_insertion_order = false")
     return con

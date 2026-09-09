@@ -85,7 +85,7 @@ _project_root = Path(__file__).resolve().parent.parent.parent
 load_dotenv(_project_root / ".env")
 
 sys.path.insert(0, str(_project_root))
-from lib.env import require_env  # noqa: E402
+from lib.env import require_directory_env, require_env  # noqa: E402
 from lib.git_utils import assert_git_clean  # noqa: E402
 from lib.metadata_utils import create_parquet_metadata_json, parquet_content_hash  # noqa: E402
 from lib.partition_utils import (  # noqa: E402
@@ -165,7 +165,7 @@ _global_con: duckdb.DuckDBPyConnection | None = None
 RAW       = require_env("POLYGON_CONTRACT_EVENTS_V3_DIR")
 TOKEN_MAP = require_env("TOKEN_ID_MAP_V1_DIR")
 OUT_DIR   = require_env("FILLS_V1_DIR")
-SCRATCH_DIR = require_env("SCRATCH_DIR")
+SCRATCH_DIR = require_directory_env("SCRATCH_DIR")
 
 BALANCES_SUBDIR = "_balances"
 

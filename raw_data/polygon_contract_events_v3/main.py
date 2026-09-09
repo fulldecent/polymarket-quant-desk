@@ -99,6 +99,7 @@ _project_root = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(_project_root))
 
+from lib.env import require_directory_env  # noqa: E402
 from lib.git_utils import assert_git_clean  # noqa: E402
 
 from _internal.chunk_planner import ChunkPlanner
@@ -210,14 +211,7 @@ def _load_environment() -> dict[str, str]:
             + "\nSet them in the repo-root .env file."
         )
 
-    hot_dir = os.environ["HOT_DIR"]
-    if not os.path.isdir(hot_dir):
-        sys.exit(
-            f"HOT_DIR does not exist: {hot_dir}\n"
-            f"Create it (e.g. mkdir -p {hot_dir}) before running."
-        )
-    if not os.access(hot_dir, os.W_OK):
-        sys.exit(f"HOT_DIR is not writable: {hot_dir}")
+    hot_dir = require_directory_env("HOT_DIR")
     # Named after the dataset it serves, so several tools can share one hot directory.
     db_path = os.path.join(hot_dir, "polygon_contract_events_v3.db")
 
@@ -230,13 +224,7 @@ def _load_environment() -> dict[str, str]:
     if not os.access(cold_root, os.W_OK):
         sys.exit(f"POLYGON_CONTRACT_EVENTS_V3_DIR is not writable: {cold_root}")
 
-    scratch_dir = os.environ["SCRATCH_DIR"]
-    if not os.path.isdir(scratch_dir):
-        sys.exit(
-            f"SCRATCH_DIR does not exist: {scratch_dir}\nCreate it before running."
-        )
-    if not os.access(scratch_dir, os.W_OK):
-        sys.exit(f"SCRATCH_DIR is not writable: {scratch_dir}")
+    scratch_dir = require_directory_env("SCRATCH_DIR")
 
     return {
         "db_path": db_path,

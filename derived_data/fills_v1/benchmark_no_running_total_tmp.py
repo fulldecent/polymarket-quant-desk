@@ -29,7 +29,7 @@ load_dotenv(_project_root / ".env")
 
 sys.path.insert(0, str(_project_root))
 
-from lib.env import require_env  # noqa: E402
+from lib.env import require_directory_env, require_env  # noqa: E402
 from lib.partition_utils import enumerate_partitions, partition_dir, partition_end  # noqa: E402
 from lib.derived_frontier import scan_frontier_1M_10K_folders  # noqa: E402
 from lib.run_logging import setup_logging  # noqa: E402
@@ -53,7 +53,7 @@ _global_con: duckdb.DuckDBPyConnection | None = None
 RAW = require_env("POLYGON_CONTRACT_EVENTS_V3_DIR")
 TOKEN_MAP = require_env("TOKEN_ID_MAP_V1_DIR")
 FILLS_OUT = require_env("FILLS_V1_DIR")
-SCRATCH_DIR = require_env("SCRATCH_DIR")
+SCRATCH_DIR = require_directory_env("SCRATCH_DIR")
 
 
 def _build_partition_sql_no_running(k_val: int, leg_paths: list[tuple[dict, str]]) -> str:
