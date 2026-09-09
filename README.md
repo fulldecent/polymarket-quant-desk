@@ -31,30 +31,18 @@ I use the Samsung T9 and it works great ([Amazon link (affiliate)](https://amzn.
 
 ## Scrape and derive data
 
-Repeat this process periodically to get new data as it is available from the market. This will allow you to run your backtesting analysis against recent data.
+Repeat this process periodically to get new data as it is available from the market. This will allow you to run your backtesting analysis against recent data. Add new lines below in your pipeline as you create your own proprietary datasets.
 
-1. Scrape raw events
+```sh
+source .venv/bin/activate
+python raw_data/polygon_contract_events_v3/main.py
+python derived_data/token_id_map_v1/main.py
+python derived_data/fills_v1/main.py
+```
 
-   ```sh
-   source .venv/bin/activate
-   python raw_data/polygon_contract_events_v3/main.py
-   ```
+The full dependency graph for your pipeline is in the [data catalog](docs/Data%20catalog.md), and links to each dataset's data dictionary. These scripts all produce data in partitions of 10,000 blockchain blocks which is immutable and reproducible.
 
-   There is nothing to tune. The scraper starts at one request of one block and measures its way
-   up to whatever your RPC provider will bear, so the same command suits a free endpoint and a
-   paid one. See [the scraper README](raw_data/polygon_contract_events_v3/README.md) for the
-   options that do exist.
-
-2. Build the derived datasets
-
-   Run each derived producer after the raw scrape, in dependency order (see [docs/Data catalog.md](docs/Data%20catalog.md) for the full graph):
-
-   ```sh
-   source .venv/bin/activate
-   python derived_data/token_id_map_v1/main.py
-   ```
-
-   Each producer is incremental and immutable: it materializes every new 10,000-block partition up to the upstream frontier and never rewrites a landed partition. Shared building blocks for producers live in [lib/](lib/README.md).
+This is information you use to find alpha!
 
 ## Explorations
 
