@@ -53,12 +53,15 @@ Spec-compliant `metadata.json` provenance next to each `data.parquet` (see [Meta
 
 ### run_logging.py
 
-Operator-facing console UX for partition-producing derived jobs: one sticky progress bar with ETA, log lines scrolling above it, and one timestamped `logs/main-{ts}.log` per run. (The raw scraper uses a separate bespoke status-line renderer and does not use this module.)
+Operator-facing console and log contract for partition-producing derived jobs. Screen is the cockpit (paths, work plan, sticky Total progress bar, occasional heartbeat, honest end summary). The UTC log file is the full record; every screen line is also in the file. Per-partition chatter stays file-only. (The raw scraper uses a separate status-line renderer and does not use this module.)
 
 | name | description |
 |---|---|
-| `setup_logging(logger_name, script_file, console)` | per-run `logs/main-{ts}.log` (DEBUG) + a `RichHandler` (INFO) bound to `console` |
-| `make_progress(console)` | the standard `Progress` (spinner, bar, M/N, elapsed, ETA), bound to the same `console` |
+| `RunOutput(logger_name, script_file)` | themed console + per-run `logs/main-{ts}.log`; `print` writes both, `log_only` writes the file |
+| `make_total_progress(console)` | Total progress bar (green done / magenta remaining, comma `done/total`, elapsed, ETA) |
+| `PartitionHeartbeat(out)` | periodic `-> partitions: N  rows: M  T.Ts` line above the bar |
+| `print_paths` / `print_work_plan` / `print_run_summary` | startup paths, one work-plan line, end-of-run summary |
+| `setup_logging(logger_name, script_file, console=None)` | file-only UTC logger; `console` is ignored. Prefer `RunOutput` in producers |
 
 ### ct_helpers.py
 

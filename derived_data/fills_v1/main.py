@@ -80,7 +80,6 @@ from pathlib import Path
 
 import duckdb
 from dotenv import load_dotenv
-from rich.console import Console
 
 _project_root = Path(__file__).resolve().parent.parent.parent
 load_dotenv(_project_root / ".env")
@@ -96,7 +95,13 @@ from lib.partition_utils import (  # noqa: E402
     partition_dir,
     partition_end,
 )
-from lib.run_logging import make_progress, setup_logging  # noqa: E402
+from lib.run_logging import (  # noqa: E402
+    PartitionHeartbeat,
+    RunOutput,
+    print_paths,
+    print_run_summary,
+    print_work_plan,
+)
 from lib.atomic_publish import (  # noqa: E402
     create_temp_location,
     publish_atomically,
@@ -145,8 +150,6 @@ _OUTPUT_COLUMNS = (
     "fee_usdc",
     "net_yes_position_after",
 )
-
-console = Console()
 
 _stop_event = threading.Event()
 _global_con: duckdb.DuckDBPyConnection | None = None
@@ -618,11 +621,13 @@ def _build_partition_sql(k_val: int, leg_paths: list[tuple[dict, str]]) -> str:
 # token_id_map + running-balance state
 # ============================================================================
 
-def _build_unified_token_cache(con: duckdb.DuckDBPyConnection, log: logging.Logger, frontier: int) -> None:
+def _build_unified_token_cache(con: duckdb.DuckDBPyConnection, log: logging.Logger, frontier: int) -> int:
     """Build unified token lifecycle cache: token_id → condition_id, market_id, first_seen_block, resolved_block, resolved_log_index.
     
     One-time startup operation that creates a temp table used for fill suppression and lifecycle tracking.
     Table is incrementally updated per partition as new resolutions are encountered.
+
+    Returns the number of rows in ``token_cache``.
     """
     # Load token_id_map with first-seen block (lowest partition containing the token).
     # token_id_map partitioning is 1M/10K like fills_v1; minimum block in partition = 10K * lower.
@@ -704,6 +709,7 @@ def _build_unified_token_cache(con: duckdb.DuckDBPyConnection, log: logging.Logg
     
     resolved_count = con.execute("SELECT COUNT(*) FROM token_cache WHERE resolved_block IS NOT NULL").fetchone()[0]
     log.info(f"merged {resolved_count:,} resolved conditions into token cache")
+    return int(n)
 
 
 def _balances_sidecar_dir() -> Path:
@@ -1267,8 +1273,19 @@ def main() -> None:
 
     assert_git_clean(_project_root)
 
-    log = setup_logging("fills_v1", __file__, console)
-    log.info("fills_v1 materializer starting")
+    out = RunOutput("fills_v1", __file__)
+    run_start = time.monotonic()
+    none_below = SCRAPE_START_BLOCK - 1
+    print_paths(
+        out,
+        [
+            ("raw", RAW),
+            ("token_id_map", TOKEN_MAP),
+            ("output", OUT_DIR),
+            ("scratch", SCRATCH_DIR),
+            ("log", str(out.log_path)),
+        ],
+    )
 
     profile_output_dir: Path | None = None
     if args.duckdb_profile_build:
@@ -1278,7 +1295,7 @@ def main() -> None:
             run_ts = time.strftime("%Y-%m-%dT%H%M%SZ", time.gmtime())
             profile_output_dir = Path(__file__).resolve().parent / "logs" / "profiles" / run_ts
         profile_output_dir.mkdir(parents=True, exist_ok=True)
-        log.info(f"duckdb build-query profiling enabled; output_dir={profile_output_dir.as_posix()}")
+        out.log_only(f"duckdb build-query profiling enabled; output_dir={profile_output_dir.as_posix()}")
 
     def _handle_sigint(sig, frame):
         _stop_event.set()
@@ -1304,11 +1321,11 @@ def main() -> None:
     token_map_frontier = (
         partition_end(token_map_latest)
         if token_map_latest is not None
-        else SCRAPE_START_BLOCK - 1
+        else none_below
     )
     if token_map_frontier < cold_frontier:
         raise RuntimeError(
-            f"token_id_map_v1 frontier ({token_map_frontier}) is behind the cold frontier ({cold_frontier}); "
+            f"token_id_map_v1 frontier ({token_map_frontier:,}) is behind the cold frontier ({cold_frontier:,}); "
             f"fills_v1 requires complete token coverage up to the cold frontier. "
             f"Advance token_id_map_v1 first."
         )
@@ -1319,29 +1336,79 @@ def main() -> None:
         for (m, k) in all_partitions
         if not (Path(OUT_DIR) / f"{PARTITION_1M_LABEL}={m}" / f"{PARTITION_10K_LABEL}={k}").exists()
     ]
-    log.info(f"frontier={frontier}, total={len(all_partitions)}, todo={len(todo)}")
-
-    if args.dry_run:
-        for m, k in todo[:10]:
-            log.info(f"DRY-RUN would process 1M={m} 10K={k}")
-        if len(todo) > 10:
-            log.info(f"... and {len(todo) - 10} more")
-        return
-
+    already_landed = len(all_partitions) - len(todo)
     if args.sample:
         todo = todo[: args.sample]
+
+    latest_self = scan_frontier_1M_10K_folders(
+        base_path=OUT_DIR,
+        starting_partition=SCRAPE_START_BLOCK,
+        tmp_suffix=".tmp",
+        cb_progress=lambda _partition: None,
+    )
+    self_frontier = partition_end(latest_self) if latest_self is not None else none_below
+
+    print_work_plan(
+        out,
+        frontier=frontier,
+        total=len(all_partitions),
+        already_landed=already_landed,
+        todo=len(todo),
+        sample=args.sample,
+    )
+    out.log_only(f"# main — start at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
+    out.log_only(f"cold frontier:        {cold_frontier:,}")
+    out.log_only(
+        f"token_id_map frontier: {token_map_frontier:,}"
+        if token_map_frontier > none_below
+        else "token_id_map frontier: none"
+    )
+    out.log_only(f"upstream frontier:    {frontier:,}")
+    out.log_only(
+        f"self frontier:        {self_frontier:,}"
+        if self_frontier > none_below
+        else "self frontier:        none"
+    )
+    out.log_only(f"partitions total:     {len(all_partitions):,}")
+    out.log_only(f"already landed:       {already_landed:,}")
+    out.log_only(f"to process:           {len(todo):,}")
+    if args.sample:
+        out.log_only(f"sample:               {args.sample:,}")
+
+    if args.dry_run:
+        if todo:
+            first_m, first_k = todo[0]
+            last_m, last_k = todo[-1]
+            out.print(f"dry-run: would process {len(todo):,} partitions")
+            out.print(f"  first: 1M={first_m} 10K={first_k}")
+            out.print(f"  last:  1M={last_m} 10K={last_k}")
+        else:
+            out.print("dry-run: nothing to do")
+        return
+
+    if not todo:
+        print_run_summary(
+            out,
+            status="nothing to do",
+            elapsed=time.monotonic() - run_start,
+            partitions_done=0,
+            rows_done=0,
+            self_frontier=self_frontier,
+            upstream_frontier=frontier,
+            none_below=none_below,
+        )
+        return
 
     con = duckdb.connect()
     _global_con = con
     con.execute(f"SET temp_directory = '{SCRATCH_DIR}'")
     con.execute("SET preserve_insertion_order = false")
 
-    # Build unified token cache: one-time startup operation.
-    # This cache tracks token lifecycle: first_seen_block, condition_id, resolved_block/log_index.
-    # Used for deterministic fill suppression (fills outside [first_seen, resolved) are excluded).
-    _build_unified_token_cache(con, log, frontier)
+    out.print("Loading token cache")
+    t_load = time.monotonic()
+    n_tokens = _build_unified_token_cache(con, out.log, frontier)
+    out.print(f"loaded {n_tokens:,} tokens in {time.monotonic() - t_load:.1f}s")
 
-    # Initialize running balance state (updated per partition).
     con.execute("""
         CREATE OR REPLACE TEMP TABLE balances (
             account BLOB,
@@ -1349,29 +1416,24 @@ def main() -> None:
             bal HUGEINT
         )
     """)
-    log.info("initialized running balance table")
+    out.log_only("initialized running balance table")
 
-    console.print(
-        f"frontier={frontier}  |  total={len(all_partitions):,}  |  "
-        f"[green]{len(all_partitions) - len(todo):,} already landed[/green]  |  "
-        f"[yellow]{len(todo):,} to process[/yellow]"
-    )
-    if not todo:
-        console.print("[green]Nothing to do.[/green]")
-        return
-
-    with make_progress(console) as progress:
-        task = progress.add_task("Materializing fills_v1", total=len(todo))
-        processed = 0
+    processed = 0
+    rows_done = 0
+    status = "OK"
+    heartbeat = PartitionHeartbeat(out)
+    with out.make_total_progress() as progress:
+        task = progress.add_task("Total progress", total=len(todo))
         for partition_idx, (m_val, k_val) in enumerate(todo, start=1):
             if _stop_event.is_set():
-                log.info("interrupted by user")
+                status = "interrupted"
+                out.log_only("interrupted by user")
                 break
-            process_chunk(
+            row_count = process_chunk(
                 con,
                 m_val,
                 k_val,
-                log,
+                out.log,
                 partition_idx=partition_idx,
                 total_partitions=len(todo),
                 telemetry_every=args.telemetry_every,
@@ -1379,10 +1441,26 @@ def main() -> None:
                 profile_output_dir=profile_output_dir,
             )
             processed += 1
-            progress.update(task, advance=1)
+            rows_done += row_count
+            heartbeat.update(rows=row_count, done=processed, total=len(todo))
+            progress.update(task, completed=processed)
+    heartbeat.flush()
+    if _stop_event.is_set():
+        status = "interrupted"
 
-    log.info(f"fills_v1 materializer finished. Processed {processed} partitions.")
-    console.print(f"[green]Complete! Processed {processed} partitions.[/green]")
+    if processed:
+        self_frontier = partition_end(todo[processed - 1][1])
+
+    print_run_summary(
+        out,
+        status=status,
+        elapsed=time.monotonic() - run_start,
+        partitions_done=processed,
+        rows_done=rows_done,
+        self_frontier=self_frontier,
+        upstream_frontier=frontier,
+        none_below=none_below,
+    )
 
 
 if __name__ == "__main__":

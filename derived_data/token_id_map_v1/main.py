@@ -52,19 +52,6 @@ import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 from dotenv import load_dotenv
-from rich.console import Console
-from rich.progress import (
-    BarColumn,
-    Progress,
-    ProgressColumn,
-    SpinnerColumn,
-    Task,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
-from rich.text import Text
-from rich.theme import Theme
 
 _project_root = Path(__file__).resolve().parent.parent.parent
 load_dotenv(_project_root / ".env")
@@ -84,7 +71,13 @@ from lib.partition_utils import (  # noqa: E402
 )
 from lib.derived_frontier import scan_frontier_1M_10K_folders  # noqa: E402
 
-from lib.run_logging import setup_logging  # noqa: E402
+from lib.run_logging import (  # noqa: E402
+    PartitionHeartbeat,
+    RunOutput,
+    print_paths,
+    print_run_summary,
+    print_work_plan,
+)
 from lib.atomic_publish import (  # noqa: E402
     create_temp_location,
     publish_atomically,
@@ -153,44 +146,6 @@ _OUTPUT_SCHEMA = pa.schema([
     pa.field("index_set",             pa.uint32()),
     pa.field("market_id",             pa.binary(), nullable=True),
 ])
-
-# Status-line colors match raw_data/polygon_contract_events_v3/main.py: completed
-# work is green, remaining work is magenta (including elapsed vs remaining time).
-_COLOR_DONE = "green"
-_COLOR_TODO = "magenta"
-
-console = Console(
-    theme=Theme({"progress.elapsed": _COLOR_DONE, "progress.remaining": _COLOR_TODO})
-)
-
-
-class _DoneOfTotalColumn(ProgressColumn):
-    """``done/total``, each number coloured like the bar segment it stands for."""
-
-    def render(self, task: Task) -> Text:
-        total = int(task.total) if task.total is not None else 0
-        return Text.assemble(
-            (f"{int(task.completed):,}", _COLOR_DONE),
-            "/",
-            (f"{total:,}", _COLOR_TODO),
-        )
-
-
-def _make_total_progress() -> Progress:
-    """Sticky Total progress bar matching the raw scraper status line.
-
-    Counts 10K partitions rather than blocks.
-    """
-    return Progress(
-        SpinnerColumn(),
-        TextColumn("{task.description}"),
-        BarColumn(complete_style=_COLOR_DONE, finished_style=_COLOR_DONE, style=_COLOR_TODO),
-        _DoneOfTotalColumn(),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        console=console,
-    )
-
 
 # Global stop event used by the SIGINT handler and long-running loops
 _stop_event = threading.Event()
@@ -445,7 +400,7 @@ def process_chunk(
                 FROM new_rows
             """)
             con.unregister("new_rows")
-        log.info(f"10K={k_val}: wrote {row_count} token mappings")
+        log.info(f"10K={k_val}: wrote {row_count:,} token mappings")
         return row_count, input_hashes
     except Exception:
         cleanup_temp(temp_loc)
@@ -456,11 +411,13 @@ def process_chunk(
 # main
 # ============================================================================
 
-def _load_seen_tuples(con: duckdb.DuckDBPyConnection) -> None:
+def _load_seen_tuples(con: duckdb.DuckDBPyConnection) -> int:
     """Load all previously materialized token_id_map_v1 partitions into a temp table.
 
     Called once at startup. Subsequent partitions suppress duplicates against this
     table (first-seen rule); process_chunk inserts newly written tuples as it goes.
+
+    Returns the number of rows in the first-seen table (0 on a first run).
     """
     glob = f"{OUT_DIR}/**/*.parquet"
     con.execute("""
@@ -480,6 +437,7 @@ def _load_seen_tuples(con: duckdb.DuckDBPyConnection) -> None:
     except duckdb.IOException:
         # No output files exist yet (first run) — leave the table empty.
         pass
+    return int(con.execute("SELECT COUNT(*) FROM seen_tuples").fetchone()[0])
 
 
 def main() -> None:
@@ -491,10 +449,19 @@ def main() -> None:
 
     assert_git_clean(_project_root)
 
-    log = setup_logging("token_id_map_v1", __file__, console)
-    log.info("token_id_map_v1 materializer starting")
+    out = RunOutput("token_id_map_v1", __file__)
+    run_start = time.monotonic()
+    none_below = SCRAPE_START_BLOCK - 1
+    print_paths(
+        out,
+        [
+            ("raw", RAW),
+            ("output", OUT_DIR),
+            ("scratch", SCRATCH_DIR),
+            ("log", str(out.log_path)),
+        ],
+    )
 
-    # Install a SIGINT handler for clean interruption.
     def _handle_sigint(sig, frame):
         _stop_event.set()
         try:
@@ -523,64 +490,108 @@ def main() -> None:
     self_frontier = (
         partition_end(latest_landed_partition)
         if latest_landed_partition is not None
-        else SCRAPE_START_BLOCK - 1
+        else none_below
     )
     todo_start = max(SCRAPE_START_BLOCK, self_frontier + 1)
     todo = enumerate_partitions(todo_start, frontier)
+    already_landed = len(all_partitions) - len(todo)
+    if args.sample:
+        todo = todo[: args.sample]
 
-    log.info(
-        f"frontier={frontier}, self_frontier={self_frontier}, start_partition_10K={START_PARTITION_10K}, "
-        f"total={len(all_partitions)}, todo={len(todo)}"
+    print_work_plan(
+        out,
+        frontier=frontier,
+        total=len(all_partitions),
+        already_landed=already_landed,
+        todo=len(todo),
+        sample=args.sample,
     )
+    out.log_only(f"# main — start at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
+    out.log_only(f"upstream frontier:    {frontier:,}")
+    out.log_only(f"self frontier:        {self_frontier:,}" if self_frontier > none_below else "self frontier:        none")
+    out.log_only(f"start partition 10K:  {START_PARTITION_10K:,}")
+    out.log_only(f"partitions total:     {len(all_partitions):,}")
+    out.log_only(f"already landed:       {already_landed:,}")
+    out.log_only(f"to process:           {len(todo):,}")
+    if args.sample:
+        out.log_only(f"sample:               {args.sample:,}")
 
     if args.dry_run:
-        for m, k in todo[:10]:
-            log.info(f"DRY-RUN would process 1M={m} 10K={k}")
-        if len(todo) > 10:
-            log.info(f"... and {len(todo) - 10} more")
+        if todo:
+            first_m, first_k = todo[0]
+            last_m, last_k = todo[-1]
+            out.print(f"dry-run: would process {len(todo):,} partitions")
+            out.print(f"  first: 1M={first_m} 10K={first_k}")
+            out.print(f"  last:  1M={last_m} 10K={last_k}")
+        else:
+            out.print("dry-run: nothing to do")
         return
 
-    if args.sample:
-        todo = todo[:args.sample]
+    if not todo:
+        print_run_summary(
+            out,
+            status="nothing to do",
+            elapsed=time.monotonic() - run_start,
+            partitions_done=0,
+            rows_done=0,
+            self_frontier=self_frontier,
+            upstream_frontier=frontier,
+            none_below=none_below,
+        )
+        return
 
     con = duckdb.connect()
     _global_con = con
     con.execute(f"SET temp_directory = '{SCRATCH_DIR}'")
 
-    # Load the first-seen set once; process_chunk maintains it incrementally.
-    _load_seen_tuples(con)
+    out.print("Loading seen tuples")
+    t_load = time.monotonic()
+    n_seen = _load_seen_tuples(con)
+    out.print(f"loaded {n_seen:,} seen tuples in {time.monotonic() - t_load:.1f}s")
 
-    # Load the condition_id -> market_id lookup once. Attached to NegRisk rows;
-    # standard conditions get NULL market_id.
+    out.print("Loading NegRisk market lookup")
+    t_load = time.monotonic()
     condition_to_market = _load_negrisk_market_lookup(con)
-    log.info(f"loaded {len(condition_to_market)} NegRisk condition->market mappings")
-
-    already_landed = len(all_partitions) - len(todo)
-    console.print(
-        f"frontier={frontier}  |  total={len(all_partitions):,}  |  "
-        f"[{_COLOR_DONE}]{already_landed:,} already landed[/{_COLOR_DONE}]  |  "
-        f"[{_COLOR_TODO}]{len(todo):,} to process[/{_COLOR_TODO}]"
+    out.print(
+        f"loaded {len(condition_to_market):,} NegRisk condition->market mappings "
+        f"in {time.monotonic() - t_load:.1f}s"
     )
 
-    if not todo:
-        console.print(f"[{_COLOR_DONE}]Nothing to do.[/{_COLOR_DONE}]")
-        return
-
-    with _make_total_progress() as progress:
+    processed = 0
+    rows_done = 0
+    status = "OK"
+    heartbeat = PartitionHeartbeat(out)
+    with out.make_total_progress() as progress:
         task = progress.add_task("Total progress", total=len(todo))
-
-        processed = 0
         for m_val, k_val in todo:
             if _stop_event.is_set():
-                log.info("interrupted by user")
+                status = "interrupted"
+                out.log_only("interrupted by user")
                 break
-
-            row_count, _ = process_chunk(con, m_val, k_val, condition_to_market=condition_to_market, log=log)
+            row_count, _ = process_chunk(
+                con, m_val, k_val, condition_to_market=condition_to_market, log=out.log
+            )
             processed += 1
-            progress.update(task, advance=1)
+            rows_done += row_count
+            heartbeat.update(rows=row_count, done=processed, total=len(todo))
+            progress.update(task, completed=processed)
+    heartbeat.flush()
+    if _stop_event.is_set():
+        status = "interrupted"
 
-    log.info(f"token_id_map_v1 materializer finished. Processed {processed} partitions.")
-    console.print(f"[{_COLOR_DONE}]Complete! Processed {processed} partitions.[/{_COLOR_DONE}]")
+    if processed:
+        self_frontier = partition_end(todo[processed - 1][1])
+
+    print_run_summary(
+        out,
+        status=status,
+        elapsed=time.monotonic() - run_start,
+        partitions_done=processed,
+        rows_done=rows_done,
+        self_frontier=self_frontier,
+        upstream_frontier=frontier,
+        none_below=none_below,
+    )
 
 
 if __name__ == "__main__":
