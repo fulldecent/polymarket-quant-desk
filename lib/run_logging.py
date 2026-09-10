@@ -1,11 +1,11 @@
 """Operator-facing console and log contract for partition-producing derived jobs.
 
-Screen is the cockpit: a two-line banner (output path, log path), one work-plan
-line, a two-row sticky footer (current partition + Total progress), one line per
-sunk partition, and an honest end summary. No log-level chrome.
+Screen is the cockpit: bold output path, log path, blank line, a two-row sticky
+footer, one line per sunk partition, and a compact run-complete block. No
+log-level chrome.
 
 The log file is the full record (UTC). Every screen line is also in the file.
-Input, scratch, and hot paths are log-only.
+Input, scratch, hot, and the work plan are log-only.
 
 The raw scraper uses a separate status-line renderer and does not use this module.
 """
@@ -97,19 +97,19 @@ def make_total_progress(console: Console) -> Progress:
 
 
 def format_duration(seconds: float) -> str:
+    """Compact duration for the end-of-run summary: ``0.4s``, ``36s``, ``1m 12s``, ``2h 3m``."""
     if seconds < 0 or seconds != seconds:  # NaN-safe
-        return "--:--:--"
-    h = int(seconds) // 3600
-    m = (int(seconds) % 3600) // 60
-    s = int(seconds) % 60
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
-
-def format_frontier(value: int, *, none_below: int) -> str:
-    """Render a block-number frontier, or ``none`` when it has not advanced."""
-    if value <= none_below:
-        return "none"
-    return f"{value:,}"
+        return "0s"
+    if seconds < 10:
+        return f"{seconds:.1f}s"
+    total = int(round(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes}m" if minutes else f"{hours}h"
+    if minutes:
+        return f"{minutes}m {secs}s" if secs else f"{minutes}m"
+    return f"{secs}s"
 
 
 def _open_file_logger(logger_name: str, script_file: str) -> tuple[logging.Logger, Path]:
@@ -407,19 +407,14 @@ def print_work_plan(
     todo: int,
     sample: int = 0,
 ) -> None:
-    """One work-plan line: total partitions, already landed, remaining this run."""
-    line = Text()
-    line.append(f"frontier={frontier:,}")
-    line.append("  |  ")
-    line.append(f"total={total:,}")
-    line.append("  |  ")
-    line.append(f"{already_landed:,} already landed", style=COLOR_DONE)
-    line.append("  |  ")
+    """Record the work plan in the run log. Not shown on screen."""
     todo_text = f"{todo:,} to process"
     if sample:
         todo_text += f" (sample {sample:,})"
-    line.append(todo_text, style=COLOR_TODO)
-    out.print(line)
+    out.log_only(
+        f"frontier={frontier:,}  |  total={total:,}  |  "
+        f"{already_landed:,} already landed  |  {todo_text}"
+    )
 
 
 def print_run_summary(
@@ -433,33 +428,29 @@ def print_run_summary(
     upstream_frontier: int,
     none_below: int,
 ) -> None:
-    """Honest end-of-run block (OK / interrupted / nothing to do)."""
-    status_style = {
-        "OK": COLOR_DONE,
-        "nothing to do": COLOR_DONE,
-        "interrupted": COLOR_TODO,
-    }.get(status)
+    """Compact end-of-run block."""
+    if status == "interrupted":
+        heading = "run interrupted"
+    else:
+        heading = "run complete"
 
-    part_s = partitions_done / elapsed if elapsed > 1 and partitions_done else 0.0
-    row_s = rows_done / elapsed if elapsed > 1 and rows_done else 0.0
+    if self_frontier <= none_below:
+        frontier_note = "none"
+    elif (
+        status != "interrupted"
+        and upstream_frontier > none_below
+        and self_frontier >= upstream_frontier
+    ):
+        frontier_note = f"{self_frontier:,} (matches all input datasets)"
+    elif upstream_frontier > none_below:
+        frontier_note = f"{self_frontier:,} (upstream {upstream_frontier:,})"
+    else:
+        frontier_note = f"{self_frontier:,}"
 
     out.print("")
-    out.print("=" * 70)
-    out.print(f"run complete  ({format_duration(elapsed)})")
-    out.print("=" * 70)
-    out.print("")
-    out.print("status")
-    status_line = Text("  ")
-    status_line.append(status, style=status_style)
-    out.print(status_line)
-    out.print("")
-    out.print("progress")
-    out.print(f"  partitions this run:  {partitions_done:,}")
-    out.print(f"  rows this run:        {rows_done:,}")
-    out.print(f"  self frontier:        {format_frontier(self_frontier, none_below=none_below)}")
-    out.print(f"  upstream frontier:    {format_frontier(upstream_frontier, none_below=none_below)}")
-    out.print("")
-    out.print("throughput")
-    out.print(f"  partitions/sec:  {part_s:,.2f}")
-    out.print(f"  rows/sec:        {row_s:,.0f}")
+    out.print(heading)
+    out.print(f"   time: {format_duration(elapsed)}")
+    out.print(f"   partitions: {partitions_done:,}")
+    out.print(f"   rows: {rows_done:,}")
+    out.print(f"   new frontier: {frontier_note}")
     out.print("")

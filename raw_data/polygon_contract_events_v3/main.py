@@ -102,6 +102,7 @@ sys.path.insert(0, str(_project_root))
 from lib.env import require_directory_env  # noqa: E402
 from lib.git_utils import assert_git_clean  # noqa: E402
 from lib.partition_utils import mask_partition  # noqa: E402
+from lib.run_logging import format_duration  # noqa: E402
 
 from _internal.chunk_planner import ChunkPlanner
 from _internal.epoch_optimizer import MAX_WORKERS, EpochOptimizer
@@ -238,15 +239,6 @@ def _load_environment() -> dict[str, str]:
 # ---------------------------------------------------------------------------
 # Display helpers
 # ---------------------------------------------------------------------------
-
-def _format_duration(seconds: float) -> str:
-    if seconds < 0 or seconds != seconds:  # NaN-safe
-        return "--:--:--"
-    h = int(seconds) // 3600
-    m = (int(seconds) % 3600) // 60
-    s = int(seconds) % 60
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
 
 def _file_size_str(path: str) -> str:
     try:
@@ -948,61 +940,45 @@ def _print_summary(
     elapsed: float,
     fatal_reason: str | None,
 ) -> None:
-    summary_lines = []
-    summary_lines.append("")
-    summary_lines.append("=" * 70)
-    summary_lines.append(f"run complete  ({_format_duration(elapsed)})")
-    summary_lines.append("=" * 70)
-
     if fatal_reason:
-        summary_lines.append("")
-        summary_lines.append("status")
-        summary_lines.append(f"  FATAL: {fatal_reason}")
-    elif caught_up_confirmed:
-        summary_lines.append("")
-        summary_lines.append("status")
-        summary_lines.append("  caught up")
-    elif blocks_done == 0:
-        summary_lines.append("")
-        summary_lines.append("status")
-        summary_lines.append("  no progress - run ended without confirmed caught-up state")
+        heading = "run failed"
+    elif _stop_event.is_set():
+        heading = "run interrupted"
     else:
-        summary_lines.append("")
-        summary_lines.append("status")
-        summary_lines.append("  OK")
+        heading = "run complete"
 
     sunk = None
-    loaded = None
-    lag = chain_head - SCRAPE_START_BLOCK
     if store is not None:
-        # Read it back from the manifests rather than trusting in-memory state.
         sunk = get_manifest_frontier(cold_root)
-        hot_db_blocks = sum(
-            (to_b - from_b + 1)
-            for from_b, to_b, _ in store.list_loaded_ranges(include_sunk=False)
-        )
-        summary_lines.append("")
-        summary_lines.append("progress")
-        summary_lines.append(
-            f"  sunk frontier:        {sunk:,}"
-            if sunk > (SCRAPE_START_BLOCK - 1)
-            else "  sunk frontier:        none"
-        )
-        summary_lines.append(f"  hot database:         {hot_db_blocks:,} blocks")
-        summary_lines.append(f"  chain head:           {chain_head:,}")
-        summary_lines.append(f"  blocks processed:     +{blocks_done:,} this run")
-    summary_lines.append("")
-    summary_lines.append("throughput")
-    blk_s = blocks_done / elapsed if elapsed > 1 and blocks_done > 0 else 0.0
-    ev_s = events_inserted / elapsed if elapsed > 1 else 0.0
-    cps = calls_made / elapsed if elapsed > 1 and calls_made else 0.0
-    summary_lines.append(f"  blocks/sec:  {blk_s:,.0f}")
-    summary_lines.append(f"  events/sec:  {ev_s:,.0f}")
-    summary_lines.append(f"  API calls:   {calls_made:,}  ({cps:.1f}/s effective)")
+    if sunk is None or sunk <= (SCRAPE_START_BLOCK - 1):
+        frontier_note = "none"
+    elif caught_up_confirmed:
+        frontier_note = f"{sunk:,} (caught up)"
+    else:
+        frontier_note = f"{sunk:,}"
+
+    summary_lines = [
+        "",
+        heading,
+        f"   time: {format_duration(elapsed)}",
+        f"   blocks: {blocks_done:,}",
+        f"   events: {events_inserted:,}",
+        f"   new frontier: {frontier_note}",
+        "",
+    ]
+    if fatal_reason:
+        summary_lines.insert(-1, f"   error: {fatal_reason}")
 
     for line in summary_lines:
         console.print(line, highlight=False)
         _log_event("summary", line)
+
+    _log_event(
+        "summary_detail",
+        "throughput",
+        chain_head=chain_head,
+        calls_made=calls_made,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1268,7 +1244,7 @@ def main() -> None:
                 f"returning incorrect data or is in a failed state."
             )
 
-        _print_message(f"Chain head: {chain_head:,}")
+        _log_event("chain_head", f"chain head {chain_head:,}", chain_head=chain_head)
 
         # Work planning must ignore already-sunk history and only consider
         # unsunk coverage above the sunk frontier.
@@ -1297,39 +1273,19 @@ def main() -> None:
 
         if not gaps and sink.in_flight == 0 and sink.pending_commit == 0:
             caught_up_confirmed = True
-            lag = chain_head - loaded_frontier if loaded_frontier >= 0 else chain_head - SCRAPE_START_BLOCK
-            _print_banner(
-                db_path=env["db_path"],
-                cold_root=env["cold_root"],
-                scratch_dir=env["scratch_dir"],
-                log_path=log_path,
+            lag = (
+                chain_head - loaded_frontier
+                if loaded_frontier >= 0
+                else chain_head - SCRAPE_START_BLOCK
+            )
+            _log_event(
+                "caught-up proof",
+                "caught up",
                 sunk_frontier=sunk_frontier,
                 loaded_frontier=loaded_frontier,
                 chain_head=chain_head,
-                gaps=[],
-                total_gap_blocks=0,
-                unsunk_ranges=unsunk_ranges,
+                lag=lag,
             )
-            _print_message(
-                "caught-up proof: "
-                f"sunk_frontier={sunk_frontier:,} "
-                f"loaded_frontier={loaded_frontier:,} "
-                f"chain_head={chain_head:,} "
-                f"lag={lag:,} blocks"
-            )
-            _print_message("")
-            _print_message("=" * 70)
-            _print_message("already caught up")
-            _print_message("=" * 70)
-            _print_message(f"  sunk frontier:    {sunk_frontier:,}")
-            _print_message(f"  loaded frontier:  {loaded_frontier:,}")
-            _print_message(f"  chain head:       {chain_head:,}")
-            _print_message(
-                f"  lag:              {lag:,} blocks (tolerance: {args.lag_tolerance})"
-            )
-            _print_message("")
-            _print_message("No new work to do. Exiting cleanly.")
-            _print_message("")
             return
 
         # --- Set up the optimizer and work queue --------------------

@@ -54,7 +54,7 @@ Spec-compliant `metadata.json` provenance next to each `data.parquet` (see [Meta
 
 ### run_logging.py
 
-Operator-facing console and log contract for partition-producing derived jobs. Screen is the cockpit: bold `output:` path, `log:` path, blank line, work plan, a two-row sticky footer (current partition with DuckDB % + Total progress), one `-> partition` line per sunk 10K, honest end summary. Input, scratch, and hot paths are log-only. (The raw scraper uses a separate status-line renderer and does not use this module.)
+Operator-facing console and log contract for partition-producing derived jobs. Screen is the cockpit: bold `output:` path, `log:` path, blank line, a two-row sticky footer, one `-> partition` line per sunk 10K, and a compact `run complete` block. Input paths, scratch, hot, and the work plan are log-only. (The raw scraper uses a separate status-line renderer and does not use this module.)
 
 | name | description |
 |---|---|
@@ -64,7 +64,8 @@ Operator-facing console and log contract for partition-producing derived jobs. S
 | `configure_duckdb_progress(con)` | enable DuckDB progress tracking without stderr bars |
 | `print_paths(out, output=..., extra=...)` | bold `output:` + `log:` on screen; extra paths to the run log only |
 | `print_partition_sunk(out, partition, rows, elapsed)` | `-> partition 8,45X,XXX  rows ##  0.4s` after each published 10K |
-| `print_work_plan` / `print_run_summary` | one work-plan line, end-of-run summary |
+| `print_work_plan` | work-plan line, run-log only |
+| `print_run_summary` | compact `run complete` / `run interrupted` block |
 | `setup_logging(logger_name, script_file, console=None)` | file-only UTC logger; `console` is ignored. Prefer `RunOutput` in producers |
 
 ### ct_helpers.py
