@@ -11,17 +11,18 @@ graph TD
     polygon_contract_events_v3 --> token_id_map_v1
     polygon_contract_events_v3 --> fills_v1
     token_id_map_v1 --> fills_v1
-    fills_v1 --> condition_summary_by_block_v1
-    fills_v1 --> condition_summary_v1
-    polygon_contract_events_v3 --resolution--> condition_summary_v1
-    fills_v1 --> account_condition_summary_v1
-    fills_v1 --> account_summary_v1
+    fills_v1 --> condition_by_block_v1
+    fills_v1 --> condition_by_10k_v1
+    polygon_contract_events_v3 --resolution--> condition_by_10k_v1
+    token_id_map_v1 --> condition_by_10k_v1
+    fills_v1 --> account_condition_by_10k_v1
+    fills_v1 --> account_by_10k_v1
 
     classDef raw fill:#b3d9ff,stroke:#336
     classDef immutable fill:#c2f0c2,stroke:#363
 
     class polygon_contract_events_v3 raw
-    class token_id_map_v1,fills_v1,condition_summary_by_block_v1,condition_summary_v1,account_condition_summary_v1,account_summary_v1 immutable
+    class token_id_map_v1,fills_v1,condition_by_block_v1,condition_by_10k_v1,account_condition_by_10k_v1,account_by_10k_v1 immutable
 ```
 
 **Legend:** blue = raw data, green = derived immutable (partitioned append-only, never rewritten)
@@ -53,10 +54,10 @@ These conventions apply to every dataset in this project. Individual data dictio
 |---|---|---|---|---|---|---|
 | token_id_map_v1 | `$TOKEN_ID_MAP_V1_DIR` | [derived_data/token_id_map_v1/](../derived_data/token_id_map_v1/) | Lookup table: `token_id → (collateral_token, parent_collection_id, condition_id, index_set, market_id)` | polygon_contract_events_v3 | [DATA_DICTIONARY.md](../derived_data/token_id_map_v1/DATA_DICTIONARY.md) | `token_id` |
 | fills_v1 | `$FILLS_V1_DIR` | [derived_data/fills_v1/](../derived_data/fills_v1/) | One row per account leg of every matched fill, with signed USDC and condition-token amounts, condition/market enrichment, and a running per-account YES position | polygon_contract_events_v3, token_id_map_v1 | [DATA_DICTIONARY.md](../derived_data/fills_v1/DATA_DICTIONARY.md) | `block_number, logical_fill_index` |
-| condition_summary_by_block_v1 | `$CONDITION_SUMMARY_BY_BLOCK_V1_DIR` | [derived_data/condition_summary_by_block_v1/](../derived_data/condition_summary_by_block_v1/) | Per-block OHLC YES price and market-wide matched volume and fees for each condition | fills_v1 | [DATA_DICTIONARY.md](../derived_data/condition_summary_by_block_v1/DATA_DICTIONARY.md) | `block_number, condition_id` |
-| condition_summary_v1 | `$CONDITION_SUMMARY_V1_DIR` | [derived_data/condition_summary_v1/](../derived_data/condition_summary_v1/) | Per-partition OHLC YES price, market-wide matched volume, and resolution outcome for each condition | fills_v1, polygon_contract_events_v3 | [DATA_DICTIONARY.md](../derived_data/condition_summary_v1/DATA_DICTIONARY.md) | `condition_id` |
-| account_condition_summary_v1 | `$ACCOUNT_CONDITION_SUMMARY_V1_DIR` | [derived_data/account_condition_summary_v1/](../derived_data/account_condition_summary_v1/) | Per-partition summary of how one account traded one condition: fill count, account-specific volume, fees, timing | fills_v1 | [DATA_DICTIONARY.md](../derived_data/account_condition_summary_v1/DATA_DICTIONARY.md) | `account, condition_id` |
-| account_summary_v1 | `$ACCOUNT_SUMMARY_V1_DIR` | [derived_data/account_summary_v1/](../derived_data/account_summary_v1/) | Per-partition behavioral profile for each account: fill count, condition breadth, volume, fees, timing, and entropy metrics | fills_v1 | [DATA_DICTIONARY.md](../derived_data/account_summary_v1/DATA_DICTIONARY.md) | `account` |
+| condition_by_block_v1 | `$CONDITION_BY_BLOCK_V1_DIR` | [derived_data/condition_by_block_v1/](../derived_data/condition_by_block_v1/) | Per-block OHLC YES price and market-wide matched volume and fees for each condition | fills_v1 | [DATA_DICTIONARY.md](../derived_data/condition_by_block_v1/DATA_DICTIONARY.md) | `block_number, condition_id` |
+| condition_by_10k_v1 | `$CONDITION_BY_10K_V1_DIR` | [derived_data/condition_by_10k_v1/](../derived_data/condition_by_10k_v1/) | Per-partition OHLC YES price, market-wide matched volume, and resolution outcome for each condition that traded or resolved in that 10K | fills_v1, polygon_contract_events_v3, token_id_map_v1 | [DATA_DICTIONARY.md](../derived_data/condition_by_10k_v1/DATA_DICTIONARY.md) | `condition_id` |
+| account_condition_by_10k_v1 | `$ACCOUNT_CONDITION_BY_10K_V1_DIR` | [derived_data/account_condition_by_10k_v1/](../derived_data/account_condition_by_10k_v1/) | Per-partition summary of how one account traded one condition: fill count, account-specific volume, fees, timing | fills_v1 | [DATA_DICTIONARY.md](../derived_data/account_condition_by_10k_v1/DATA_DICTIONARY.md) | `account, condition_id` |
+| account_by_10k_v1 | `$ACCOUNT_BY_10K_V1_DIR` | [derived_data/account_by_10k_v1/](../derived_data/account_by_10k_v1/) | Per-partition behavioral profile for each account: fill count, condition breadth, volume, fees, timing, and entropy metrics | fills_v1 | [DATA_DICTIONARY.md](../derived_data/account_by_10k_v1/DATA_DICTIONARY.md) | `account` |
 
 ## Adding a new dataset
 

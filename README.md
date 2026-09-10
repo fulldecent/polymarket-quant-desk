@@ -38,6 +38,10 @@ source .venv/bin/activate
 python raw_data/polygon_contract_events_v3/main.py
 python derived_data/token_id_map_v1/main.py
 python derived_data/fills_v1/main.py
+python derived_data/condition_by_block_v1/main.py
+python derived_data/condition_by_10k_v1/main.py
+python derived_data/account_condition_by_10k_v1/main.py
+python derived_data/account_by_10k_v1/main.py
 ```
 
 The full dependency graph for your pipeline is in the [data catalog](docs/Data%20catalog.md), and links to each dataset's data dictionary. These scripts all produce data in partitions of 10,000 blockchain blocks which is immutable and reproducible.

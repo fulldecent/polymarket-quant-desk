@@ -1,0 +1,33 @@
+# account_condition_by_10k_v1
+
+Per-partition summary of how one account traded one condition: fill count, account-specific volume, signed fill-flow, fees, and timing.
+
+See [DATA_DICTIONARY.md](DATA_DICTIONARY.md) for the full schema, row ordering, and guarantees.
+
+## How to run it
+
+```sh
+source .venv/bin/activate
+python derived_data/account_condition_by_10k_v1/main.py
+```
+
+```sh
+python derived_data/account_condition_by_10k_v1/main.py --dry-run
+python derived_data/account_condition_by_10k_v1/main.py --sample 10
+```
+
+## How to test it
+
+```sh
+source .venv/bin/activate
+python -m pytest derived_data/account_condition_by_10k_v1/tests/unit_tests -v
+python -m pytest derived_data/account_condition_by_10k_v1/tests/data_validation -v
+```
+
+## Upstream dependencies
+
+This dataset requires `fills_v1` to be materialized through the target partition.
+
+## Reproducibility
+
+Given identical source data, the producer will always generate Parquet files with the same rows in the same order within each partition.
