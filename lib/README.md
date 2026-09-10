@@ -16,6 +16,7 @@ Single source of truth for the 1M/10K nested partition scheme used by every data
 | `PARTITION_1M_LABEL`, `PARTITION_10K_LABEL` | directory labels (`"1M"`, `"10K"`) |
 | `partition_start(block)` / `partition_end(block)` | aligned start / inclusive end of the 10K partition containing a block |
 | `partition_dir(block)` | canonical relative dir, e.g. `"1M=33000000/10K=33600000"` |
+| `mask_partition(partition_start)` | screen form with the last four digits masked, e.g. `"8,45X,XXX"` |
 | `enumerate_partitions(start_block, frontier)` | every consecutive `(m, k)` partition from `start_block` up to the frontier, by block range (no gaps) — the canonical partition-planning primitive for derived producers |
 
 ### atomic_publish.py
@@ -53,7 +54,7 @@ Spec-compliant `metadata.json` provenance next to each `data.parquet` (see [Meta
 
 ### run_logging.py
 
-Operator-facing console and log contract for partition-producing derived jobs. Screen is the cockpit: paths, work plan, a two-row sticky footer (current partition with DuckDB % + Total progress), occasional heartbeat, honest end summary. The UTC log file is the full record; every screen line is also in the file. Per-partition chatter stays file-only. (The raw scraper uses a separate status-line renderer and does not use this module.)
+Operator-facing console and log contract for partition-producing derived jobs. Screen is the cockpit: bold `output:` path, `log:` path, blank line, work plan, a two-row sticky footer (current partition with DuckDB % + Total progress), one `-> partition` line per sunk 10K, honest end summary. Input, scratch, and hot paths are log-only. (The raw scraper uses a separate status-line renderer and does not use this module.)
 
 | name | description |
 |---|---|
@@ -61,8 +62,9 @@ Operator-facing console and log contract for partition-producing derived jobs. S
 | `RunStatus` | two-row Live footer: current partition/phase (percent + elapsed) above Total progress |
 | `PhaseWork(status, prefix)` | names a footer phase (`10K=N  building`) and runs SQL with DuckDB `query_progress` |
 | `configure_duckdb_progress(con)` | enable DuckDB progress tracking without stderr bars |
-| `PartitionHeartbeat(out, row_noun=...)` | periodic `-> partitions: N  <noun>: M  T.Ts` line above the footer |
-| `print_paths` / `print_work_plan` / `print_run_summary` | startup paths, one work-plan line, end-of-run summary |
+| `print_paths(out, output=..., extra=...)` | bold `output:` + `log:` on screen; extra paths to the run log only |
+| `print_partition_sunk(out, partition, rows, elapsed)` | `-> partition 8,45X,XXX  rows ##  0.4s` after each published 10K |
+| `print_work_plan` / `print_run_summary` | one work-plan line, end-of-run summary |
 | `setup_logging(logger_name, script_file, console=None)` | file-only UTC logger; `console` is ignored. Prefer `RunOutput` in producers |
 
 ### ct_helpers.py

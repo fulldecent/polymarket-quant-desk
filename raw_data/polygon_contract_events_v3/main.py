@@ -101,6 +101,7 @@ sys.path.insert(0, str(_project_root))
 
 from lib.env import require_directory_env  # noqa: E402
 from lib.git_utils import assert_git_clean  # noqa: E402
+from lib.partition_utils import mask_partition  # noqa: E402
 
 from _internal.chunk_planner import ChunkPlanner
 from _internal.epoch_optimizer import MAX_WORKERS, EpochOptimizer
@@ -315,19 +316,6 @@ console = Console(
 _print_lock = threading.Lock()
 
 
-def _mask_partition(partition_start: int) -> str:
-    """Render a 10K partition start with its four variable digits masked: ``92,93X,XXX``."""
-    out: list[str] = []
-    masked = 0
-    for ch in reversed(f"{partition_start:,}"):
-        if ch.isdigit() and masked < 4:
-            out.append("X")
-            masked += 1
-        else:
-            out.append(ch)
-    return "".join(reversed(out))
-
-
 class JSONLRunLogger:
     """Write machine-readable run events to a per-run JSONL file."""
 
@@ -388,6 +376,12 @@ def _describe_rpc_endpoint(url: str) -> str:
 
     key = max(candidates, key=lambda c: (_shannon_entropy(c), len(c)))
     return f"{host} {key[:3]}...{key[-3:]}"
+
+
+def _tuning_suffix(optimizer: EpochOptimizer, planner: ChunkPlanner) -> str:
+    """``  threads ##  max blks/req ##`` for the scrape sticky line and speed updates."""
+    max_blks = planner.next_span(optimizer.params.result_budget)
+    return f"  threads {optimizer.params.workers}  max blks/req {max_blks:,}"
 
 
 # Footer rows, top to bottom. The overall run bar sits at the very bottom.
@@ -890,14 +884,10 @@ def _print_banner(
     total_gap_blocks: int,
     unsunk_ranges: int,
 ) -> None:
-    """Print the once-per-run startup summary above the live status line.
+    """Print the once-per-run startup banner above the live status line.
 
-    Items shown:
-
-        * absolute paths in use;
-        * progress of the sunk and loaded frontiers;
-        * chain head;
-        * gap list (truncated to a few entries) with total backlog size.
+    Screen shows ``output:`` (cold root, bold), ``log:``, and a blank line.
+    Hot, scratch, frontiers, and gap detail go to the run log only.
     """
     now = datetime.now(timezone.utc).isoformat()
     banner_lines = [
@@ -934,13 +924,10 @@ def _print_banner(
         banner_lines.append("blocks to scrape:     0 (caught up)")
     banner_lines.append("")
 
-    # Only the paths go on screen; the frontier/gap detail belongs in the run log.
-    console.print(
-        f"hot database:         {db_path} ({_file_size_str(db_path)})", highlight=False
-    )
-    console.print(f"raw:                  {cold_root}", highlight=False)
-    console.print(f"scratch:              {scratch_dir}", highlight=False)
-    console.print(f"log:                  {log_path}", highlight=False)
+    # Screen: output + log + blank line. Hot, scratch, and frontier detail stay in the run log.
+    _print_message(Text(f"output: {cold_root}", style="bold"))
+    _print_message(f"log:    {log_path}")
+    _print_message("")
     for line in banner_lines:
         _log_event("banner", line)
 
@@ -1137,7 +1124,7 @@ def main() -> None:
                                elapsed_ms=None, message="", partition=None):
             if partition is not None:
                 status_ui.spinner(
-                    "startup", f"Finding sunk partition {_mask_partition(partition)}"
+                    "startup", f"Finding sunk partition {mask_partition(partition)}"
                 )
 
         try:
@@ -1157,7 +1144,7 @@ def main() -> None:
                                elapsed_ms=None, message="", partition=None):
             if partition is not None:
                 status_ui.spinner(
-                    "startup", f"Touching up sunk partition {_mask_partition(partition)}"
+                    "startup", f"Touching up sunk partition {mask_partition(partition)}"
                 )
 
         try:
@@ -1184,7 +1171,7 @@ def main() -> None:
             if partition is not None:
                 status_ui.spinner(
                     "startup",
-                    f"Cleaning temporary files for partition {_mask_partition(partition)}",
+                    f"Cleaning temporary files for partition {mask_partition(partition)}",
                 )
 
         try:
@@ -1240,7 +1227,7 @@ def main() -> None:
             if op == "sink" and phase == "copy" and partition is not None:
                 status_ui.bar(
                     "partition",
-                    f"Sinking partition {_mask_partition(partition)}",
+                    f"Sinking partition {mask_partition(partition)}",
                     rows_done or 0,
                     rows_total or 1,
                 )
@@ -1388,7 +1375,7 @@ def main() -> None:
                 )
                 status_ui.bar(
                     "partition",
-                    f"Partition {_mask_partition(partition_start_now)}",
+                    f"Partition {mask_partition(partition_start_now)}",
                     partition_loaded,
                     PARTITION_SIZE_10K,
                 )
@@ -1399,7 +1386,9 @@ def main() -> None:
                 run_seconds = time.monotonic() - run_start
                 rate = blocks_done / run_seconds if run_seconds > 0 else 0.0
                 status_ui.spinner(
-                    "scrape", f"Scraping {endpoint_label}  {rate:,.0f} blk/s"
+                    "scrape",
+                    f"Scraping {endpoint_label}  {rate:,.0f} blk/s"
+                    f"{_tuning_suffix(optimizer, planner)}",
                 )
             else:
                 status_ui.clear("scrape")
@@ -1530,7 +1519,11 @@ def main() -> None:
                     if optimizer.record_ok(
                         blocks=chunk_span, logs=raw_log_count, elapsed_sec=elapsed_s
                     ):
-                        _print_message(f"  ramp -> {optimizer.params.describe()}")
+                        _print_message(
+                            f"Scraping {endpoint_label} updating speed"
+                            f"{_tuning_suffix(optimizer, planner)}"
+                        )
+                        _log_event("ramp", optimizer.params.describe())
                     _refresh_bars()
                     sf = store.get_sunk_frontier()
 
@@ -1584,7 +1577,11 @@ def main() -> None:
                     )
                     _return_chunk(pending_ranges, chunk)
                     optimizer.record_timeout()
-                    _print_message(f"  backing off -> {optimizer.params.describe()}")
+                    _print_message(
+                        f"Scraping {endpoint_label} backing off"
+                        f"{_tuning_suffix(optimizer, planner)}"
+                    )
+                    _log_event("backoff", optimizer.params.describe())
 
                 elif status == "throttled":
                     http_status = result.get("http_status")
@@ -1595,7 +1592,11 @@ def main() -> None:
                     )
                     _return_chunk(pending_ranges, chunk)
                     optimizer.record_throttled(http_status)
-                    _print_message(f"  backing off -> {optimizer.params.describe()}")
+                    _print_message(
+                        f"Scraping {endpoint_label} backing off"
+                        f"{_tuning_suffix(optimizer, planner)}"
+                    )
+                    _log_event("backoff", optimizer.params.describe())
 
                 elif status == "fatal":
                     fatal_reason = (

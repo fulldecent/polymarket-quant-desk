@@ -96,10 +96,10 @@ from lib.partition_utils import (  # noqa: E402
     partition_end,
 )
 from lib.run_logging import (  # noqa: E402
-    PartitionHeartbeat,
     PhaseWork,
     RunOutput,
     configure_duckdb_progress,
+    print_partition_sunk,
     print_paths,
     print_run_summary,
     print_work_plan,
@@ -1299,12 +1299,11 @@ def main() -> None:
     none_below = SCRAPE_START_BLOCK - 1
     print_paths(
         out,
-        [
+        output=OUT_DIR,
+        extra=[
             ("raw", RAW),
             ("token_id_map", TOKEN_MAP),
-            ("output", OUT_DIR),
             ("scratch", SCRATCH_DIR),
-            ("log", str(out.log_path)),
         ],
     )
 
@@ -1429,7 +1428,6 @@ def main() -> None:
     processed = 0
     rows_done = 0
     status = "OK"
-    heartbeat = PartitionHeartbeat(out, row_noun="fill legs")
     with out.status:
         out.status.total(0, len(todo))
         load = PhaseWork(out.status, "Loading token cache")
@@ -1454,6 +1452,7 @@ def main() -> None:
                 break
             work = PhaseWork(out.status, f"10K={k_val:,}")
             work.phase("building")
+            t0 = time.monotonic()
             row_count = process_chunk(
                 con,
                 m_val,
@@ -1466,12 +1465,11 @@ def main() -> None:
                 profile_output_dir=profile_output_dir,
                 work=work,
             )
+            print_partition_sunk(out, k_val, row_count, time.monotonic() - t0)
             processed += 1
             rows_done += row_count
-            heartbeat.update(rows=row_count, done=processed, total=len(todo))
             out.status.total(processed, len(todo))
         out.status.clear_partition()
-    heartbeat.flush()
     if _stop_event.is_set():
         status = "interrupted"
 

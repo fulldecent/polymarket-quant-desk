@@ -1,11 +1,11 @@
 """Operator-facing console and log contract for partition-producing derived jobs.
 
-Screen is the cockpit: paths, one work-plan line, a two-row sticky footer
-(current partition + Total progress), occasional heartbeats, and an honest end
-summary. No log-level chrome.
+Screen is the cockpit: a two-line banner (output path, log path), one work-plan
+line, a two-row sticky footer (current partition + Total progress), one line per
+sunk partition, and an honest end summary. No log-level chrome.
 
 The log file is the full record (UTC). Every screen line is also in the file.
-Per-partition chatter stays file-only.
+Input, scratch, and hot paths are log-only.
 
 The raw scraper uses a separate status-line renderer and does not use this module.
 """
@@ -36,13 +36,11 @@ from rich.progress import (
 from rich.text import Text
 from rich.theme import Theme
 
+from .partition_utils import mask_partition
+
 COLOR_DONE = "green"
 COLOR_TODO = "magenta"
 
-HEARTBEAT_EVERY_N = 50
-HEARTBEAT_EVERY_SEC = 10.0
-
-_LABEL_WIDTH = 22
 _DUCKDB_PROGRESS_POLL_SEC = 0.2
 
 
@@ -368,64 +366,36 @@ class RunOutput:
         self.log.log(level, message)
 
 
-class PartitionHeartbeat:
-    """Periodic ``-> partitions: N  <noun>: M  T.Ts`` line above the footer.
+def print_partition_sunk(
+    out: RunOutput,
+    partition: int,
+    rows: int,
+    elapsed: float,
+) -> None:
+    """One scrolling line after a 10K partition is published."""
+    line = Text("  -> partition ")
+    line.append(mask_partition(partition), style=COLOR_DONE)
+    line.append(f"  rows {rows:,}  {elapsed:.1f}s")
+    out.print(line)
 
-    Prints after ``HEARTBEAT_EVERY_N`` partitions, after ``HEARTBEAT_EVERY_SEC``
-    seconds, and when the run's last partition completes. Counts in each line
-    are since the previous heartbeat. Does not emit while a partition is still
-    running — the partition footer row is the liveness signal then.
+
+def print_paths(
+    out: RunOutput,
+    *,
+    output: str,
+    extra: list[tuple[str, str]] | None = None,
+) -> None:
+    """Startup banner: bold output path, log path, blank line.
+
+    Input, scratch, and hot paths belong in ``extra`` and are written to the run
+    log only.
     """
-
-    def __init__(
-        self,
-        out: RunOutput,
-        *,
-        row_noun: str = "rows",
-        every_n: int = HEARTBEAT_EVERY_N,
-        every_sec: float = HEARTBEAT_EVERY_SEC,
-    ) -> None:
-        self._out = out
-        self._row_noun = row_noun
-        self._every_n = every_n
-        self._every_sec = every_sec
-        self._batch_n = 0
-        self._batch_rows = 0
-        self._batch_t0 = time.monotonic()
-
-    def update(self, *, rows: int, done: int, total: int) -> None:
-        self._batch_n += 1
-        self._batch_rows += rows
-        now = time.monotonic()
-        due = (
-            done == total
-            or self._batch_n >= self._every_n
-            or (now - self._batch_t0) >= self._every_sec
-        )
-        if due:
-            self._emit(now)
-
-    def flush(self) -> None:
-        """Emit a partial batch (e.g. on interrupt). No-op when already printed."""
-        if self._batch_n == 0:
-            return
-        self._emit(time.monotonic())
-
-    def _emit(self, now: float) -> None:
-        elapsed = now - self._batch_t0
-        line = Text("  -> partitions: ")
-        line.append(f"{self._batch_n:,}", style=COLOR_DONE)
-        line.append(f"  {self._row_noun}: {self._batch_rows:,}  {elapsed:.1f}s")
-        self._out.print(line)
-        self._batch_n = 0
-        self._batch_rows = 0
-        self._batch_t0 = now
-
-
-def print_paths(out: RunOutput, items: list[tuple[str, str]]) -> None:
-    """Print labeled absolute paths (and the log path) at startup."""
-    for label, value in items:
-        out.print(f"{label + ':':<{_LABEL_WIDTH}}{value}")
+    out.print(Text(f"output: {output}", style="bold"))
+    out.print(f"log:    {out.log_path}")
+    out.print("")
+    if extra:
+        for label, value in extra:
+            out.log_only(f"{label}: {value}")
 
 
 def print_work_plan(

@@ -36,6 +36,19 @@ def partition_dir(block: int) -> str:
     return f"{PARTITION_1M_LABEL}={m_val}/{PARTITION_10K_LABEL}={start}"
 
 
+def mask_partition(partition_start: int) -> str:
+    """Render a 10K partition start with its four variable digits masked: ``92,93X,XXX``."""
+    out: list[str] = []
+    masked = 0
+    for ch in reversed(f"{partition_start:,}"):
+        if ch.isdigit() and masked < 4:
+            out.append("X")
+            masked += 1
+        else:
+            out.append(ch)
+    return "".join(reversed(out))
+
+
 def enumerate_partitions(start_block: int, frontier: int) -> list[tuple[int, int]]:
     """Every consecutive 10K partition from ``start_block`` up to the frontier.
 
@@ -72,6 +85,8 @@ def _self_test() -> int:
     check("partition_start(33_605_403)", partition_start(33_605_403), 33_600_000)
     check("partition_end(33_605_403)", partition_end(33_605_403), 33_609_999)
     check("partition_dir(33_605_403)", partition_dir(33_605_403), "1M=33000000/10K=33600000")
+    check("mask_partition(84_530_000)", mask_partition(84_530_000), "84,53X,XXX")
+    check("mask_partition(8_450_000)", mask_partition(8_450_000), "8,45X,XXX")
     # A frontier on a partition's last block includes that partition; one block short excludes it.
     check(
         "enumerate_partitions(33_605_403, 33_629_999)",
