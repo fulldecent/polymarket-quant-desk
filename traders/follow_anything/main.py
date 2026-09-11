@@ -18,7 +18,7 @@ from traders.lib.streams import (  # noqa: E402
     EXEC_CHOICES,
     LISTEN_CHOICES,
     SETTLEMENT_TIMEOUT_SECONDS,
-    exchange_is_neg_risk,
+    event_is_neg_risk,
     execution_client,
     extract_buy_trigger,
     is_live_trigger,
@@ -247,7 +247,7 @@ async def run(args: argparse.Namespace) -> int:
                 result = await client.buy_market(
                     trigger["buy_token_id"],
                     args.amount,
-                    neg_risk=exchange_is_neg_risk(event.contract_address),
+                    neg_risk=event_is_neg_risk(event),
                 )
             except Exception as exc:
                 ui.print(f"copy_failed  error={exc}")
@@ -322,7 +322,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    raise SystemExit(asyncio.run(run(args)))
+    try:
+        raise SystemExit(asyncio.run(run(args)))
+    except KeyboardInterrupt:
+        raise SystemExit(130)
 
 
 if __name__ == "__main__":

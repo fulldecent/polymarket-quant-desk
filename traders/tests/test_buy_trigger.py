@@ -11,6 +11,7 @@ sys.path.insert(0, str(_project_root))
 from exchange_client.lib.event_stream import TradeEvent  # noqa: E402
 from exchange_client.lib.event_stream import MempoolTradeEvent  # noqa: E402
 from traders.lib.streams import (  # noqa: E402
+    event_is_neg_risk,
     exchange_is_neg_risk,
     extract_buy_trigger,
     is_live_trigger,
@@ -53,6 +54,20 @@ def test_taker_pays_usdc_is_a_buy():
     assert trig is not None
     assert trig["buyer"] == "0x" + "bb" * 20
     assert trig["buy_token_id"] == TOKEN
+
+
+def test_empty_buyer_is_not_a_trigger():
+    event = _event(maker_asset="0", taker_asset=TOKEN, maker_amt="0", taker_amt="1")
+    object.__setattr__(event, "maker", "")
+    object.__setattr__(event, "taker", "")
+    assert extract_buy_trigger(event) is None
+
+
+def test_event_neg_risk_flag_or_contract():
+    event = _event(maker_asset="0", taker_asset=TOKEN, maker_amt="1", taker_amt="1")
+    assert not event_is_neg_risk(event)
+    object.__setattr__(event, "neg_risk", True)
+    assert event_is_neg_risk(event)
 
 
 def test_token_token_is_not_a_buy():

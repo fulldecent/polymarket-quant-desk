@@ -194,34 +194,22 @@ class PolynodeExecutionClient:
             "headers": headers,
         }
 
-        try:
-            response = await asyncio.to_thread(
-                requests.post,
-                f"{self._cosigner_url}/submit",
-                headers={
-                    "Content-Type": "application/json",
-                    "X-PolyNode-Key": self._polynode_key,
-                },
-                json=payload,
-                timeout=30,
+        response = await asyncio.to_thread(
+            requests.post,
+            f"{self._cosigner_url}/submit",
+            headers={
+                "Content-Type": "application/json",
+                "X-PolyNode-Key": self._polynode_key,
+            },
+            json=payload,
+            timeout=30,
+        )
+        if response.status_code != 200:
+            detail = (response.text or "")[:300]
+            raise RuntimeError(
+                f"polynode submit HTTP {response.status_code}: {detail}"
             )
-            response.raise_for_status()
-            raw = response.json()
-        except Exception as exc:
-            response_body = ""
-            response_status = ""
-            try:
-                response_status = str(response.status_code)  # type: ignore[name-defined]
-                response_body = response.text  # type: ignore[name-defined]
-            except Exception:
-                pass
-            print(f"[PolynodeExecutionClient] buy_market request failed: {exc}")
-            if response_status:
-                print(f"[PolynodeExecutionClient] Response status: {response_status}")
-            if response_body:
-                print(f"[PolynodeExecutionClient] Response body: {response_body[:2000]}")
-            print(f"[PolynodeExecutionClient] Signed order: {serialized}")
-            raise
+        raw = response.json()
 
         tx_hashes: list[str] = []
         for x in raw.get("transactionsHashes", []) or []:

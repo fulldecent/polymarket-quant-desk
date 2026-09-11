@@ -263,7 +263,12 @@ def _build_trade_fields(data: dict) -> dict | None:
         "tokens_json": json.dumps(data.get("tokens") or {}, separators=(",", ":")),
         "outcome": _str_from_keys(data, "outcome", default=""),
         "tick_size": _str_from_keys(data, "tick_size", default=""),
-        "neg_risk": bool(data.get("neg_risk", False)),
+        "neg_risk": bool(
+            data.get("neg_risk")
+            or data.get("negativeRisk")
+            or data.get("negative_risk")
+            or (representative_fill or {}).get("neg_risk")
+        ),
     }
 
 

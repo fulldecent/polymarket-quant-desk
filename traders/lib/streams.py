@@ -104,6 +104,12 @@ def exchange_is_neg_risk(address: str) -> bool:
     return address.lower() in _NEG_RISK_EXCHANGES
 
 
+def event_is_neg_risk(event: TradeEvent | MempoolTradeEvent) -> bool:
+    if bool(getattr(event, "neg_risk", False)):
+        return True
+    return exchange_is_neg_risk(getattr(event, "contract_address", "") or "")
+
+
 def is_live_trigger(
     event: TradeEvent | MempoolTradeEvent, *, after_block: int
 ) -> bool:
@@ -120,14 +126,16 @@ def is_live_trigger(
 
 def extract_buy_trigger(event: TradeEvent | MempoolTradeEvent) -> dict | None:
     if event.maker_asset_id == "0" and event.taker_asset_id not in {"", "0"}:
-        buyer = event.maker
         buy_token = event.taker_asset_id
         raw_usdc = event.maker_amount
+        buyer = event.maker or event.taker
     elif event.taker_asset_id == "0" and event.maker_asset_id not in {"", "0"}:
-        buyer = event.taker
         buy_token = event.maker_asset_id
         raw_usdc = event.taker_amount
+        buyer = event.taker or event.maker
     else:
+        return None
+    if not buyer:
         return None
     try:
         trade_value_usd = float(raw_usdc) / 1e6
