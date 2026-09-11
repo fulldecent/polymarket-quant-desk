@@ -36,6 +36,20 @@ def _is_our_copy_fill(event: TradeEvent, token_id: str, ours: set[str]) -> bool:
     return event.maker_asset_id == token_id or event.taker_asset_id == token_id
 
 
+def _pending_is_settled(pending: dict) -> bool:
+    expected = pending["expected"]
+    if not expected:
+        return bool(pending["landed"])
+    return pending["landed"] == expected
+
+
+def _pending_tx_label(pending: dict) -> str:
+    if pending["expected"]:
+        return shorten(next(iter(pending["expected"])))
+    order_id = pending.get("order_id") or ""
+    return shorten(order_id) if order_id else "none"
+
+
 def _drop(queue: asyncio.Queue) -> int:
     n = 0
     while True:
@@ -134,7 +148,7 @@ async def run(args: argparse.Namespace) -> int:
             if trig_block:
                 lag = event.block_number - trig_block
             pending["lag"] = lag
-            if pending["landed"] == pending["expected"]:
+            if _pending_is_settled(pending):
                 lags.append(lag)
                 last_lag = "none" if lag is None else str(lag)
                 settled_n += 1
@@ -174,7 +188,7 @@ async def run(args: argparse.Namespace) -> int:
                 if time.monotonic() - pending["submitted_at"] > SETTLEMENT_TIMEOUT_SECONDS:
                     ui.print(
                         f"timeout  seq={settled_n + 1}  "
-                        f"tx={shorten(next(iter(pending['expected'])))}  "
+                        f"tx={_pending_tx_label(pending)}  "
                         f"timeout={SETTLEMENT_TIMEOUT_SECONDS}s"
                     )
                     pending = None
@@ -249,6 +263,7 @@ async def run(args: argparse.Namespace) -> int:
             pending = {
                 "trigger_tx": tx,
                 "token_id": trigger["buy_token_id"],
+                "order_id": result.order_id or "",
                 "expected": expected,
                 "landed": set(),
                 "submitted_at": time.monotonic(),
