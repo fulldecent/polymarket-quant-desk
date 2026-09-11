@@ -68,37 +68,15 @@ async def run(args: argparse.Namespace) -> int:
     clob = trading_lib.build_client()
     exec_client = execution_client(args.exec)
     started = time.monotonic()
-    try:
-        trading_lib.get_usdc_balance(clob)
-    except Exception as exc:
-        if "401" in str(exc):
-            ui.print("clob l2 key rejected; deriving from EOA")
-            try:
-                creds = trading_lib.derive_clob_api_creds(clob)
-                ui.print(f"clob l2 key derived  api_key={creds.api_key[:8]}…")
-                ui.print(
-                    "update CLOB_API_KEY / CLOB_SECRET / CLOB_PASS_PHRASE in .env to keep it"
-                )
-            except Exception as derive_exc:
-                ui.print(f"clob derive failed  error={derive_exc}")
-        else:
-            ui.log_only(f"clob probe: {exc}")
     stream = None
-    if has_write and not args.dry_run:
-        stream = settled_stream(args.listen, on_status=ui.print)
-        ui.print(f"connecting listen={args.listen}  host={listen_host(args.listen)}")
-        try:
-            await stream.connect()
-        except Exception as exc:
-            ui.closing(
-                f"status=failed  error={type(exc).__name__}: {exc}",
-                time.monotonic() - started,
-            )
-            return 1
 
     try:
         _print_usdc(ui, clob, account)
         _print_snapshot(ui, clob, account)
+
+        if not has_write:
+            ui.closing("status=ok  snapshot", time.monotonic() - started)
+            return 0
 
         expected: list[str] = []
 
@@ -137,10 +115,6 @@ async def run(args: argparse.Namespace) -> int:
             expected.extend(hashes)
             ui.print(f"merge submitted  txs={len(hashes)}")
 
-        if not has_write:
-            ui.closing("status=ok  snapshot", time.monotonic() - started)
-            return 0
-
         if args.dry_run or not expected:
             ui.closing(
                 f"status=ok  txs=0  dry_run={str(args.dry_run).lower()}",
@@ -148,7 +122,17 @@ async def run(args: argparse.Namespace) -> int:
             )
             return 0
 
-        assert stream is not None
+        stream = settled_stream(args.listen, on_status=ui.print)
+        ui.print(f"connecting listen={args.listen}  host={listen_host(args.listen)}")
+        try:
+            await stream.connect()
+        except Exception as exc:
+            ui.closing(
+                f"status=ok  txs={len(expected)}  listen_failed={type(exc).__name__}: {exc}",
+                time.monotonic() - started,
+            )
+            return 0
+
         landed = await _wait_hashes(ui, stream, args.listen, expected)
         missing = len(expected) - landed
         if missing:
@@ -235,11 +219,22 @@ def _print_snapshot(ui: TraderUI, client, account: str) -> None:
     try:
         orders = trading_lib.fetch_open_orders(client)
     except Exception as exc:
-        ui.print(
-            "open_orders unavailable  "
-            f"error={trading_lib.explain_api_error('CLOB API', trading_lib.get_clob_api_url(), exc)}"
-        )
-        return
+        if "401" in str(exc):
+            try:
+                trading_lib.derive_clob_api_creds(client)
+                orders = trading_lib.fetch_open_orders(client)
+            except Exception as exc2:
+                ui.print(
+                    "open_orders unavailable  "
+                    f"error={trading_lib.explain_api_error('CLOB API', client.host, exc2)}"
+                )
+                return
+        else:
+            ui.print(
+                "open_orders unavailable  "
+                f"error={trading_lib.explain_api_error('CLOB API', client.host, exc)}"
+            )
+            return
 
     ui.print(f"open_orders: {len(orders)}")
     for o in orders:
