@@ -158,7 +158,12 @@ def os_account() -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Watch live fills. No orders.")
-    parser.add_argument("--listen", required=True, choices=LISTEN_CHOICES)
+    parser.add_argument(
+        "--listen",
+        choices=LISTEN_CHOICES,
+        default="rpc",
+        help="settled fill source (default: rpc)",
+    )
     parser.add_argument(
         "--trigger-polynode-mempool",
         action="store_true",

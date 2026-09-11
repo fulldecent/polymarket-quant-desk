@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import AsyncIterator, Protocol
+from urllib.parse import urlparse, urlunparse
 
 from eth_abi.abi import decode as abi_decode
 
@@ -331,30 +332,45 @@ def _decode_v2(
     return None
 
 
+def _http_rpc_to_ws(http_url: str) -> str | None:
+    """Known HTTPS→WSS rewrites. Same-host https→wss is not a WebSocket."""
+    lowered = http_url.lower()
+    if lowered.startswith("ws://") or lowered.startswith("wss://"):
+        return http_url
+    if "infura.io" in lowered:
+        return (
+            http_url.replace("https://", "wss://")
+            .replace("http://", "ws://")
+            .replace("/v3/", "/ws/v3/")
+        )
+    parsed = urlparse(http_url)
+    host = (parsed.hostname or "").lower()
+    # Chainstack dedicated: https://nd-x-y-z.p2pify.com/KEY
+    #                     → wss://ws-nd-x-y-z.p2pify.com/KEY
+    if host.endswith(".p2pify.com") and host.startswith("nd-"):
+        return urlunparse(
+            ("wss", "ws-" + (parsed.netloc), parsed.path, "", parsed.query, "")
+        )
+    return None
+
+
 def ws_url_from_env(ws_url: str, http_url: str) -> str:
     """Resolve a Polygon JSON-RPC WebSocket URL.
 
-    Uses POLYGON_WS_URL when set. Infura HTTP URLs can be rewritten to
-    ``/ws/v3/``. Other HTTPS RPC endpoints (Chainstack, dRPC, …) are not
-    WebSockets — do not flip https→wss.
+    Uses POLYGON_WS_URL when set. Infura and Chainstack HTTPS URLs have a
+    documented WSS twin. Other HTTPS RPC endpoints are not WebSockets.
     """
     import sys
 
     if ws_url:
         return ws_url
     if http_url:
-        lowered = http_url.lower()
-        if lowered.startswith("ws://") or lowered.startswith("wss://"):
-            return http_url
-        if "infura.io" in lowered:
-            return (
-                http_url.replace("https://", "wss://")
-                .replace("http://", "ws://")
-                .replace("/v3/", "/ws/v3/")
-            )
+        converted = _http_rpc_to_ws(http_url)
+        if converted:
+            return converted
+        host = urlparse(http_url).hostname or "the configured RPC host"
         sys.exit(
             "POLYGON_WS_URL is required for --listen rpc. "
-            f"POLYGON_RPC_URL ({http_url!r}) is HTTPS JSON-RPC, not a WebSocket "
-            "(servers return HTTP 405 if you rewrite it to wss://)."
+            f"{host} is HTTPS JSON-RPC, not a WebSocket."
         )
     sys.exit("POLYGON_WS_URL or POLYGON_RPC_URL not set")
