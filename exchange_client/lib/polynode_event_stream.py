@@ -13,9 +13,12 @@ import asyncio
 import json
 import zlib
 from decimal import Decimal, InvalidOperation
+from collections.abc import Callable
 from typing import AsyncIterator
 
 import websockets
+
+StatusFn = Callable[[str], None]
 
 from .event_stream import MempoolTradeEvent, TradeEvent, v2_maker_taker_assets
 
@@ -271,16 +274,31 @@ class PolynodeMempoolEventStream:
         self,
         api_key: str,
         ws_url: str = "wss://ws.polynode.dev/ws",
+        *,
+        on_status: StatusFn | None = None,
     ) -> None:
         self._api_key = api_key
         self._ws_url = ws_url
+        self._on_status = on_status
         self._ws = None
         self._queue: asyncio.Queue[MempoolTradeEvent] = asyncio.Queue()
         self._listen_task: asyncio.Task | None = None
+        self._ready = asyncio.Event()
+
+    def _status(self, message: str) -> None:
+        if self._on_status is not None:
+            self._on_status(message)
 
     async def connect(self) -> None:
         if self._listen_task is None or self._listen_task.done():
+            self._ready.clear()
             self._listen_task = asyncio.create_task(self._listen_loop())
+        try:
+            await asyncio.wait_for(self._ready.wait(), timeout=20)
+        except TimeoutError as exc:
+            raise ConnectionError(
+                "polynode mempool listen failed: subscribe did not complete"
+            ) from exc
 
     async def disconnect(self) -> None:
         if self._listen_task is not None:
@@ -318,6 +336,8 @@ class PolynodeMempoolEventStream:
                     self._ws = ws
                     reconnect_delay = 1.0
                     await ws.send(json.dumps({"action": "subscribe", "type": "settlements"}))
+                    self._ready.set()
+                    self._status("connected listen=polynode mempool")
                     async for raw in ws:
                         msg = _decode_message(raw)
                         if msg is None:
@@ -330,7 +350,10 @@ class PolynodeMempoolEventStream:
             except asyncio.CancelledError:
                 raise
 
-            except Exception:
+            except Exception as exc:
+                self._status(
+                    f"listen error={type(exc).__name__}: {exc}  retry={reconnect_delay:.0f}s mempool"
+                )
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 60)
 
@@ -350,16 +373,31 @@ class PolynodeSettledEventStream:
         self,
         api_key: str,
         ws_url: str = "wss://ws.polynode.dev/ws",
+        *,
+        on_status: StatusFn | None = None,
     ) -> None:
         self._api_key = api_key
         self._ws_url = ws_url
+        self._on_status = on_status
         self._ws = None
         self._queue: asyncio.Queue[TradeEvent] = asyncio.Queue()
         self._listen_task: asyncio.Task | None = None
+        self._ready = asyncio.Event()
+
+    def _status(self, message: str) -> None:
+        if self._on_status is not None:
+            self._on_status(message)
 
     async def connect(self) -> None:
         if self._listen_task is None or self._listen_task.done():
+            self._ready.clear()
             self._listen_task = asyncio.create_task(self._listen_loop())
+        try:
+            await asyncio.wait_for(self._ready.wait(), timeout=20)
+        except TimeoutError as exc:
+            raise ConnectionError(
+                "polynode settled listen failed: subscribe did not complete"
+            ) from exc
 
     async def disconnect(self) -> None:
         if self._listen_task is not None:
@@ -397,6 +435,8 @@ class PolynodeSettledEventStream:
                     self._ws = ws
                     reconnect_delay = 1.0
                     await ws.send(json.dumps({"action": "subscribe", "type": "settlements"}))
+                    self._ready.set()
+                    self._status("connected listen=polynode settled")
                     async for raw in ws:
                         msg = _decode_message(raw)
                         if msg is None:
@@ -409,7 +449,10 @@ class PolynodeSettledEventStream:
             except asyncio.CancelledError:
                 raise
 
-            except Exception:
+            except Exception as exc:
+                self._status(
+                    f"listen error={type(exc).__name__}: {exc}  retry={reconnect_delay:.0f}s settled"
+                )
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 60)
 

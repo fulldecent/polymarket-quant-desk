@@ -19,6 +19,7 @@ from traders.lib.streams import (  # noqa: E402
     LISTEN_CHOICES,
     SETTLEMENT_TIMEOUT_SECONDS,
     execution_client,
+    listen_host,
     settled_stream,
 )
 from traders.lib.ui import TraderUI, format_hms, shorten  # noqa: E402
@@ -65,73 +66,90 @@ async def run(args: argparse.Namespace) -> int:
     clob = trading_lib.build_client()
     exec_client = execution_client(args.exec)
     started = time.monotonic()
+    stream = None
+    if not args.dry_run:
+        stream = settled_stream(args.listen, on_status=ui.print)
+        ui.print(f"connecting listen={args.listen}  host={listen_host(args.listen)}")
+        try:
+            await stream.connect()
+        except Exception as exc:
+            ui.closing(
+                f"status=failed  error={type(exc).__name__}: {exc}",
+                time.monotonic() - started,
+            )
+            return 1
 
     try:
-        usdc = trading_lib.get_usdc_balance(clob)
-        ui.print(f"usdc={trading_lib.fmt_usd(usdc)}")
-    except Exception as exc:
-        ui.print(f"usdc=unavailable  error={exc}")
+        try:
+            usdc = trading_lib.get_usdc_balance(clob)
+            ui.print(f"usdc={trading_lib.fmt_usd(usdc)}")
+        except Exception as exc:
+            ui.print(f"usdc=unavailable  error={exc}")
 
-    _print_snapshot(ui, clob, account)
+        _print_snapshot(ui, clob, account)
 
-    expected: list[str] = []
+        expected: list[str] = []
 
-    if args.cancel_orders:
-        ui.print("cancel_orders submitted")
-        trading_lib.cancel_all_orders(clob, dry_run=args.dry_run)
+        if args.cancel_orders:
+            ui.print("cancel_orders submitted")
+            trading_lib.cancel_all_orders(clob, dry_run=args.dry_run)
 
-    if args.limit_sell is not None:
-        trading_lib.cancel_all_orders(clob, dry_run=args.dry_run)
-        ui.print(f"limit_sell offset={args.limit_sell:g} ttl={args.limit_sell_ttl}s")
-        trading_lib.create_limit_sell_orders(
-            clob,
-            account,
-            offset_pct=args.limit_sell,
-            ttl_seconds=args.limit_sell_ttl,
-            dry_run=args.dry_run,
-        )
+        if args.limit_sell is not None:
+            trading_lib.cancel_all_orders(clob, dry_run=args.dry_run)
+            ui.print(f"limit_sell offset={args.limit_sell:g} ttl={args.limit_sell_ttl}s")
+            trading_lib.create_limit_sell_orders(
+                clob,
+                account,
+                offset_pct=args.limit_sell,
+                ttl_seconds=args.limit_sell_ttl,
+                dry_run=args.dry_run,
+            )
 
-    if args.market_sell:
-        if args.dry_run:
-            ui.print("market_sell dry-run")
-        else:
-            ui.print("market_sell submitted")
-            results = trading_lib.dump_all_positions(clob, account)
-            for row in results:
-                if row.get("status") == "ok":
-                    expected.extend(_extract_tx_hashes(row.get("response")))
+        if args.market_sell:
+            if args.dry_run:
+                ui.print("market_sell dry-run")
+            else:
+                ui.print("market_sell submitted")
+                results = trading_lib.dump_all_positions(clob, account)
+                for row in results:
+                    if row.get("status") == "ok":
+                        expected.extend(_extract_tx_hashes(row.get("response")))
 
-    if args.redeem:
-        hashes = await exec_client.redeem_positions(account, dry_run=args.dry_run)
-        expected.extend(hashes)
-        ui.print(f"redeem submitted  txs={len(hashes)}")
+        if args.redeem:
+            hashes = await exec_client.redeem_positions(account, dry_run=args.dry_run)
+            expected.extend(hashes)
+            ui.print(f"redeem submitted  txs={len(hashes)}")
 
-    if args.merge:
-        hashes = await exec_client.merge_positions(account, dry_run=args.dry_run)
-        expected.extend(hashes)
-        ui.print(f"merge submitted  txs={len(hashes)}")
+        if args.merge:
+            hashes = await exec_client.merge_positions(account, dry_run=args.dry_run)
+            expected.extend(hashes)
+            ui.print(f"merge submitted  txs={len(hashes)}")
 
-    if args.dry_run or not expected:
+        if args.dry_run or not expected:
+            ui.closing(
+                f"status=ok  txs=0  dry_run={str(args.dry_run).lower()}",
+                time.monotonic() - started,
+            )
+            return 0
+
+        assert stream is not None
+        landed = await _wait_hashes(ui, stream, args.listen, expected)
+        missing = len(expected) - landed
+        if missing:
+            ui.closing(
+                f"status=failed  timeout={SETTLEMENT_TIMEOUT_SECONDS}s  "
+                f"landed={landed}  missing={missing}",
+                time.monotonic() - started,
+            )
+            return 1
         ui.closing(
-            f"status=ok  txs=0  dry_run={str(args.dry_run).lower()}",
+            f"status=ok  landed={landed}  txs={len(expected)}",
             time.monotonic() - started,
         )
         return 0
-
-    landed = await _wait_hashes(ui, args.listen, expected, started)
-    missing = len(expected) - landed
-    if missing:
-        ui.closing(
-            f"status=failed  timeout={SETTLEMENT_TIMEOUT_SECONDS}s  "
-            f"landed={landed}  missing={missing}",
-            time.monotonic() - started,
-        )
-        return 1
-    ui.closing(
-        f"status=ok  landed={landed}  txs={len(expected)}",
-        time.monotonic() - started,
-    )
-    return 0
+    finally:
+        if stream is not None:
+            await stream.disconnect()
 
 
 def _print_snapshot(ui: TraderUI, client, account: str) -> None:
@@ -155,13 +173,11 @@ def _print_snapshot(ui: TraderUI, client, account: str) -> None:
 
 async def _wait_hashes(
     ui: TraderUI,
+    stream,
     listen: str,
     tx_hashes: list[str],
-    started: float,
 ) -> int:
     wanted = {x.lower() for x in tx_hashes if x}
-    stream = settled_stream(listen)
-    await stream.connect()
     landed: set[str] = set()
     wait_started = time.monotonic()
     ui.start_footer(
@@ -196,7 +212,6 @@ async def _wait_hashes(
     finally:
         ticker.cancel()
         ui.stop_footer()
-        await stream.disconnect()
     return len(landed)
 
 

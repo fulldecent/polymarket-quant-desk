@@ -17,6 +17,7 @@ sys.path.insert(0, str(_project_root))
 from exchange_client.lib import trading_lib  # noqa: E402
 from traders.lib.streams import (  # noqa: E402
     LISTEN_CHOICES,
+    listen_host,
     mempool_stream,
     outcome_token_id,
     settled_stream,
@@ -32,32 +33,56 @@ async def run(args: argparse.Namespace) -> int:
     mempool_flag = "  mempool" if args.trigger_polynode_mempool else ""
     ui.opening(f"watch_only  listen={args.listen}{mempool_flag}", account=account)
 
-    listen = settled_stream(args.listen)
-    trigger = mempool_stream() if args.trigger_polynode_mempool else None
-    await listen.connect()
-    if trigger is not None:
-        await trigger.connect()
-
+    ui.print(f"connecting listen={args.listen}  host={listen_host(args.listen)}")
+    listen = settled_stream(args.listen, on_status=ui.print)
+    trigger = (
+        mempool_stream(on_status=ui.print) if args.trigger_polynode_mempool else None
+    )
     started = time.monotonic()
+    try:
+        await listen.connect()
+        if trigger is not None:
+            await trigger.connect()
+    except Exception as exc:
+        ui.closing(
+            f"status=failed  error={type(exc).__name__}: {exc}",
+            time.monotonic() - started,
+        )
+        return 1
+
     fills = 0
     last_block = 0
+    last_event_at = 0.0
     block_fills: dict[int, list] = defaultdict(list)
     mempool_seen = 0
     stop = asyncio.Event()
 
     async def _listen_loop() -> None:
-        nonlocal fills, last_block
+        nonlocal fills, last_block, last_event_at
         async for event in listen:
             if stop.is_set():
                 return
             fills += 1
             last_block = event.block_number
-            bucket = block_fills[event.block_number]
-            bucket.append(event)
-            # emit when we leave a block (next block arrives)
+            last_event_at = time.monotonic()
+            block_fills[event.block_number].append(event)
             prior = sorted(b for b in block_fills if b < event.block_number)
             for b in prior:
                 _emit_block(ui, b, block_fills.pop(b))
+
+    async def _idle_flush() -> None:
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=0.5)
+                return
+            except asyncio.TimeoutError:
+                pass
+            if not block_fills or last_event_at == 0:
+                continue
+            if time.monotonic() - last_event_at < 2.0:
+                continue
+            newest = max(block_fills)
+            _emit_block(ui, newest, block_fills.pop(newest))
 
     async def _mempool_loop() -> None:
         nonlocal mempool_seen
@@ -87,6 +112,7 @@ async def run(args: argparse.Namespace) -> int:
     tasks = [
         asyncio.create_task(_listen_loop()),
         asyncio.create_task(_footer_loop()),
+        asyncio.create_task(_idle_flush()),
     ]
     if trigger is not None:
         tasks.append(asyncio.create_task(_mempool_loop()))

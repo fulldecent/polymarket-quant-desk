@@ -20,6 +20,7 @@ from traders.lib.streams import (  # noqa: E402
     SETTLEMENT_TIMEOUT_SECONDS,
     cleared_price,
     execution_client,
+    listen_host,
     settled_stream,
 )
 from traders.lib.ui import TraderUI, format_hms, shorten  # noqa: E402
@@ -38,76 +39,87 @@ async def run(args: argparse.Namespace) -> int:
 
     client = execution_client(args.exec)
     started = time.monotonic()
-
-    ui.print(f"warmup token={shorten(args.token_id, head=4, tail=4)}")
-    await client.warmup(args.token_id)
-
-    max_price = 0.0 if args.worst_price is None else args.worst_price
+    stream = settled_stream(args.listen, on_status=ui.print)
+    ui.print(f"connecting listen={args.listen}  host={listen_host(args.listen)}")
     try:
-        result = await client.buy_market(
-            args.token_id, args.amount, max_price=max_price
-        )
+        await stream.connect()
     except Exception as exc:
         ui.closing(
-            f"status=failed  error={exc}",
+            f"status=failed  error={type(exc).__name__}: {exc}",
             time.monotonic() - started,
         )
         return 1
 
-    tx = result.tx_hashes[0] if result.tx_hashes else ""
-    order = result.order_id or ""
-    ui.print(f"submitted order={shorten(order)}  tx={shorten(tx)}")
-    ui.log_only(f"order_response {result.raw_response!r}")
+    try:
+        ui.print(f"warmup token={shorten(args.token_id, head=4, tail=4)}")
+        await client.warmup(args.token_id)
 
-    if not result.success:
+        max_price = 0.0 if args.worst_price is None else args.worst_price
+        try:
+            result = await client.buy_market(
+                args.token_id, args.amount, max_price=max_price
+            )
+        except Exception as exc:
+            ui.closing(
+                f"status=failed  error={exc}",
+                time.monotonic() - started,
+            )
+            return 1
+
+        tx = result.tx_hashes[0] if result.tx_hashes else ""
+        order = result.order_id or ""
+        ui.print(f"submitted order={shorten(order)}  tx={shorten(tx)}")
+        ui.log_only(f"order_response {result.raw_response!r}")
+
+        if not result.success:
+            ui.closing(
+                f"status=failed  error=order_rejected  order={shorten(order)}",
+                time.monotonic() - started,
+            )
+            return 1
+        if not result.tx_hashes:
+            ui.closing(
+                f"status=failed  error=no_tx_hash  order={shorten(order)}",
+                time.monotonic() - started,
+            )
+            return 1
+
+        settlement = await _wait_for_fill(
+            ui,
+            stream=stream,
+            listen=args.listen,
+            tx_hashes=result.tx_hashes,
+            token_id=args.token_id,
+        )
+        if settlement is None:
+            ui.closing(
+                f"status=failed  timeout={SETTLEMENT_TIMEOUT_SECONDS}s  "
+                f"order={shorten(order)}  tx={shorten(tx)}",
+                time.monotonic() - started,
+            )
+            return 1
+
+        price = settlement.get("cleared_price")
+        price_s = f"{price:.6f}" if price is not None else "none"
         ui.closing(
-            f"status=failed  error=order_rejected  order={shorten(order)}",
+            f"status=ok  order={shorten(order)}  block={settlement['block']:,}  "
+            f"cleared={price_s}  tx={shorten(settlement['tx_hash'])}",
             time.monotonic() - started,
         )
-        return 1
-    if not result.tx_hashes:
-        ui.closing(
-            f"status=failed  error=no_tx_hash  order={shorten(order)}",
-            time.monotonic() - started,
-        )
-        return 1
-
-    settlement = await _wait_for_fill(
-        ui,
-        listen=args.listen,
-        tx_hashes=result.tx_hashes,
-        token_id=args.token_id,
-        started=started,
-    )
-    if settlement is None:
-        ui.closing(
-            f"status=failed  timeout={SETTLEMENT_TIMEOUT_SECONDS}s  "
-            f"order={shorten(order)}  tx={shorten(tx)}",
-            time.monotonic() - started,
-        )
-        return 1
-
-    price = settlement.get("cleared_price")
-    price_s = f"{price:.6f}" if price is not None else "none"
-    ui.closing(
-        f"status=ok  order={shorten(order)}  block={settlement['block']:,}  "
-        f"cleared={price_s}  tx={shorten(settlement['tx_hash'])}",
-        time.monotonic() - started,
-    )
-    return 0
+        return 0
+    finally:
+        await stream.disconnect()
 
 
 async def _wait_for_fill(
     ui: TraderUI,
     *,
+    stream,
     listen: str,
     tx_hashes: list[str],
     token_id: str,
-    started: float,
 ) -> dict | None:
     wanted = {x.lower() for x in tx_hashes if x}
-    stream = settled_stream(listen)
-    await stream.connect()
     tx_show = shorten(next(iter(tx_hashes)))
     wait_started = time.monotonic()
     ui.start_footer(
@@ -144,7 +156,6 @@ async def _wait_for_fill(
     finally:
         ticker.cancel()
         ui.stop_footer()
-        await stream.disconnect()
 
 
 def parse_args() -> argparse.Namespace:

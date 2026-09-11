@@ -20,6 +20,7 @@ from traders.lib.streams import (  # noqa: E402
     SETTLEMENT_TIMEOUT_SECONDS,
     execution_client,
     extract_buy_trigger,
+    listen_host,
     mempool_stream,
     settled_stream,
 )
@@ -41,14 +42,24 @@ async def run(args: argparse.Namespace) -> int:
     )
 
     client = execution_client(args.exec)
-    listen = settled_stream(args.listen)
-    mempool = mempool_stream() if args.trigger_polynode_mempool else None
-    await listen.connect()
-    if mempool is not None:
-        await mempool.connect()
-
     started = time.monotonic()
-    next_ready = started + args.warmup_seconds
+    listen = settled_stream(args.listen, on_status=ui.print)
+    mempool = (
+        mempool_stream(on_status=ui.print) if args.trigger_polynode_mempool else None
+    )
+    ui.print(f"connecting listen={args.listen}  host={listen_host(args.listen)}")
+    try:
+        await listen.connect()
+        if mempool is not None:
+            await mempool.connect()
+    except Exception as exc:
+        ui.closing(
+            f"status=failed  error={type(exc).__name__}: {exc}",
+            time.monotonic() - started,
+        )
+        return 1
+
+    next_ready = time.monotonic() + args.warmup_seconds
     settled_n = 0
     lags: list[int | None] = []
     last_lag = "none"

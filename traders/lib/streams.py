@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
+from urllib.parse import urlparse
 
 from exchange_client.lib import trading_lib
 from exchange_client.lib.event_stream import (
@@ -27,25 +29,39 @@ LISTEN_CHOICES = ("rpc", "polynode")
 EXEC_CHOICES = ("clob", "polynode")
 SETTLEMENT_TIMEOUT_SECONDS = 60
 
+StatusFn = Callable[[str], None]
 
-def settled_stream(listen: str) -> SettledTradeStream:
+
+def listen_host(listen: str) -> str:
+    if listen == "rpc":
+        raw = os.environ.get("POLYGON_WS_URL") or os.environ.get("POLYGON_RPC_URL") or ""
+    else:
+        raw = os.environ.get("POLYNODE_WS_URL") or "wss://ws.polynode.dev/ws"
+    return urlparse(raw).hostname or "unset"
+
+
+def settled_stream(listen: str, *, on_status: StatusFn | None = None) -> SettledTradeStream:
     if listen == "rpc":
         ws_url = ws_url_from_env(
             os.environ.get("POLYGON_WS_URL", ""),
             os.environ.get("POLYGON_RPC_URL", ""),
         )
-        return RpcSettledEventStream(ws_url)
+        return RpcSettledEventStream(ws_url, on_status=on_status)
     if listen == "polynode":
         api_key = trading_lib.require_env("POLYNODE_API_KEY")
         ws_url = os.environ.get("POLYNODE_WS_URL", "wss://ws.polynode.dev/ws")
-        return PolynodeSettledEventStream(api_key=api_key, ws_url=ws_url)
+        return PolynodeSettledEventStream(
+            api_key=api_key, ws_url=ws_url, on_status=on_status
+        )
     raise ValueError(f"unknown --listen {listen!r}")
 
 
-def mempool_stream() -> TradeMempoolStream:
+def mempool_stream(*, on_status: StatusFn | None = None) -> TradeMempoolStream:
     api_key = trading_lib.require_env("POLYNODE_API_KEY")
     ws_url = os.environ.get("POLYNODE_WS_URL", "wss://ws.polynode.dev/ws")
-    return PolynodeMempoolEventStream(api_key=api_key, ws_url=ws_url)
+    return PolynodeMempoolEventStream(
+        api_key=api_key, ws_url=ws_url, on_status=on_status
+    )
 
 
 def execution_client(name: str) -> ExecutionClient:
