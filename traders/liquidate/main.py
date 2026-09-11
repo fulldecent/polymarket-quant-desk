@@ -55,9 +55,11 @@ async def run(args: argparse.Namespace) -> int:
         actions.append("merge")
     if args.dry_run:
         actions.append("dry-run")
+    has_write = bool(actions)
     ui.opening(
         f"liquidate  exec={args.exec}  listen={args.listen}  "
-        f"order-book=clob  redeem/merge={args.exec}  actions={','.join(actions)}",
+        f"order-book=clob  redeem/merge={args.exec}  "
+        f"actions={','.join(actions) if actions else 'snapshot'}",
         account=account,
     )
     ui.print(f"order-book: clob")
@@ -67,7 +69,7 @@ async def run(args: argparse.Namespace) -> int:
     exec_client = execution_client(args.exec)
     started = time.monotonic()
     stream = None
-    if not args.dry_run:
+    if has_write and not args.dry_run:
         stream = settled_stream(args.listen, on_status=ui.print)
         ui.print(f"connecting listen={args.listen}  host={listen_host(args.listen)}")
         try:
@@ -125,6 +127,10 @@ async def run(args: argparse.Namespace) -> int:
             expected.extend(hashes)
             ui.print(f"merge submitted  txs={len(hashes)}")
 
+        if not has_write:
+            ui.closing("status=ok  snapshot", time.monotonic() - started)
+            return 0
+
         if args.dry_run or not expected:
             ui.closing(
                 f"status=ok  txs=0  dry_run={str(args.dry_run).lower()}",
@@ -162,13 +168,53 @@ def _print_snapshot(ui: TraderUI, client, account: str) -> None:
         ]
         orders = trading_lib.fetch_open_orders(client)
         mergeable = trading_lib.find_mergeable_pairs(account)
-        ui.print(
-            f"snapshot  positions={len(open_positions)}  "
-            f"redeemable={len(redeemable)}  mergeable={len(mergeable)}  "
-            f"open_orders={len(orders)}"
-        )
     except Exception as exc:
         ui.print(f"snapshot unavailable  error={exc}")
+        return
+
+    total = sum(float(p.get("currentValue", 0)) for p in open_positions)
+    ui.print(f"positions: {len(open_positions)} ({trading_lib.fmt_usd(total)})")
+    for p in open_positions:
+        outcome = str(p.get("outcome", "?"))
+        if len(outcome) > 6:
+            outcome = outcome[:5] + "…"
+        title = str(p.get("title", "?"))
+        if len(title) > 50:
+            title = title[:49] + "…"
+        ui.print(
+            f"  {trading_lib.fmt_usd(float(p.get('currentValue', 0))):>8}  "
+            f"{outcome:6}  {title}"
+        )
+    if not open_positions:
+        ui.print("  none")
+
+    ui.print(f"redeemable: {len(redeemable)}")
+    for p in redeemable:
+        title = str(p.get("title", "?"))
+        if len(title) > 50:
+            title = title[:49] + "…"
+        ui.print(
+            f"  {trading_lib.fmt_usd(float(p.get('currentValue', 0))):>8}  {title}"
+        )
+
+    recover = sum(float(m.get("recover_usd", 0)) for m in mergeable)
+    ui.print(f"mergeable: {len(mergeable)} ({trading_lib.fmt_usd(recover)})")
+    for m in mergeable:
+        title = str(m.get("title", "?"))
+        if len(title) > 50:
+            title = title[:49] + "…"
+        ui.print(f"  {trading_lib.fmt_usd(float(m.get('recover_usd', 0))):>8}  {title}")
+
+    ui.print(f"open_orders: {len(orders)}")
+    for o in orders:
+        side = o.get("side", "?")
+        price = float(o.get("price", 0))
+        original = float(o.get("original_size", 0) or o.get("size", 0))
+        matched = float(o.get("size_matched", 0) or o.get("sizeMatched", 0) or 0)
+        remaining = original - matched
+        ui.print(
+            f"  {side:4} {remaining:>8,.2f} @ {trading_lib.fmt_usd(price)}"
+        )
 
 
 async def _wait_hashes(
@@ -217,7 +263,8 @@ async def _wait_hashes(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Cancel, sell, redeem, or merge our exposure."
+        description="Cancel, sell, redeem, or merge our exposure. "
+        "With no action flags, print a snapshot of current positions."
     )
     parser.add_argument("--exec", required=True, choices=EXEC_CHOICES)
     parser.add_argument("--listen", required=True, choices=LISTEN_CHOICES)
@@ -238,20 +285,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--redeem", action="store_true")
     parser.add_argument("--merge", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args()
-    if not any(
-        [
-            args.cancel_orders,
-            args.limit_sell is not None,
-            args.market_sell,
-            args.redeem,
-            args.merge,
-        ]
-    ):
-        parser.error(
-            "at least one of --cancel-orders --limit-sell --market-sell --redeem --merge"
-        )
-    return args
+    return parser.parse_args()
 
 
 def main() -> None:

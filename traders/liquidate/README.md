@@ -10,4 +10,4 @@ python traders/liquidate/main.py --exec {clob,polynode} --listen {rpc,polynode} 
   [--cancel-orders] [--limit-sell PCT] [--limit-sell-ttl DUR] [--market-sell] [--redeem] [--merge] [--dry-run]
 ```
 
-At least one action flag is required.
+With no action flags, prints a snapshot of positions, redeemable, mergeable, and open orders and exits. Listen is not opened.
