@@ -55,6 +55,11 @@ async def run(args: argparse.Namespace) -> int:
         actions.append("redeem")
     if args.merge:
         actions.append("merge")
+    if args.wrap is not None:
+        if args.wrap == "all":
+            actions.append("wrap=all")
+        else:
+            actions.append(f"wrap={args.wrap}")
     if args.dry_run:
         actions.append("dry-run")
     has_write = bool(actions)
@@ -124,6 +129,50 @@ async def run(args: argparse.Namespace) -> int:
             hashes = await exec_client.merge_positions(account, dry_run=args.dry_run)
             expected.extend(hashes)
             ui.print(f"merge submitted  txs={len(hashes)}")
+
+        if args.wrap is not None:
+            wrap_usd = None if args.wrap == "all" else float(args.wrap)
+            amount_s = "all" if wrap_usd is None else trading_lib.fmt_usd(wrap_usd)
+            ui.print("")
+            ui.print(f"wrap         {amount_s} USDC.e → pUSD")
+            ui.start_footer("wrapping  usdc.e → pUSD")
+            try:
+                result = await asyncio.to_thread(
+                    trading_lib.wrap_usdce_to_pusd,
+                    account,
+                    amount_usd=wrap_usd,
+                    dry_run=args.dry_run,
+                )
+            except Exception as exc:
+                ui.print(f"wrap failed  error={exc}")
+                ui.closing(
+                    f"status=failed  error={exc}",
+                    time.monotonic() - started,
+                )
+                return 1
+            finally:
+                ui.stop_footer()
+            expected.extend(result.tx_hashes)
+            tx = result.tx_hashes[0] if result.tx_hashes else ""
+            for label in result.labels:
+                ui.print(f"  {label}")
+            if result.dry_run:
+                ui.print(
+                    f"wrap dry-run  calls={result.tx_count}  "
+                    f"pUSD={trading_lib.fmt_usd(result.pusd_after)}  "
+                    f"usdc.e={trading_lib.fmt_usd(result.usdce_after)}"
+                )
+            elif not result.tx_hashes:
+                ui.print(
+                    f"wrap none    pUSD={trading_lib.fmt_usd(result.pusd_after)}  "
+                    f"usdc.e={trading_lib.fmt_usd(result.usdce_after)}"
+                )
+            else:
+                ui.print(
+                    f"wrap mined   tx={shorten(tx)}  "
+                    f"pUSD={trading_lib.fmt_usd(result.pusd_after)}  "
+                    f"usdc.e={trading_lib.fmt_usd(result.usdce_after)}"
+                )
 
         if args.dry_run or not expected:
             ui.closing(
@@ -198,21 +247,26 @@ def _position_line(p: dict) -> Text:
 
 def _print_usdc(ui: TraderUI, client, account: str) -> None:
     try:
-        usdc = trading_lib.get_usdc_balance_via_rpc(account)
-        line = Text("usdc        ")
-        line.append(trading_lib.fmt_usd(usdc), style=COLOR_DONE)
+        pusd = trading_lib.get_pusd_balance_via_rpc(account)
+        usdce = trading_lib.get_usdc_balance_via_rpc(account)
+        line = Text("pUSD        ")
+        line.append(trading_lib.fmt_usd(pusd), style=COLOR_DONE)
+        ui.print(line)
+        line = Text("usdc.e      ")
+        line.append(trading_lib.fmt_usd(usdce), style=COLOR_DONE)
         ui.print(line)
         return
     except Exception as rpc_exc:
-        ui.log_only(f"usdc via rpc failed: {rpc_exc}")
+        ui.log_only(f"collateral via rpc failed: {rpc_exc}")
     try:
         usdc = trading_lib.get_usdc_balance(client)
-        line = Text("usdc        ")
+        line = Text("pUSD        ")
         line.append(trading_lib.fmt_usd(usdc), style=COLOR_DONE)
         ui.print(line)
+        ui.print(Text("usdc.e      unavailable", style="dim"))
     except Exception as exc:
         ui.print(
-            "usdc=unavailable  "
+            "pUSD=unavailable  "
             f"error={trading_lib.explain_api_error('CLOB API', trading_lib.get_clob_api_url(), exc)}"
         )
 
@@ -345,7 +399,7 @@ async def _wait_hashes(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Cancel, sell, redeem, or merge our exposure. "
+        description="Cancel, sell, redeem, merge, or wrap USDC.e to pUSD. "
         "With no action flags, print a snapshot of current positions."
     )
     parser.add_argument("--exec", required=True, choices=EXEC_CHOICES)
@@ -366,8 +420,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--market-sell", action="store_true")
     parser.add_argument("--redeem", action="store_true")
     parser.add_argument("--merge", action="store_true")
+    parser.add_argument(
+        "--wrap",
+        nargs="?",
+        const="all",
+        metavar="USD",
+        help="wrap USDC.e into pUSD for CLOB v2 (default: entire USDC.e balance)",
+    )
     parser.add_argument("--dry-run", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.wrap not in (None, "all"):
+        try:
+            amount = float(args.wrap)
+        except ValueError:
+            parser.error("--wrap must be a USD amount, or omitted to wrap all")
+        if amount <= 0:
+            parser.error("--wrap amount must be > 0")
+        args.wrap = f"{amount:g}"
+    return args
 
 
 def main() -> None:

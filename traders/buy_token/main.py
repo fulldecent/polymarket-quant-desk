@@ -12,6 +12,8 @@ from pathlib import Path
 _project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_project_root))
 
+from rich.text import Text  # noqa: E402
+
 from exchange_client.lib import trading_lib  # noqa: E402
 from exchange_client.lib.event_stream import TradeEvent  # noqa: E402
 from traders.lib.streams import (  # noqa: E402
@@ -23,7 +25,23 @@ from traders.lib.streams import (  # noqa: E402
     listen_host,
     settled_stream,
 )
-from traders.lib.ui import TraderUI, format_hms, shorten  # noqa: E402
+from traders.lib.ui import COLOR_DONE, TraderUI, format_hms, shorten  # noqa: E402
+
+# CLOB v2 FOK buy of $2 posted as 2.005990 pUSD (taker fee). Keep a 1% buffer
+# when wrapping just enough USDC.e to cover the order.
+_WRAP_FEE_BUFFER = 1.01
+
+
+def _print_collateral(ui: TraderUI, account: str) -> tuple[float, float]:
+    pusd = trading_lib.get_pusd_balance_via_rpc(account)
+    usdce = trading_lib.get_usdc_balance_via_rpc(account)
+    line = Text("pUSD        ")
+    line.append(trading_lib.fmt_usd(pusd), style=COLOR_DONE)
+    ui.print(line)
+    line = Text("usdc.e      ")
+    line.append(trading_lib.fmt_usd(usdce), style=COLOR_DONE)
+    ui.print(line)
+    return pusd, usdce
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -34,11 +52,75 @@ async def run(args: argparse.Namespace) -> int:
     ui.opening(account=account)
     ui.log_only(
         f"exec={args.exec}  listen={args.listen}  amount={args.amount:.2f}  "
-        f"worst_price={worst}"
+        f"worst_price={worst}  wrap={str(args.wrap).lower()}"
     )
 
-    client = execution_client(args.exec)
     started = time.monotonic()
+    try:
+        pusd, usdce = _print_collateral(ui, account)
+    except Exception as exc:
+        ui.closing(
+            f"status=failed  error={exc}",
+            time.monotonic() - started,
+        )
+        return 1
+
+    needed = args.amount
+    if pusd + 1e-9 < needed:
+        if not args.wrap:
+            ui.closing(
+                f"status=failed  error=pUSD {trading_lib.fmt_usd(pusd)} "
+                f"need {trading_lib.fmt_usd(needed)}; "
+                f"USDC.e {trading_lib.fmt_usd(usdce)} is not CLOB v2 collateral. "
+                "Wrap: python traders/liquidate/main.py --exec clob --listen rpc --wrap",
+                time.monotonic() - started,
+            )
+            return 1
+        wrap_usd = round((needed - pusd) * _WRAP_FEE_BUFFER, 6)
+        if wrap_usd < 0.01:
+            wrap_usd = 0.01
+        if usdce + 1e-9 < wrap_usd:
+            ui.closing(
+                f"status=failed  error=need {trading_lib.fmt_usd(wrap_usd)} pUSD, "
+                f"have pUSD {trading_lib.fmt_usd(pusd)} and "
+                f"USDC.e {trading_lib.fmt_usd(usdce)}",
+                time.monotonic() - started,
+            )
+            return 1
+        ui.print(f"wrap         {trading_lib.fmt_usd(wrap_usd)} USDC.e → pUSD")
+        ui.start_footer("wrapping  usdc.e → pUSD")
+        try:
+            result = await asyncio.to_thread(
+                trading_lib.wrap_usdce_to_pusd,
+                account,
+                amount_usd=wrap_usd,
+                dry_run=False,
+            )
+        except Exception as exc:
+            ui.closing(
+                f"status=failed  error={exc}",
+                time.monotonic() - started,
+            )
+            return 1
+        finally:
+            ui.stop_footer()
+        for label in result.labels:
+            ui.print(f"  {label}")
+        tx = result.tx_hashes[0] if result.tx_hashes else ""
+        ui.print(
+            f"wrap mined   tx={shorten(tx)}  "
+            f"pUSD={trading_lib.fmt_usd(result.pusd_after)}"
+        )
+        pusd = result.pusd_after
+        if pusd + 1e-9 < needed:
+            ui.closing(
+                f"status=failed  error=pUSD {trading_lib.fmt_usd(pusd)} "
+                f"after wrap, need {trading_lib.fmt_usd(needed)}",
+                time.monotonic() - started,
+            )
+            return 1
+
+    client = execution_client(args.exec)
     stream = settled_stream(args.listen, on_status=ui.print)
     ui.print(f"connecting listen={args.listen}  host={listen_host(args.listen)}")
     try:
@@ -184,6 +266,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         metavar="P",
         help="worst acceptable fill price per share (default: no cap)",
+    )
+    parser.add_argument(
+        "--wrap",
+        action="store_true",
+        help="wrap just enough USDC.e → pUSD before the buy (CLOB v2 collateral)",
     )
     args = parser.parse_args()
     if not args.token_id:

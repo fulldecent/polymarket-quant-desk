@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -388,23 +389,73 @@ def get_usdc_balance(client: ClobClient) -> float:
     return float(result.get("balance", "0")) / 1e6
 
 
-def get_usdc_balance_via_rpc(address: str | None = None) -> float:
-    """Return the proxy wallet's USDC.e balance in dollars via Polygon RPC."""
+def _erc20_balance_raw(token: str, owner: str) -> int:
     rpc = get_polygon_rpc_url()
-    wallet = address or get_funder_address()
     cmd = [
         "cast",
         "call",
-        _USDC_E,
+        token,
         "balanceOf(address)(uint256)",
-        wallet,
+        owner,
         "--rpc-url",
         rpc,
     ]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if r.returncode != 0:
         raise RuntimeError(explain_rpc_error(rpc, r.stderr))
-    return _parse_cast_int(r.stdout) / 1e6
+    return _parse_cast_int(r.stdout)
+
+
+def _erc20_allowance_raw(token: str, owner: str, spender: str) -> int:
+    rpc = get_polygon_rpc_url()
+    cmd = [
+        "cast",
+        "call",
+        token,
+        "allowance(address,address)(uint256)",
+        owner,
+        spender,
+        "--rpc-url",
+        rpc,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError(explain_rpc_error(rpc, r.stderr))
+    return _parse_cast_int(r.stdout)
+
+
+def _erc1155_is_approved_for_all(token: str, owner: str, operator: str) -> bool:
+    rpc = get_polygon_rpc_url()
+    cmd = [
+        "cast",
+        "call",
+        token,
+        "isApprovedForAll(address,address)(bool)",
+        owner,
+        operator,
+        "--rpc-url",
+        rpc,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError(explain_rpc_error(rpc, r.stderr))
+    token = r.stdout.strip().split()[0].lower()
+    return token in {"true", "1"}
+
+
+def get_usdc_balance_via_rpc(address: str | None = None) -> float:
+    """Return the proxy wallet's USDC.e balance in dollars via Polygon RPC."""
+    wallet = address or get_funder_address()
+    return _erc20_balance_raw(_USDC_E, wallet) / 1e6
+
+
+def get_pusd_balance_via_rpc(address: str | None = None) -> float:
+    """Return the proxy wallet's pUSD balance in dollars via Polygon RPC.
+
+    CLOB v2 collateral is pUSD, not USDC.e.
+    """
+    wallet = address or get_funder_address()
+    return _erc20_balance_raw(_PUSD, wallet) / 1e6
 
 
 def get_usdc_balance_raw(client: ClobClient) -> str:
@@ -1288,10 +1339,34 @@ def build_relayer_client():
 _CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 _NEGRISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
 _USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+_PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+_COLLATERAL_ONRAMP = "0x93070a847efEf7F70739046A929D47a521F5B8ee"
+_CTF_EXCHANGE_V2 = "0xE111180000d2663C0091e4f400237545B87B996B"
+_NEGRISK_CTF_EXCHANGE_V2 = "0xe2222d279d744050d28e00520010520000310F59"
+_CTF_COLLATERAL_ADAPTER = "0xAdA100Db00Ca00073811820692005400218FcE1f"
+_NEGRISK_CTF_COLLATERAL_ADAPTER = "0xadA2005600Dec949baf300f4C6120000bDB6eAab"
 _MULTISEND_ADDRESS = "0xA238CBeb142c10Ef7Ad8442C6D1f9E89e07e7761"
 _ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 _CALL_OPERATION = 0
 _DELEGATECALL_OPERATION = 1
+_MAX_UINT256 = 2**256 - 1
+_UNLIMITED_ALLOWANCE = _MAX_UINT256 // 2
+
+# pUSD spenders the CLOB v2 matching engine and CTF adapters pull from.
+_PUSD_SPENDERS = (
+    _CTF_EXCHANGE_V2,
+    _NEGRISK_CTF_EXCHANGE_V2,
+    _CTF_COLLATERAL_ADAPTER,
+    _NEGRISK_CTF_COLLATERAL_ADAPTER,
+)
+# ConditionalTokens operators needed to sell / split / merge after the v2 cutover.
+_CTF_OPERATORS = (
+    _CTF_EXCHANGE_V2,
+    _NEGRISK_CTF_EXCHANGE_V2,
+    _NEGRISK_ADAPTER,
+    _CTF_COLLATERAL_ADAPTER,
+    _NEGRISK_CTF_COLLATERAL_ADAPTER,
+)
 
 
 def _keccak256(data: bytes) -> bytes:
@@ -2098,3 +2173,248 @@ def merge_positions(
         return merge_positions_rpc(user, dry_run=dry_run, condition_id=condition_id)
     else:
         sys.exit(f"Unknown merge method: {method!r} (use 'relayer' or 'rpc')")
+
+
+# ── Wrap USDC.e → pUSD (CLOB v2 collateral) ─────────────────────────────────
+#
+# CLOB v2 settles in pUSD. USDC.e on the Safe is inert for trading until it is
+# wrapped 1:1 via CollateralOnramp, then pUSD is approved to the v2 exchanges.
+
+
+@dataclass(frozen=True)
+class WrapResult:
+    tx_hashes: list[str]
+    wrapped_usd: float
+    pusd_after: float
+    usdce_after: float
+    tx_count: int
+    dry_run: bool
+    labels: tuple[str, ...] = ()
+
+
+def _usd_to_raw(amount_usd: float) -> int:
+    if amount_usd < 0:
+        raise ValueError(f"negative wrap amount: {amount_usd}")
+    return int(round(amount_usd * 1_000_000))
+
+
+def plan_wrap_and_v2_approvals(
+    owner: str,
+    *,
+    wrap_raw: int,
+    usdce_onramp_allowance: int,
+    pusd_allowances: dict[str, int],
+    ctf_approvals: dict[str, bool],
+) -> list[tuple[str, bytes, str]]:
+    """Build Safe calls: optional USDC.e approve + wrap, then missing v2 approvals."""
+    if wrap_raw < 0:
+        raise ValueError(f"negative wrap_raw: {wrap_raw}")
+    txs: list[tuple[str, bytes, str]] = []
+    if wrap_raw > 0:
+        if usdce_onramp_allowance < wrap_raw:
+            txs.append((
+                _USDC_E,
+                _cast_calldata(
+                    "approve(address,uint256)",
+                    _COLLATERAL_ONRAMP,
+                    str(_MAX_UINT256),
+                ),
+                "approve USDC.e → onramp",
+            ))
+        txs.append((
+            _COLLATERAL_ONRAMP,
+            _cast_calldata(
+                "wrap(address,address,uint256)",
+                _USDC_E,
+                owner,
+                str(wrap_raw),
+            ),
+            f"wrap {fmt_usd(wrap_raw / 1e6)} USDC.e → pUSD",
+        ))
+    for spender in _PUSD_SPENDERS:
+        if int(pusd_allowances.get(spender, 0)) >= _UNLIMITED_ALLOWANCE:
+            continue
+        txs.append((
+            _PUSD,
+            _cast_calldata(
+                "approve(address,uint256)",
+                spender,
+                str(_MAX_UINT256),
+            ),
+            f"approve pUSD → {spender[:6]}…{spender[-4:]}",
+        ))
+    for operator in _CTF_OPERATORS:
+        if ctf_approvals.get(operator):
+            continue
+        txs.append((
+            _CTF_ADDRESS,
+            _cast_calldata(
+                "setApprovalForAll(address,bool)",
+                operator,
+                "true",
+            ),
+            f"CTF setApprovalForAll {operator[:6]}…{operator[-4:]}",
+        ))
+    return txs
+
+
+def _fetch_wrap_chain_state(owner: str) -> dict:
+    return {
+        "usdce_raw": _erc20_balance_raw(_USDC_E, owner),
+        "pusd_raw": _erc20_balance_raw(_PUSD, owner),
+        "usdce_onramp_allowance": _erc20_allowance_raw(
+            _USDC_E, owner, _COLLATERAL_ONRAMP
+        ),
+        "pusd_allowances": {
+            spender: _erc20_allowance_raw(_PUSD, owner, spender)
+            for spender in _PUSD_SPENDERS
+        },
+        "ctf_approvals": {
+            operator: _erc1155_is_approved_for_all(_CTF_ADDRESS, owner, operator)
+            for operator in _CTF_OPERATORS
+        },
+    }
+
+
+def _relayer_execute(safe_txs: list, description: str) -> list[str]:
+    """Submit Safe txs via the builder relayer and wait until mined."""
+    relayer = build_relayer_client()
+    response = relayer.execute(safe_txs, description)
+    result = response.wait()
+    if result is None:
+        raise RuntimeError(f"relayer timed out: {description}")
+    state = str(result.get("state", "unknown"))
+    tx_hash = result.get("transactionHash")
+    failed = state.upper() in {
+        "STATE_FAILED",
+        "STATE_INVALID",
+        "FAILED",
+        "INVALID",
+    }
+    if failed:
+        raise RuntimeError(f"relayer {state}: {description}")
+    if not tx_hash:
+        raise RuntimeError(f"relayer {state} with no tx hash: {description}")
+    return [tx_hash]
+
+
+def _refresh_clob_v2_collateral() -> None:
+    """Ask CLOB to re-read on-chain pUSD so the next order sees the wrap."""
+    try:
+        from py_clob_client_v2 import AssetType as AssetTypeV2
+        from py_clob_client_v2 import BalanceAllowanceParams as BalanceAllowanceParamsV2
+
+        v2 = build_v2_client()
+        v2.update_balance_allowance(
+            BalanceAllowanceParamsV2(asset_type=AssetTypeV2.COLLATERAL)
+        )
+    except Exception:
+        return
+
+
+def wrap_usdce_to_pusd(
+    user: str | None = None,
+    *,
+    amount_usd: float | None = None,
+    dry_run: bool = False,
+) -> WrapResult:
+    """Wrap USDC.e on the Gnosis Safe into pUSD and set v2 CLOB approvals.
+
+    Args:
+        user: proxy wallet (funder). Defaults to POLYMARKET_PROXY_WALLET.
+        amount_usd: USDC.e to wrap. None wraps the entire USDC.e balance.
+        dry_run: plan the Safe txs without submitting.
+    """
+    from py_builder_relayer_client.models import OperationType, SafeTransaction
+
+    owner = user or get_funder_address()
+    state = _fetch_wrap_chain_state(owner)
+    usdce_raw = int(state["usdce_raw"])
+    if amount_usd is None:
+        wrap_raw = usdce_raw
+    else:
+        wrap_raw = _usd_to_raw(amount_usd)
+        if wrap_raw > usdce_raw:
+            raise RuntimeError(
+                f"wrap {fmt_usd(wrap_raw / 1e6)} exceeds USDC.e "
+                f"{fmt_usd(usdce_raw / 1e6)}"
+            )
+
+    txs = plan_wrap_and_v2_approvals(
+        owner,
+        wrap_raw=wrap_raw,
+        usdce_onramp_allowance=int(state["usdce_onramp_allowance"]),
+        pusd_allowances=state["pusd_allowances"],
+        ctf_approvals=state["ctf_approvals"],
+    )
+
+    log_event({
+        "action": "wrap_usdce_to_pusd",
+        "phase": "planned",
+        "wrap_raw": wrap_raw,
+        "tx_count": len(txs),
+        "labels": [label for _, _, label in txs],
+        "dry_run": dry_run,
+    })
+
+    labels = tuple(label for _, _, label in txs)
+    if dry_run or not txs:
+        pusd_after = (int(state["pusd_raw"]) + (wrap_raw if dry_run else 0)) / 1e6
+        usdce_after = (usdce_raw - (wrap_raw if dry_run else 0)) / 1e6
+        return WrapResult(
+            tx_hashes=[],
+            wrapped_usd=wrap_raw / 1e6 if txs else 0.0,
+            pusd_after=int(state["pusd_raw"]) / 1e6 if not dry_run else pusd_after,
+            usdce_after=usdce_raw / 1e6 if not dry_run else usdce_after,
+            tx_count=len(txs),
+            dry_run=dry_run,
+            labels=labels,
+        )
+
+    safe_txs = [
+        SafeTransaction(
+            to=target,
+            operation=OperationType.Call,
+            data="0x" + calldata.hex(),
+            value="0",
+        )
+        for target, calldata, _ in txs
+    ]
+
+    log_event({
+        "action": "wrap_usdce_to_pusd",
+        "phase": "submitted",
+        "wrap_raw": wrap_raw,
+        "tx_count": len(txs),
+    })
+
+    try:
+        hashes = _relayer_execute(safe_txs, "Wrap USDC.e to pUSD")
+    except Exception as exc:
+        log_event({
+            "action": "wrap_usdce_to_pusd",
+            "phase": "failed",
+            "error": str(exc),
+        })
+        raise
+
+    _refresh_clob_v2_collateral()
+    pusd_after = get_pusd_balance_via_rpc(owner)
+    usdce_after = get_usdc_balance_via_rpc(owner)
+    log_event({
+        "action": "wrap_usdce_to_pusd",
+        "phase": "completed",
+        "wrap_raw": wrap_raw,
+        "tx_hashes": hashes,
+        "pusd_after": pusd_after,
+        "usdce_after": usdce_after,
+    })
+    return WrapResult(
+        tx_hashes=hashes,
+        wrapped_usd=wrap_raw / 1e6,
+        pusd_after=pusd_after,
+        usdce_after=usdce_after,
+        tx_count=len(txs),
+        dry_run=False,
+        labels=labels,
+    )
