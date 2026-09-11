@@ -79,6 +79,7 @@ async def run(args: argparse.Namespace) -> int:
             return 0
 
         expected: list[str] = []
+        fill_hashes: list[str] = []
 
         if args.cancel_orders:
             ui.print("cancel_orders submitted")
@@ -103,7 +104,9 @@ async def run(args: argparse.Namespace) -> int:
                 results = trading_lib.dump_all_positions(clob, account)
                 for row in results:
                     if row.get("status") == "ok":
-                        expected.extend(_extract_tx_hashes(row.get("response")))
+                        hashes = _extract_tx_hashes(row.get("response"))
+                        expected.extend(hashes)
+                        fill_hashes.extend(hashes)
 
         if args.redeem:
             try:
@@ -125,7 +128,16 @@ async def run(args: argparse.Namespace) -> int:
 
         if args.dry_run or not expected:
             ui.closing(
-                f"status=ok  txs=0  dry_run={str(args.dry_run).lower()}",
+                f"status=ok  txs={len(expected)}  dry_run={str(args.dry_run).lower()}",
+                time.monotonic() - started,
+            )
+            return 0
+
+        # Relayer redeem/merge already waited until STATE_MINED. Those txs are
+        # ConditionalTokens, not OrderFilled — --listen would never see them.
+        if not fill_hashes:
+            ui.closing(
+                f"status=ok  txs={len(expected)}",
                 time.monotonic() - started,
             )
             return 0
@@ -141,7 +153,7 @@ async def run(args: argparse.Namespace) -> int:
             )
             return 0
 
-        landed = await _wait_hashes(ui, stream, args.listen, expected)
+        landed = await _wait_hashes(ui, stream, args.listen, fill_hashes)
         missing = len(expected) - landed
         if missing:
             ui.closing(

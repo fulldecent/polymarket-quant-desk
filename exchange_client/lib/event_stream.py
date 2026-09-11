@@ -332,23 +332,29 @@ def _decode_v2(
 
 
 def ws_url_from_env(ws_url: str, http_url: str) -> str:
-    """Derive a WebSocket URL from environment variables.
+    """Resolve a Polygon JSON-RPC WebSocket URL.
 
-    Prefers ws_url if non-empty. Falls back to converting http_url
-    (with special handling for Infura endpoints).
-
-    Raises SystemExit if neither is usable.
+    Uses POLYGON_WS_URL when set. Infura HTTP URLs can be rewritten to
+    ``/ws/v3/``. Other HTTPS RPC endpoints (Chainstack, dRPC, …) are not
+    WebSockets — do not flip https→wss.
     """
+    import sys
+
     if ws_url:
         return ws_url
     if http_url:
-        if "infura.io" in http_url:
+        lowered = http_url.lower()
+        if lowered.startswith("ws://") or lowered.startswith("wss://"):
+            return http_url
+        if "infura.io" in lowered:
             return (
                 http_url.replace("https://", "wss://")
                 .replace("http://", "ws://")
                 .replace("/v3/", "/ws/v3/")
             )
-        return http_url.replace("https://", "wss://").replace("http://", "ws://")
-    import sys
-
+        sys.exit(
+            "POLYGON_WS_URL is required for --listen rpc. "
+            f"POLYGON_RPC_URL ({http_url!r}) is HTTPS JSON-RPC, not a WebSocket "
+            "(servers return HTTP 405 if you rewrite it to wss://)."
+        )
     sys.exit("POLYGON_WS_URL or POLYGON_RPC_URL not set")
