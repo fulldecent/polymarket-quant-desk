@@ -161,17 +161,23 @@ async def _wait_for_fill(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Fill-or-kill market buy of one outcome token.",
-        epilog="Look up TOKEN_ID: python explorations/token-search/main.py <query>",
+        epilog=(
+            "TOKEN_ID is a CLOB Yes/No token. Look one up with:\n"
+            "  python explorations/token-search/main.py <query>\n"
+            "then:\n"
+            "  python traders/buy_token/main.py TOKEN_ID --exec clob --listen rpc --amount 2"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "token_id",
+        nargs="?",
         metavar="TOKEN_ID",
-        help="decimal clobTokenId (python explorations/token-search/main.py <query>)",
+        help="decimal clobTokenId",
     )
-    parser.add_argument("--exec", required=True, choices=EXEC_CHOICES)
-    parser.add_argument("--listen", required=True, choices=LISTEN_CHOICES)
-    parser.add_argument("--amount", type=float, required=True, metavar="USD")
+    parser.add_argument("--exec", choices=EXEC_CHOICES)
+    parser.add_argument("--listen", choices=LISTEN_CHOICES)
+    parser.add_argument("--amount", type=float, metavar="USD")
     parser.add_argument(
         "--worst-price",
         type=float,
@@ -180,6 +186,20 @@ def parse_args() -> argparse.Namespace:
         help="worst acceptable fill price per share (default: no cap)",
     )
     args = parser.parse_args()
+    if not args.token_id:
+        parser.print_help()
+        raise SystemExit(2)
+    missing = [
+        name
+        for name, ok in (
+            ("--exec", args.exec),
+            ("--listen", args.listen),
+            ("--amount", args.amount is not None),
+        )
+        if not ok
+    ]
+    if missing:
+        parser.error("the following arguments are required: " + ", ".join(missing))
     if args.amount < 2:
         parser.error("--amount must be >= 2")
     return args
