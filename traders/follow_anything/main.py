@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Copy the next N settled buy fills as FOK market buys. Measure block lag."""
+"""Warm up, then copy N buy fills from the next new block. Measure block lag."""
 
 from __future__ import annotations
 
@@ -20,11 +20,22 @@ from traders.lib.streams import (  # noqa: E402
     SETTLEMENT_TIMEOUT_SECONDS,
     execution_client,
     extract_buy_trigger,
+    is_live_trigger,
     listen_host,
     mempool_stream,
     settled_stream,
 )
 from traders.lib.ui import TraderUI, format_hms, shorten, shorten_addr  # noqa: E402
+
+
+def _drop(queue: asyncio.Queue) -> int:
+    n = 0
+    while True:
+        try:
+            queue.get_nowait()
+            n += 1
+        except asyncio.QueueEmpty:
+            return n
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -58,7 +69,10 @@ async def run(args: argparse.Namespace) -> int:
         )
         return 1
 
-    next_ready = time.monotonic() + args.warmup_seconds
+    warmup_until = time.monotonic() + args.warmup_seconds
+    after_block = 0
+    high_water = 0
+    warmup_done = False
     settled_n = 0
     lags: list[int | None] = []
     last_lag = "none"
@@ -83,15 +97,17 @@ async def run(args: argparse.Namespace) -> int:
     pumps = [asyncio.create_task(_pump_listen())]
     if mempool is not None:
         pumps.append(asyncio.create_task(_pump_mempool()))
-    ui.start_footer(f"copied 0/{args.count}  last_lag=none  waiting")
+    ui.start_footer(f"warmup  {format_hms(args.warmup_seconds)}")
 
     async def _drain() -> None:
-        nonlocal pending, settled_n, last_lag
+        nonlocal pending, settled_n, last_lag, high_water
         while True:
             try:
                 event = listen_q.get_nowait()
             except asyncio.QueueEmpty:
                 return
+            if event.block_number > high_water:
+                high_water = event.block_number
             tx = event.tx_hash.lower()
             if tx in trigger_blocks and trigger_blocks[tx] == 0:
                 trigger_blocks[tx] = event.block_number
@@ -110,10 +126,11 @@ async def run(args: argparse.Namespace) -> int:
                 lags.append(lag)
                 last_lag = "none" if lag is None else str(lag)
                 settled_n += 1
+                trig_s = f"{trig_block:,}" if trig_block else "none"
                 ui.print(
                     f"settled  seq={settled_n}  copy_tx={shorten(event.tx_hash)}  "
                     f"copy_block={event.block_number:,}  "
-                    f"trigger_block={trig_block}  lag={last_lag}"
+                    f"trigger_block={trig_s}  lag={last_lag}"
                 )
                 pending = None
 
@@ -121,11 +138,26 @@ async def run(args: argparse.Namespace) -> int:
         while settled_n < args.count:
             await _drain()
             elapsed = format_hms(time.monotonic() - started)
-            ui.update_footer(
-                f"copied {settled_n}/{args.count}  last_lag={last_lag}  waiting  {elapsed}"
-            )
+            remaining = warmup_until - time.monotonic()
+
+            if remaining > 0:
+                dropped = _drop(trigger_q)
+                if dropped:
+                    ui.log_only(f"warmup drop {dropped}")
+                ui.update_footer(
+                    f"warmup  {format_hms(remaining)}  block={high_water:,}  {elapsed}"
+                )
+                await asyncio.sleep(0.1)
+                continue
+
+            if not warmup_done:
+                after_block = high_water
+                dropped = _drop(trigger_q)
+                ui.print(f"warmup done  after_block={after_block:,}  dropped={dropped}")
+                warmup_done = True
 
             if pending is not None:
+                _drop(trigger_q)
                 if time.monotonic() - pending["submitted_at"] > SETTLEMENT_TIMEOUT_SECONDS:
                     ui.print(
                         f"timeout  seq={settled_n + 1}  "
@@ -133,19 +165,24 @@ async def run(args: argparse.Namespace) -> int:
                         f"timeout={SETTLEMENT_TIMEOUT_SECONDS}s"
                     )
                     pending = None
-                    next_ready = time.monotonic() + args.warmup_seconds
                 else:
+                    ui.update_footer(
+                        f"copied {settled_n}/{args.count}  last_lag={last_lag}  "
+                        f"waiting  {elapsed}"
+                    )
                     await asyncio.sleep(0.1)
                     continue
 
-            now = time.monotonic()
-            if now < next_ready:
-                await asyncio.sleep(min(0.25, next_ready - now))
-                continue
-
+            ui.update_footer(
+                f"copied {settled_n}/{args.count}  last_lag={last_lag}  "
+                f"wait_block>{after_block:,}  {elapsed}"
+            )
             try:
                 event = await asyncio.wait_for(trigger_q.get(), timeout=0.5)
             except asyncio.TimeoutError:
+                continue
+
+            if not is_live_trigger(event, after_block=after_block):
                 continue
 
             trigger = extract_buy_trigger(event)
@@ -170,10 +207,13 @@ async def run(args: argparse.Namespace) -> int:
             else:
                 trigger_blocks[tx] = 0
 
+            block = getattr(event, "block_number", 0) or 0
+            block_s = "mempool" if not block else f"{block:,}"
             ui.print(
                 f"trigger  token={shorten(trigger['buy_token_id'], head=4, tail=4)}  "
                 f"buyer={shorten_addr(trigger['buyer'])}  "
-                f"value=${trigger['trade_value_usd']:.2f}  tx={shorten(event.tx_hash)}"
+                f"value=${trigger['trade_value_usd']:.2f}  "
+                f"block={block_s}  tx={shorten(event.tx_hash)}"
             )
 
             try:
@@ -181,12 +221,12 @@ async def run(args: argparse.Namespace) -> int:
                 result = await client.buy_market(trigger["buy_token_id"], args.amount)
             except Exception as exc:
                 ui.print(f"copy_failed  error={exc}")
-                next_ready = time.monotonic() + args.warmup_seconds
+                _drop(trigger_q)
                 continue
 
             if not result.success or not result.tx_hashes:
                 ui.print("copy_failed  error=order_rejected")
-                next_ready = time.monotonic() + args.warmup_seconds
+                _drop(trigger_q)
                 continue
 
             expected = {x.lower() for x in result.tx_hashes if x}
@@ -202,7 +242,7 @@ async def run(args: argparse.Namespace) -> int:
                 f"submitted  order={shorten(result.order_id or '')}  "
                 f"tx={shorten(result.tx_hashes[0])}"
             )
-            next_ready = time.monotonic() + args.warmup_seconds
+            _drop(trigger_q)
 
         await _drain()
         ok = settled_n >= args.count
@@ -222,7 +262,8 @@ async def run(args: argparse.Namespace) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Copy N buy fills and measure settlement lag."
+        description="Warm up, then copy N buy fills from the next new block. "
+        "Measure copy_settled_block - trigger_settled_block."
     )
     parser.add_argument("--exec", required=True, choices=EXEC_CHOICES)
     parser.add_argument("--listen", required=True, choices=LISTEN_CHOICES)
@@ -232,6 +273,7 @@ def parse_args() -> argparse.Namespace:
         default="10s",
         metavar="DUR",
         type=trading_lib.parse_ttl,
+        help="observe only, then copy from the next new block (once)",
     )
     parser.add_argument("--amount", default=2.0, metavar="USD", type=float)
     parser.add_argument("--count", default=5, type=int, metavar="N")

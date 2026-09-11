@@ -9,7 +9,8 @@ _project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_project_root))
 
 from exchange_client.lib.event_stream import TradeEvent  # noqa: E402
-from traders.lib.streams import extract_buy_trigger  # noqa: E402
+from exchange_client.lib.event_stream import MempoolTradeEvent  # noqa: E402
+from traders.lib.streams import extract_buy_trigger, is_live_trigger  # noqa: E402
 
 TOKEN = "123"
 
@@ -57,3 +58,25 @@ def test_token_token_is_not_a_buy():
         )
         is None
     )
+
+
+def test_settled_trigger_must_be_after_warmup_block():
+    event = _event(maker_asset="0", taker_asset=TOKEN, maker_amt="1", taker_amt="1")
+    assert not is_live_trigger(event, after_block=1)
+    assert is_live_trigger(event, after_block=0)
+
+
+def test_mempool_trigger_is_live_after_warmup():
+    event = MempoolTradeEvent(
+        tx_hash="0x" + "ab" * 32,
+        contract_address="0x" + "11" * 20,
+        event_type="OrderFilled",
+        maker="0x" + "aa" * 20,
+        taker="0x" + "bb" * 20,
+        maker_asset_id="0",
+        taker_asset_id=TOKEN,
+        maker_amount="1",
+        taker_amount="1",
+        fee="0",
+    )
+    assert is_live_trigger(event, after_block=99_999_999)

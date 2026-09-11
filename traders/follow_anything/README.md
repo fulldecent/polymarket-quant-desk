@@ -1,6 +1,8 @@
 # follow_anything
 
-After `--warmup`, copy buy fills as FOK market buys of `--amount` USDC until **N copies have settled** on `--listen`. Measures `copy_settled_block - trigger_settled_block`.
+`--warmup` is one-shot: connect and watch, copy nothing. Then drop the queued fills, wait for the **next new block** on `--listen`, and FOK-copy buy fills of `--amount` until **N copies have settled**. No cooldown between copies. Measures `copy_settled_block - trigger_settled_block`.
+
+Same loop for `--listen rpc` and `--listen polynode`. `--trigger-polynode-mempool` fires on the next pre-block buy after warmup instead of waiting for that block.
 
 ```sh
 source .venv/bin/activate

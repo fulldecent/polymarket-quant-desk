@@ -91,6 +91,20 @@ def outcome_token_id(event: TradeEvent | MempoolTradeEvent) -> str:
     return ""
 
 
+def is_live_trigger(
+    event: TradeEvent | MempoolTradeEvent, *, after_block: int
+) -> bool:
+    """True once warmup is over and this fill is from a newer block.
+
+    Settled fills must have ``block_number > after_block`` (the high-water
+    block observed during warmup). Mempool fills have no block yet; they
+    are live as soon as warmup ends.
+    """
+    if isinstance(event, MempoolTradeEvent):
+        return True
+    return event.block_number > after_block
+
+
 def extract_buy_trigger(event: TradeEvent | MempoolTradeEvent) -> dict | None:
     if event.maker_asset_id == "0" and event.taker_asset_id not in {"", "0"}:
         buyer = event.maker
