@@ -12,6 +12,7 @@ Press Enter to recheck the proxy IP address (useful to verify connection is stil
 import atexit
 import json
 import os
+import re
 import select
 import signal
 import subprocess
@@ -28,10 +29,14 @@ _project_root = _script_dir.parent
 load_dotenv(_project_root / ".env", override=False)
 load_dotenv(_script_dir / ".env", override=True)
 
-PROXY_CONFIG_DIR = os.path.join(_script_dir, "proxy-config")
-HTTPBIN_PROXY_URL = "http://localhost:9430/ip"
+PROXY_CONFIG_DIR = Path(_script_dir) / "proxy-config"
+LOG_DIR = PROXY_CONFIG_DIR / "logs"
+TOR_NOTICE_LOG = PROXY_CONFIG_DIR / "tor-data" / "notice.log"
+# 127.0.0.1 not localhost — some stacks bind IPv4 only; Tor circuits are slow.
+HTTPBIN_PROXY_URL = "http://127.0.0.1:9430/ip"
 
 processes: list[subprocess.Popen] = []
+_log_handles: list = []
 
 
 def kill_existing():
@@ -46,7 +51,6 @@ def cleanup():
     for proc in reversed(processes):
         if proc.poll() is None:
             proc.terminate()
-    # Give them a moment, then force-kill stragglers
     deadline = time.time() + 5
     for proc in reversed(processes):
         remaining = max(0, deadline - time.time())
@@ -54,6 +58,11 @@ def cleanup():
             proc.wait(timeout=remaining)
         except subprocess.TimeoutExpired:
             proc.kill()
+    for handle in _log_handles:
+        try:
+            handle.close()
+        except Exception:
+            pass
 
 
 atexit.register(cleanup)
@@ -69,23 +78,78 @@ signal.signal(signal.SIGINT, handle_signal)
 signal.signal(signal.SIGTERM, handle_signal)
 
 
-def wait_for_proxy(url: str, timeout: int = 120, interval: float = 2.0):
+def _check_children_alive() -> None:
+    for proc in processes:
+        if proc.poll() is not None:
+            print(
+                f"ERROR: {proc.args[0]!r} exited with code {proc.returncode}",
+                file=sys.stderr,
+            )
+            _dump_logs()
+            cleanup()
+            sys.exit(1)
+
+
+def _dump_logs() -> None:
+    for name in ("tor", "gost", "caddy"):
+        path = LOG_DIR / f"{name}.log"
+        if not path.exists():
+            continue
+        tail = path.read_text(errors="replace").splitlines()[-20:]
+        if not tail:
+            continue
+        print(f"--- {name}.log (last {len(tail)} lines) ---", file=sys.stderr)
+        for line in tail:
+            print(f"  {line}", file=sys.stderr)
+
+
+def _tor_bootstrap_pct() -> int | None:
+    if not TOR_NOTICE_LOG.exists():
+        return None
+    text = TOR_NOTICE_LOG.read_text(errors="replace")
+    matches = re.findall(r"Bootstrapped (\d+)%", text)
+    if not matches:
+        return None
+    return int(matches[-1])
+
+
+def wait_for_tor_bootstrap(timeout: int = 180) -> None:
+    """NL StrictNodes circuits can take minutes. Print bootstrap % instead of sitting silent."""
+    print("Waiting for Tor bootstrap (ExitNodes {nl}) …")
+    start = time.time()
+    last_pct = -1
+    while time.time() - start < timeout:
+        _check_children_alive()
+        pct = _tor_bootstrap_pct()
+        if pct is not None and pct != last_pct:
+            print(f"  tor bootstrap {pct}%")
+            last_pct = pct
+        if pct is not None and pct >= 100:
+            return
+        time.sleep(1)
+    raise TimeoutError(
+        f"Tor did not bootstrap within {timeout}s (last {last_pct if last_pct >= 0 else 0}%). "
+        "NL exits can be scarce; see proxy-config/tor-data/notice.log"
+    )
+
+
+def wait_for_proxy(url: str, timeout: int = 90, interval: float = 2.0):
     """Poll *url* until it returns a 200 response or *timeout* seconds elapse."""
     start = time.time()
     last_error = None
+    last_report = 0.0
     while time.time() - start < timeout:
+        elapsed = time.time() - start
         try:
-            with urllib.request.urlopen(url, timeout=5) as resp:
+            with urllib.request.urlopen(url, timeout=15) as resp:
                 if resp.status == 200:
                     return json.loads(resp.read())
-        except (urllib.error.URLError, OSError, ValueError) as exc:
+        except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
             last_error = exc
-        # Check if any process died unexpectedly
-        for proc in processes:
-            if proc.poll() is not None:
-                print(f"ERROR: {proc.args[0]!r} exited with code {proc.returncode}", file=sys.stderr)
-                cleanup()
-                sys.exit(1)
+        _check_children_alive()
+        if elapsed - last_report >= 10:
+            print(f"  still waiting for httpbin via Tor … {elapsed:.0f}s  last={last_error}")
+            last_report = elapsed
         time.sleep(interval)
     raise TimeoutError(f"Proxy did not become ready within {timeout}s (last error: {last_error})")
 
@@ -102,42 +166,43 @@ def fetch_proxy_ip() -> str:
     return "unknown"
 
 
+def _spawn(name: str, args: list[str]) -> subprocess.Popen:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = LOG_DIR / f"{name}.log"
+    handle = open(log_path, "w", encoding="utf-8")
+    _log_handles.append(handle)
+    print(f"Starting {name} …  log={log_path}")
+    return subprocess.Popen(
+        args,
+        cwd=PROXY_CONFIG_DIR,
+        stdout=handle,
+        stderr=subprocess.STDOUT,
+    )
+
+
 def main():
     kill_existing()
+    TOR_NOTICE_LOG.parent.mkdir(parents=True, exist_ok=True)
+    if TOR_NOTICE_LOG.exists():
+        TOR_NOTICE_LOG.unlink()
 
-    # 1) Tor
-    print("Starting tor …")
-    processes.append(subprocess.Popen(
-        ["tor", "-f", os.path.join(PROXY_CONFIG_DIR, "config.torrc"), "--runasdaemon", "0"],
-        cwd=PROXY_CONFIG_DIR,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+    processes.append(_spawn(
+        "tor",
+        ["tor", "-f", str(PROXY_CONFIG_DIR / "config.torrc"), "--runasdaemon", "0"],
+    ))
+    processes.append(_spawn("gost", ["gost", "-C", str(PROXY_CONFIG_DIR / "gost.yaml")]))
+    processes.append(_spawn(
+        "caddy",
+        ["caddy", "run", "--config", str(PROXY_CONFIG_DIR / "Caddyfile")],
     ))
 
-    # 2) GOST
-    print("Starting gost …")
-    processes.append(subprocess.Popen(
-        ["gost", "-C", os.path.join(PROXY_CONFIG_DIR, "gost.yaml")],
-        cwd=PROXY_CONFIG_DIR,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    ))
-
-    # 3) Caddy
-    print("Starting caddy …")
-    processes.append(subprocess.Popen(
-        ["caddy", "run", "--config", os.path.join(PROXY_CONFIG_DIR, "Caddyfile")],
-        cwd=PROXY_CONFIG_DIR,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    ))
-
-    # Wait for the full chain to come up
-    print("Waiting for proxy to become ready …")
     try:
+        wait_for_tor_bootstrap()
+        print("Waiting for httpbin via the proxy …")
         data = wait_for_proxy(HTTPBIN_PROXY_URL)
     except TimeoutError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
+        _dump_logs()
         cleanup()
         sys.exit(1)
 

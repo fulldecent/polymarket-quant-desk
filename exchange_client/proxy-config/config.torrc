@@ -3,3 +3,4 @@ ExitNodes {nl}
 StrictNodes 1
 DataDirectory ./tor-data
 AvoidDiskWrites 1
+Log notice file ./tor-data/notice.log
