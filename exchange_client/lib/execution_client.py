@@ -13,9 +13,6 @@ from dataclasses import dataclass
 from typing import Protocol
 
 import requests
-from py_clob_client.clob_types import MarketOrderArgs, OrderType, RequestArgs
-from py_clob_client.headers.headers import create_level_2_headers
-from py_clob_client.utilities import order_to_json
 
 from . import trading_lib
 
@@ -38,22 +35,12 @@ class ExecutionClient(Protocol):
         amount_usd: float,
         *,
         max_price: float = 0,
+        neg_risk: bool = False,
     ) -> ExecutionResult: ...
     async def warmup(self, token_id: str) -> None: ...
     def cached_fee_rate_bps(self, token_id: str) -> int | None: ...
     async def redeem_positions(self, user: str, dry_run: bool = False) -> list[str]: ...
     async def merge_positions(self, user: str, dry_run: bool = False, condition_id: str | None = None) -> list[str]: ...
-
-
-def _warmup_clob_client(client, token_id: str) -> None:
-    """Populate py_clob_client in-process caches for `token_id`.
-
-    After this runs, `create_market_order` for that token makes zero GET
-    requests (only the signed POST remains).
-    """
-    client.get_tick_size(token_id)
-    client.get_neg_risk(token_id)
-    client.get_fee_rate_bps(token_id)
 
 
 def _cached_fee_rate_bps(client, token_id: str) -> int | None:
@@ -79,6 +66,8 @@ class ClobExecutionClient:
     def __init__(self) -> None:
         trading_lib.load_env()
         self._client = trading_lib.build_client()
+        self._v2 = trading_lib.get_v2_client()
+        self._neg_risk: dict[str, bool] = {}
 
     async def buy_market(
         self,
@@ -86,13 +75,17 @@ class ClobExecutionClient:
         amount_usd: float,
         *,
         max_price: float = 0,
+        neg_risk: bool = False,
     ) -> ExecutionResult:
+        if token_id in self._neg_risk:
+            neg_risk = self._neg_risk[token_id]
         resp = await asyncio.to_thread(
             trading_lib.buy_token,
             self._client,
             token_id,
             amount_usd,
             max_price=max_price,
+            neg_risk=neg_risk,
         )
 
         tx_hashes: list[str] = []
@@ -114,7 +107,10 @@ class ClobExecutionClient:
         )
 
     async def warmup(self, token_id: str) -> None:
-        await asyncio.to_thread(_warmup_clob_client, self._client, token_id)
+        def _warm() -> None:
+            self._neg_risk[token_id] = bool(self._v2.get_neg_risk(token_id))
+
+        await asyncio.to_thread(_warm)
 
     def cached_fee_rate_bps(self, token_id: str) -> int | None:
         return _cached_fee_rate_bps(self._client, token_id)
@@ -155,6 +151,8 @@ class PolynodeExecutionClient:
             else "https://trade.polynode.dev"
         )
         self._client = trading_lib.build_client()
+        self._v2 = trading_lib.get_v2_client()
+        self._neg_risk: dict[str, bool] = {}
 
     async def buy_market(
         self,
@@ -162,32 +160,33 @@ class PolynodeExecutionClient:
         amount_usd: float,
         *,
         max_price: float = 0,
+        neg_risk: bool = False,
     ) -> ExecutionResult:
-        order = await asyncio.to_thread(
-            self._client.create_market_order,
-            MarketOrderArgs(
-                token_id=token_id,
-                amount=amount_usd,
-                price=max_price,
-                side="BUY",
-                order_type=OrderType.FOK,
-            ),
-        )
+        if token_id in self._neg_risk:
+            neg_risk = self._neg_risk[token_id]
 
-        body = order_to_json(order, self._client.creds.api_key, OrderType.FOK, False)
-        serialized = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+        def _sign() -> tuple[str, dict]:
+            from py_clob_client_v2 import OrderType as OrderTypeV2
+            from py_clob_client_v2.client import order_to_json_v2
+            from py_clob_client_v2.headers.headers import create_level_2_headers as l2
+            from py_clob_client_v2.clob_types import RequestArgs as RequestArgsV2
 
-        request_args = RequestArgs(
-            method="POST",
-            request_path="/order",
-            body=body,
-            serialized_body=serialized,
-        )
-        signer = self._client.signer
-        if signer is None:
-            raise RuntimeError("client signer is not initialized")
-        headers = create_level_2_headers(signer, self._client.creds, request_args)
+            order = trading_lib._sign_v2_fok_buy(
+                self._v2, token_id, amount_usd, max_price=max_price, neg_risk=neg_risk
+            )
+            owner = self._v2.creds.api_key or ""
+            body = order_to_json_v2(order, owner, OrderTypeV2.FOK, False, False)
+            serialized = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+            request_args = RequestArgsV2(
+                method="POST",
+                request_path="/order",
+                body=body,
+                serialized_body=serialized,
+            )
+            headers = l2(self._v2.signer, self._v2.creds, request_args)
+            return serialized, headers
 
+        serialized, headers = await asyncio.to_thread(_sign)
         payload = {
             "method": "POST",
             "path": "/order",
@@ -243,7 +242,10 @@ class PolynodeExecutionClient:
         )
 
     async def warmup(self, token_id: str) -> None:
-        await asyncio.to_thread(_warmup_clob_client, self._client, token_id)
+        def _warm() -> None:
+            self._neg_risk[token_id] = bool(self._v2.get_neg_risk(token_id))
+
+        await asyncio.to_thread(_warm)
 
     def cached_fee_rate_bps(self, token_id: str) -> int | None:
         return _cached_fee_rate_bps(self._client, token_id)

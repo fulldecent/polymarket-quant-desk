@@ -234,6 +234,23 @@ def build_v2_client():
     )
 
 
+_v2_client = None
+_FOK_TICK = "0.01"
+_FOK_WORST_BUY = 0.99
+
+
+def get_v2_client():
+    """Process-wide CLOB v2 client. HTTP session and version are reused."""
+    global _v2_client
+    if _v2_client is None:
+        _v2_client = build_v2_client()
+        try:
+            _v2_client.get_version()
+        except Exception:
+            pass
+    return _v2_client
+
+
 def derive_clob_api_creds(client: ClobClient) -> ApiCreds:
     """Replace L2 API creds by creating/deriving them from the EOA (L1).
 
@@ -640,17 +657,52 @@ def print_orders(orders: list[dict], label: str) -> None:
 # ── Trading ──────────────────────────────────────────────────────────────────
 
 
+def _sign_v2_fok_buy(
+    v2, token_id: str, amount_usd: float, *, max_price: float, neg_risk: bool
+):
+    """Sign a v2 FOK buy locally. No HTTP."""
+    from py_clob_client_v2 import MarketOrderArgsV2, OrderType as OrderTypeV2
+    from py_clob_client_v2.clob_types import CreateOrderOptions
+
+    price = max_price if max_price else _FOK_WORST_BUY
+    return v2.builder.build_market_order(
+        MarketOrderArgsV2(
+            token_id=token_id,
+            amount=amount_usd,
+            price=price,
+            side="BUY",
+            order_type=OrderTypeV2.FOK,
+        ),
+        CreateOrderOptions(tick_size=_FOK_TICK, neg_risk=bool(neg_risk)),
+        version=2,
+        fee_rate_bps=None,
+    )
+
+
+def _post_v2_order(v2, order) -> dict:
+    """One POST /order. Does not poll for transaction hashes."""
+    from py_clob_client_v2 import OrderType as OrderTypeV2
+    from py_clob_client_v2.client import order_to_json_v2
+    from py_clob_client_v2.endpoints import POST_ORDER
+
+    owner = v2.creds.api_key or ""
+    payload = order_to_json_v2(order, owner, OrderTypeV2.FOK, False, False)
+    serialized = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    headers = v2._l2_headers(
+        "POST", POST_ORDER, body=payload, serialized_body=serialized
+    )
+    return v2._post(f"{v2.host}{POST_ORDER}", headers=headers, data=serialized)
+
+
 def buy_token(
     client: ClobClient, token_id: str, amount_usd: float,
-    *, max_price: float = 0,
+    *, max_price: float = 0, neg_risk: bool = False,
 ) -> dict:
-    """Place a fill-or-kill market buy order. Returns the API response.
+    """Place a fill-or-kill market buy. One signed POST, no book/tick GETs.
 
     Args:
-        max_price: worst acceptable fill price per share. If nonzero,
-            the CLOB order's price field is set to this value instead
-            of auto-walking the full order book. This prevents
-            slippage beyond the expected entry price.
+        max_price: worst acceptable fill price per share. 0 means 0.99.
+        neg_risk: True if the token trades on a NegRisk exchange.
     """
     log_event({
         "action": "buy",
@@ -658,27 +710,17 @@ def buy_token(
         "token_id": token_id,
         "amount_usd": amount_usd,
         "max_price": max_price,
+        "neg_risk": bool(neg_risk),
         "side": "BUY",
         "order_type": "FOK",
     })
 
     try:
-        v2 = build_v2_client()
-        from py_clob_client_v2 import MarketOrderArgsV2, OrderType as OrderTypeV2
-
-        v2.get_tick_size(token_id)
-        v2.get_neg_risk(token_id)
-        v2.get_fee_rate_bps(token_id)
-        order = v2.create_market_order(
-            MarketOrderArgsV2(
-                token_id=token_id,
-                amount=amount_usd,
-                price=max_price,
-                side="BUY",
-                order_type=OrderTypeV2.FOK,
-            ),
+        v2 = get_v2_client()
+        order = _sign_v2_fok_buy(
+            v2, token_id, amount_usd, max_price=max_price, neg_risk=neg_risk
         )
-        resp = v2.post_order(order, order_type=OrderTypeV2.FOK)
+        resp = _post_v2_order(v2, order)
 
         log_event({
             "action": "buy",
@@ -686,6 +728,7 @@ def buy_token(
             "token_id": token_id,
             "amount_usd": amount_usd,
             "max_price": max_price,
+            "neg_risk": bool(neg_risk),
             "side": "BUY",
             "order_type": "FOK",
             "response": resp,
@@ -698,6 +741,7 @@ def buy_token(
             "token_id": token_id,
             "amount_usd": amount_usd,
             "max_price": max_price,
+            "neg_risk": bool(neg_risk),
             "side": "BUY",
             "order_type": "FOK",
             "error": str(exc),

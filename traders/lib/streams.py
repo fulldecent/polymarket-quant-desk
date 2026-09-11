@@ -8,12 +8,20 @@ from urllib.parse import urlparse
 
 from exchange_client.lib import trading_lib
 from exchange_client.lib.event_stream import (
+    V1_CONTRACTS,
+    V2_CONTRACTS,
     MempoolTradeEvent,
     SettledTradeStream,
     TradeEvent,
     TradeMempoolStream,
     ws_url_from_env,
 )
+
+_NEG_RISK_EXCHANGES = {
+    V1_CONTRACTS["NegRiskCtfExchange"].lower(),
+    V2_CONTRACTS["NegRiskCtfExchangeV2"].lower(),
+    "0xe2222d002000ba0053cef3375333610f64600036",
+}
 from exchange_client.lib.execution_client import (
     ClobExecutionClient,
     ExecutionClient,
@@ -89,6 +97,11 @@ def outcome_token_id(event: TradeEvent | MempoolTradeEvent) -> str:
     if event.taker_asset_id not in {"", "0"}:
         return event.taker_asset_id
     return ""
+
+
+def exchange_is_neg_risk(address: str) -> bool:
+    """True if `address` is a NegRisk CTF exchange (v1 or v2)."""
+    return address.lower() in _NEG_RISK_EXCHANGES
 
 
 def is_live_trigger(

@@ -10,7 +10,11 @@ sys.path.insert(0, str(_project_root))
 
 from exchange_client.lib.event_stream import TradeEvent  # noqa: E402
 from exchange_client.lib.event_stream import MempoolTradeEvent  # noqa: E402
-from traders.lib.streams import extract_buy_trigger, is_live_trigger  # noqa: E402
+from traders.lib.streams import (  # noqa: E402
+    exchange_is_neg_risk,
+    extract_buy_trigger,
+    is_live_trigger,
+)
 
 TOKEN = "123"
 
@@ -80,3 +84,10 @@ def test_mempool_trigger_is_live_after_warmup():
         fee="0",
     )
     assert is_live_trigger(event, after_block=99_999_999)
+
+
+def test_neg_risk_from_exchange_address():
+    assert exchange_is_neg_risk("0xe2222d279d744050d28e00520010520000310F59")
+    assert exchange_is_neg_risk("0xC5d563A36AE78145C45a50134d48A1215220f80a")
+    assert not exchange_is_neg_risk("0xE111180000d2663C0091e4f400237545B87B996B")
+    assert not exchange_is_neg_risk("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E")

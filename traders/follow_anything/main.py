@@ -18,6 +18,7 @@ from traders.lib.streams import (  # noqa: E402
     EXEC_CHOICES,
     LISTEN_CHOICES,
     SETTLEMENT_TIMEOUT_SECONDS,
+    exchange_is_neg_risk,
     execution_client,
     extract_buy_trigger,
     is_live_trigger,
@@ -26,6 +27,13 @@ from traders.lib.streams import (  # noqa: E402
     settled_stream,
 )
 from traders.lib.ui import TraderUI, format_hms, shorten, shorten_addr  # noqa: E402
+
+
+def _is_our_copy_fill(event: TradeEvent, token_id: str, ours: set[str]) -> bool:
+    parties = {event.maker.lower(), event.taker.lower()} - {""}
+    if not parties & ours:
+        return False
+    return event.maker_asset_id == token_id or event.taker_asset_id == token_id
 
 
 def _drop(queue: asyncio.Queue) -> int:
@@ -113,7 +121,11 @@ async def run(args: argparse.Namespace) -> int:
                 trigger_blocks[tx] = event.block_number
             if pending is None:
                 continue
-            if tx not in pending["expected"]:
+            expected = pending["expected"]
+            if expected:
+                if tx not in expected:
+                    continue
+            elif not _is_our_copy_fill(event, pending["token_id"], skip):
                 continue
             pending["landed"].add(tx)
             pending["copy_block"] = event.block_number
@@ -141,9 +153,7 @@ async def run(args: argparse.Namespace) -> int:
             remaining = warmup_until - time.monotonic()
 
             if remaining > 0:
-                dropped = _drop(trigger_q)
-                if dropped:
-                    ui.log_only(f"warmup drop {dropped}")
+                _drop(trigger_q)
                 ui.update_footer(
                     f"warmup  {format_hms(remaining)}  block={high_water:,}  {elapsed}"
                 )
@@ -155,6 +165,9 @@ async def run(args: argparse.Namespace) -> int:
                 dropped = _drop(trigger_q)
                 ui.print(f"warmup done  after_block={after_block:,}  dropped={dropped}")
                 warmup_done = True
+
+            if settled_n >= args.count:
+                break
 
             if pending is not None:
                 _drop(trigger_q)
@@ -217,14 +230,17 @@ async def run(args: argparse.Namespace) -> int:
             )
 
             try:
-                await client.warmup(trigger["buy_token_id"])
-                result = await client.buy_market(trigger["buy_token_id"], args.amount)
+                result = await client.buy_market(
+                    trigger["buy_token_id"],
+                    args.amount,
+                    neg_risk=exchange_is_neg_risk(event.contract_address),
+                )
             except Exception as exc:
                 ui.print(f"copy_failed  error={exc}")
                 _drop(trigger_q)
                 continue
 
-            if not result.success or not result.tx_hashes:
+            if not result.success:
                 ui.print("copy_failed  error=order_rejected")
                 _drop(trigger_q)
                 continue
@@ -232,15 +248,18 @@ async def run(args: argparse.Namespace) -> int:
             expected = {x.lower() for x in result.tx_hashes if x}
             pending = {
                 "trigger_tx": tx,
+                "token_id": trigger["buy_token_id"],
                 "expected": expected,
                 "landed": set(),
                 "submitted_at": time.monotonic(),
                 "copy_block": None,
                 "lag": None,
             }
+            tx_s = shorten(result.tx_hashes[0]) if result.tx_hashes else "none"
+            delayed = "" if result.tx_hashes else "  delayed"
             ui.print(
                 f"submitted  order={shorten(result.order_id or '')}  "
-                f"tx={shorten(result.tx_hashes[0])}"
+                f"tx={tx_s}{delayed}"
             )
             _drop(trigger_q)
 
