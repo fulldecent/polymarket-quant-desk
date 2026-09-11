@@ -47,7 +47,13 @@ def _pending_tx_label(pending: dict) -> str:
     if pending["expected"]:
         return shorten(next(iter(pending["expected"])))
     order_id = pending.get("order_id") or ""
-    return shorten(order_id) if order_id else "none"
+    return shorten(order_id) if order_id else "unknown"
+
+
+def _copy_lag(copy_block: int | None, trigger_block: int | None) -> int | None:
+    if not copy_block or not trigger_block:
+        return None
+    return copy_block - trigger_block
 
 
 def _drop(queue: asyncio.Queue) -> int:
@@ -96,8 +102,8 @@ async def run(args: argparse.Namespace) -> int:
     high_water = 0
     warmup_done = False
     settled_n = 0
-    lags: list[int | None] = []
-    last_lag = "none"
+    lags: list[int] = []
+    last_lag = "-"
     pending: dict | None = None
     trigger_blocks: dict[str, int] = {}
     seen_triggers: set[str] = set()
@@ -121,8 +127,29 @@ async def run(args: argparse.Namespace) -> int:
         pumps.append(asyncio.create_task(_pump_mempool()))
     ui.start_footer(f"warmup  {format_hms(args.warmup_seconds)}")
 
+    def _score_pending() -> bool:
+        nonlocal pending, settled_n, last_lag
+        if pending is None or not _pending_is_settled(pending):
+            return False
+        trig_block = int(trigger_blocks.get(pending["trigger_tx"]) or 0)
+        copy_block = pending.get("copy_block")
+        lag = _copy_lag(copy_block, trig_block or None)
+        if lag is None:
+            return False
+        lags.append(lag)
+        last_lag = str(lag)
+        settled_n += 1
+        copy_tx = pending.get("copy_tx") or next(iter(pending["landed"]), "")
+        ui.print(
+            f"settled  seq={settled_n}  copy_tx={shorten(copy_tx)}  "
+            f"copy_block={copy_block:,}  "
+            f"trigger_block={trig_block:,}  lag={lag}"
+        )
+        pending = None
+        return True
+
     async def _drain() -> None:
-        nonlocal pending, settled_n, last_lag, high_water
+        nonlocal pending, high_water
         while True:
             try:
                 event = listen_q.get_nowait()
@@ -131,9 +158,11 @@ async def run(args: argparse.Namespace) -> int:
             if event.block_number > high_water:
                 high_water = event.block_number
             tx = event.tx_hash.lower()
-            if tx in trigger_blocks and trigger_blocks[tx] == 0:
+            if tx in trigger_blocks and trigger_blocks[tx] == 0 and event.block_number:
                 trigger_blocks[tx] = event.block_number
             if pending is None:
+                continue
+            if _score_pending():
                 continue
             expected = pending["expected"]
             if expected:
@@ -143,22 +172,8 @@ async def run(args: argparse.Namespace) -> int:
                 continue
             pending["landed"].add(tx)
             pending["copy_block"] = event.block_number
-            trig_block = trigger_blocks.get(pending["trigger_tx"])
-            lag = None
-            if trig_block:
-                lag = event.block_number - trig_block
-            pending["lag"] = lag
-            if _pending_is_settled(pending):
-                lags.append(lag)
-                last_lag = "none" if lag is None else str(lag)
-                settled_n += 1
-                trig_s = f"{trig_block:,}" if trig_block else "none"
-                ui.print(
-                    f"settled  seq={settled_n}  copy_tx={shorten(event.tx_hash)}  "
-                    f"copy_block={event.block_number:,}  "
-                    f"trigger_block={trig_s}  lag={last_lag}"
-                )
-                pending = None
+            pending["copy_tx"] = event.tx_hash
+            _score_pending()
 
     try:
         while settled_n < args.count:
@@ -186,12 +201,30 @@ async def run(args: argparse.Namespace) -> int:
             if pending is not None:
                 _drop(trigger_q)
                 if time.monotonic() - pending["submitted_at"] > SETTLEMENT_TIMEOUT_SECONDS:
-                    ui.print(
-                        f"timeout  seq={settled_n + 1}  "
-                        f"tx={_pending_tx_label(pending)}  "
-                        f"timeout={SETTLEMENT_TIMEOUT_SECONDS}s"
+                    if _pending_is_settled(pending):
+                        copy_block = pending.get("copy_block") or 0
+                        copy_tx = pending.get("copy_tx") or ""
+                        ui.print(
+                            f"failed  trigger never landed on chain  "
+                            f"already bought  copy_tx={shorten(copy_tx)}  "
+                            f"copy_block={copy_block:,}  stop"
+                        )
+                        error = "trigger_never_landed"
+                    else:
+                        ui.print(
+                            f"failed  copy not on chain after "
+                            f"{SETTLEMENT_TIMEOUT_SECONDS}s  "
+                            f"order={_pending_tx_label(pending)}  "
+                            f"stop  more fills may still land"
+                        )
+                        error = "copy_not_on_chain"
+                    ui.closing(
+                        f"status=failed  settled={settled_n}/{args.count}  "
+                        f"lags={','.join(str(x) for x in lags) or '-'}  "
+                        f"error={error}",
+                        time.monotonic() - started,
                     )
-                    pending = None
+                    return 1
                 else:
                     ui.update_footer(
                         f"copied {settled_n}/{args.count}  last_lag={last_lag}  "
@@ -270,8 +303,8 @@ async def run(args: argparse.Namespace) -> int:
                 "copy_block": None,
                 "lag": None,
             }
-            tx_s = shorten(result.tx_hashes[0]) if result.tx_hashes else "none"
-            delayed = "" if result.tx_hashes else "  delayed"
+            tx_s = shorten(result.tx_hashes[0]) if result.tx_hashes else "unconfirmed"
+            delayed = "" if result.tx_hashes else "  waiting for fill"
             ui.print(
                 f"submitted  order={shorten(result.order_id or '')}  "
                 f"tx={tx_s}{delayed}"
@@ -280,7 +313,7 @@ async def run(args: argparse.Namespace) -> int:
 
         await _drain()
         ok = settled_n >= args.count
-        lag_s = ",".join("none" if x is None else str(x) for x in lags)
+        lag_s = ",".join(str(x) for x in lags) or "-"
         ui.closing(
             f"status={'ok' if ok else 'failed'}  settled={settled_n}/{args.count}  lags={lag_s}",
             time.monotonic() - started,

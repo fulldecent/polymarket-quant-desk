@@ -129,7 +129,16 @@ def test_hashed_pending_needs_all_expected():
 def test_timeout_label_empty_expected_no_order():
     from traders.follow_anything.main import _pending_tx_label
 
-    assert _pending_tx_label({"expected": set(), "order_id": ""}) == "none"
+    assert _pending_tx_label({"expected": set(), "order_id": ""}) == "unknown"
+
+
+def test_copy_lag_same_block_is_zero():
+    from traders.follow_anything.main import _copy_lag
+
+    assert _copy_lag(93_640_042, 93_640_042) == 0
+    assert _copy_lag(93_640_043, 93_640_042) == 1
+    assert _copy_lag(93_640_043, 0) is None
+    assert _copy_lag(93_640_043, None) is None
 
 
 def test_neg_risk_from_exchange_address():
