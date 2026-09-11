@@ -137,9 +137,28 @@ def print_positions(positions: list[dict], label: str) -> None:
 # ── CLOB client ──────────────────────────────────────────────────────────────
 
 
+def _ensure_clob_http1() -> None:
+    """CLOB L1/L2 auth uses POLY_* headers. HTTP/2 lowercases them and CLOB 401s."""
+    import httpx
+    from py_clob_client.http_helpers import helpers as clob_http
+
+    existing = getattr(clob_http, "_http_client", None)
+    if getattr(existing, "_pqd_http1", False):
+        return
+    replacement = httpx.Client(http2=False, timeout=30.0)
+    replacement._pqd_http1 = True
+    clob_http._http_client = replacement
+    if existing is not None:
+        try:
+            existing.close()
+        except Exception:
+            pass
+
+
 def build_client() -> ClobClient:
     """Construct an authenticated ClobClient from environment variables."""
     load_env()
+    _ensure_clob_http1()
     host = get_clob_api_url()
     pk = require_env("EOA_PRIVATE_KEY")
     funder = require_env("POLYMARKET_PROXY_WALLET")

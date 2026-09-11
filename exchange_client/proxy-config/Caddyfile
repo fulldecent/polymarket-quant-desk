@@ -21,6 +21,9 @@
 		transport http {
 			tls
 			tls_server_name clob.polymarket.com
+			# HTTP/2 lowercases POLY_* L1/L2 auth headers; CLOB then returns
+			# "Invalid L1 Request headers".
+			versions 1.1
 		}
 	}
 }
@@ -63,6 +66,7 @@
 		transport http {
 			tls
 			tls_server_name relayer-v2.polymarket.com
+			versions 1.1
 		}
 	}
 }
