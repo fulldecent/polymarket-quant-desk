@@ -119,7 +119,7 @@ def _draw_footer() -> None:
     state.footer_lines = 1
 
 
-async def handle_polynode(event: TradeEvent) -> None:
+async def handle_polynode(event) -> None:
     tx = event.tx_hash
     if not tx:
         return

@@ -6,7 +6,7 @@ This folder has three responsibilities:
 
 1. **Proxy** — routes all Polymarket API traffic through Tor so the origin IP is hidden and geographic restrictions are bypassed.
 2. **Trading library** (`trading_lib.py`) — shared module for building a CLOB client, fetching positions, placing market orders, and logging trades. Imported by bots and other scripts across the repo.
-3. **CLI programs** — `positions_and_orders.py` and `buy-market.py` for interactive use.
+3. **CLI programs** — `positions_and_orders.py` is a frozen snapshot CLI. Write path is `traders/liquidate`. Live traders live under `traders/` (`watch_only`, `buy_token`, `liquidate`, `follow_anything`).
 
 ## One-time setup
 

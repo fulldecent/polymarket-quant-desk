@@ -1,0 +1,59 @@
+"""Buy-trigger extraction used by follow_anything."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+_project_root = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_project_root))
+
+from exchange_client.lib.event_stream import TradeEvent  # noqa: E402
+from traders.lib.streams import extract_buy_trigger  # noqa: E402
+
+TOKEN = "123"
+
+
+def _event(*, maker_asset: str, taker_asset: str, maker_amt: str, taker_amt: str) -> TradeEvent:
+    return TradeEvent(
+        tx_hash="0x" + "ab" * 32,
+        contract_address="0x" + "11" * 20,
+        event_type="OrderFilled",
+        maker="0x" + "aa" * 20,
+        taker="0x" + "bb" * 20,
+        maker_asset_id=maker_asset,
+        taker_asset_id=taker_asset,
+        maker_amount=maker_amt,
+        taker_amount=taker_amt,
+        fee="0",
+        block_number=1,
+        log_index=0,
+    )
+
+
+def test_maker_pays_usdc_is_a_buy():
+    trig = extract_buy_trigger(
+        _event(maker_asset="0", taker_asset=TOKEN, maker_amt="2000000", taker_amt="4000000")
+    )
+    assert trig is not None
+    assert trig["buyer"] == "0x" + "aa" * 20
+    assert trig["buy_token_id"] == TOKEN
+    assert trig["trade_value_usd"] == 2.0
+
+
+def test_taker_pays_usdc_is_a_buy():
+    trig = extract_buy_trigger(
+        _event(maker_asset=TOKEN, taker_asset="0", maker_amt="4000000", taker_amt="2000000")
+    )
+    assert trig is not None
+    assert trig["buyer"] == "0x" + "bb" * 20
+    assert trig["buy_token_id"] == TOKEN
+
+
+def test_token_token_is_not_a_buy():
+    assert (
+        extract_buy_trigger(
+            _event(maker_asset=TOKEN, taker_asset="999", maker_amt="1", taker_amt="1")
+        )
+        is None
+    )

@@ -1,16 +1,9 @@
-"""RPC WebSocket implementation of TradeEventStream.
+"""RPC WebSocket implementation of the settled trade stream.
 
-Connects to a Polygon JSON-RPC WebSocket endpoint, subscribes to OrderFilled and
-OrdersMatched logs from the Polymarket exchange contracts, and yields decoded
-TradeEvent objects.
-
-Usage:
-    from exchange_client.lib.event_stream import TradeEvent
-    from exchange_client.lib.rpc_event_stream import RpcSettledEventStream
-
-    stream = RpcSettledEventStream(ws_url="wss://polygon-mainnet.infura.io/ws/v3/KEY")
-    async for event in stream:
-        print(event.maker, event.maker_asset_id)
+Connects to a Polygon JSON-RPC WebSocket endpoint and subscribes to
+OrderFilled / OrdersMatched logs. v1 and v2 exchanges use different
+addresses and topic0 hashes, so they are two separate eth_subscribe
+filters on the same socket.
 """
 
 from __future__ import annotations
@@ -22,19 +15,17 @@ from typing import AsyncIterator
 import websockets
 
 from .event_stream import (
-    ALL_ADDRESSES,
-    WANTED_TOPICS,
+    V1_ADDRESSES,
+    V1_TOPICS,
+    V2_ADDRESSES,
+    V2_TOPICS,
     TradeEvent,
     decode_event,
 )
 
 
 class RpcSettledEventStream:
-    """Stream Polymarket trade events from a Polygon RPC WebSocket.
-
-    Handles connection, eth_subscribe, automatic reconnection with exponential
-    backoff, and decoding of raw EVM log data into TradeEvent objects.
-    """
+    """Stream Polymarket trade events from a Polygon RPC WebSocket."""
 
     def __init__(self, ws_url: str) -> None:
         self._ws_url = ws_url
@@ -83,25 +74,8 @@ class RpcSettledEventStream:
                     self._connected = True
                     reconnect_delay = 1.0
 
-                    subscribe_msg = {
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": "eth_subscribe",
-                        "params": [
-                            "logs",
-                            {
-                                "address": ALL_ADDRESSES,
-                                "topics": [WANTED_TOPICS],
-                            },
-                        ],
-                    }
-                    await ws.send(json.dumps(subscribe_msg))
-                    response = await ws.recv()
-                    data = json.loads(response)
-
-                    if "error" in data:
-                        raise ConnectionError(
-                            f"eth_subscribe error: {data['error']}")
+                    await _subscribe(ws, 1, V1_ADDRESSES, V1_TOPICS)
+                    await _subscribe(ws, 2, V2_ADDRESSES, V2_TOPICS)
 
                     async for message in ws:
                         try:
@@ -124,6 +98,26 @@ class RpcSettledEventStream:
                 self._connected = False
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 60)
+
+
+async def _subscribe(ws, req_id: int, addresses: list[str], topics: list[str]) -> None:
+    await ws.send(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "eth_subscribe",
+                "params": [
+                    "logs",
+                    {"address": addresses, "topics": [topics]},
+                ],
+            }
+        )
+    )
+    response = await ws.recv()
+    data = json.loads(response)
+    if "error" in data:
+        raise ConnectionError(f"eth_subscribe error: {data['error']}")
 
 
 # Backward-compatible alias while callers migrate.

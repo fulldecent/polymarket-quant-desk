@@ -1,0 +1,112 @@
+"""Shared rich console + per-run log file for trader CLIs."""
+
+from __future__ import annotations
+
+import logging
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from rich.console import Console
+from rich.live import Live
+from rich.text import Text
+from rich.theme import Theme
+
+COLOR_DONE = "green"
+COLOR_TODO = "magenta"
+
+
+class _UtcFormatter(logging.Formatter):
+    converter = time.gmtime
+
+
+def format_hms(seconds: float) -> str:
+    if seconds < 0 or seconds != seconds:
+        return "0:00:00"
+    total = int(seconds)
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}"
+
+
+def shorten(value: str, *, head: int = 6, tail: int = 4) -> str:
+    if not value:
+        return "none"
+    if len(value) <= head + tail + 1:
+        return value
+    return f"{value[:head]}…{value[-tail:]}"
+
+
+def shorten_addr(addr: str) -> str:
+    if not addr:
+        return "none"
+    if not addr.startswith("0x") or len(addr) < 10:
+        return addr
+    return f"{addr[:5]}…{addr[-3:]}"
+
+
+class TraderUI:
+    """Opening banner, scrolling lines, optional sticky wait footer, closing banner."""
+
+    def __init__(self, program: str, script_file: str) -> None:
+        self.program = program
+        self.console = Console(
+            theme=Theme(
+                {"progress.elapsed": COLOR_DONE, "progress.remaining": COLOR_TODO}
+            )
+        )
+        log_dir = Path(script_file).resolve().parent / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
+        self.log_path = log_dir / f"main-{ts}.log"
+        handler = logging.FileHandler(self.log_path, encoding="utf-8")
+        handler.setFormatter(
+            _UtcFormatter("%(asctime)s  %(message)s", datefmt="%Y-%m-%dT%H:%M:%SZ")
+        )
+        self.log = logging.getLogger(f"trader.{program}")
+        self.log.setLevel(logging.DEBUG)
+        self.log.handlers.clear()
+        self.log.addHandler(handler)
+        self.log.propagate = False
+        self._live: Live | None = None
+        self._footer = Text("")
+
+    def print(self, text: str | Text) -> None:
+        if self._live is not None:
+            self.console.print(text, highlight=False, markup=False)
+        else:
+            self.console.print(text, highlight=False, markup=False)
+        self.log.info(text.plain if isinstance(text, Text) else text)
+
+    def log_only(self, message: str) -> None:
+        self.log.info(message)
+
+    def opening(self, line1: str, *, account: str) -> None:
+        self.print(line1)
+        self.print(f"account={shorten_addr(account)}  log={self.log_path}")
+
+    def start_footer(self, text: str) -> None:
+        self.stop_footer()
+        self._footer = Text(text)
+        self._live = Live(
+            self._footer,
+            console=self.console,
+            refresh_per_second=8,
+            transient=True,
+        )
+        self._live.start()
+
+    def update_footer(self, text: str) -> None:
+        self._footer.plain = text
+        if self._live is not None:
+            self._live.update(self._footer)
+
+    def stop_footer(self) -> None:
+        if self._live is not None:
+            self._live.stop()
+            self._live = None
+
+    def closing(self, status_line: str, elapsed: float) -> None:
+        self.stop_footer()
+        self.print(status_line)
+        self.print(f"elapsed={format_hms(elapsed)}")
