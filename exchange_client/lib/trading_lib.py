@@ -161,6 +161,26 @@ def build_client() -> ClobClient:
     )
 
 
+def derive_clob_api_creds(client: ClobClient) -> ApiCreds:
+    """Replace L2 API creds by creating/deriving them from the EOA (L1).
+
+    Does not write ``.env``. The new creds last for this process only.
+    """
+    creds = client.create_or_derive_api_creds()
+    if creds is None:
+        raise RuntimeError("could not create or derive CLOB API creds from the EOA")
+    client.set_api_creds(creds)
+    return creds
+
+
+def _parse_cast_int(stdout: str) -> int:
+    """Parse ``cast`` integer output. Foundry may append ``[7.911e7]``."""
+    token = stdout.strip().split()[0]
+    if not token:
+        raise ValueError(f"empty cast output: {stdout!r}")
+    return int(token, 0)
+
+
 def get_funder_address() -> str:
     """Return the proxy wallet (funder) address."""
     return require_env("POLYMARKET_PROXY_WALLET")
@@ -282,7 +302,7 @@ def get_pol_balance() -> float:
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if r.returncode != 0:
         raise RuntimeError(explain_rpc_error(rpc, r.stderr))
-    return int(r.stdout.strip()) / 1e18
+    return _parse_cast_int(r.stdout) / 1e18
 
 
 def get_usdc_balance(client: ClobClient) -> float:
@@ -309,7 +329,7 @@ def get_usdc_balance_via_rpc(address: str | None = None) -> float:
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if r.returncode != 0:
         raise RuntimeError(explain_rpc_error(rpc, r.stderr))
-    return int(r.stdout.strip(), 0) / 1e6
+    return _parse_cast_int(r.stdout) / 1e6
 
 
 def get_usdc_balance_raw(client: ClobClient) -> str:

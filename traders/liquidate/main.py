@@ -68,6 +68,21 @@ async def run(args: argparse.Namespace) -> int:
     clob = trading_lib.build_client()
     exec_client = execution_client(args.exec)
     started = time.monotonic()
+    try:
+        trading_lib.get_usdc_balance(clob)
+    except Exception as exc:
+        if "401" in str(exc):
+            ui.print("clob l2 key rejected; deriving from EOA")
+            try:
+                creds = trading_lib.derive_clob_api_creds(clob)
+                ui.print(f"clob l2 key derived  api_key={creds.api_key[:8]}…")
+                ui.print(
+                    "update CLOB_API_KEY / CLOB_SECRET / CLOB_PASS_PHRASE in .env to keep it"
+                )
+            except Exception as derive_exc:
+                ui.print(f"clob derive failed  error={derive_exc}")
+        else:
+            ui.log_only(f"clob probe: {exc}")
     stream = None
     if has_write and not args.dry_run:
         stream = settled_stream(args.listen, on_status=ui.print)
