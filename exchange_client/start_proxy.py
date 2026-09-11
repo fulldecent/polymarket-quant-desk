@@ -11,7 +11,6 @@ Press Enter to recheck the proxy IP address (useful to verify connection is stil
 
 import atexit
 import json
-import os
 import re
 import select
 import signal
@@ -207,9 +206,7 @@ def main():
         sys.exit(1)
 
     origin = data.get("origin", "unknown")
-    wallet = os.environ.get("POLYMARKET_PROXY_WALLET", "not set")
     print(f"\nProxied IP address: {origin}")
-    print(f"Wallet: {wallet}")
     print("Proxy is running. Press Ctrl+C to stop all services.")
     print("Press Enter to recheck proxy IP address.\n")
 

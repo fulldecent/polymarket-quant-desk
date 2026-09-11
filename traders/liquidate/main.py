@@ -82,12 +82,7 @@ async def run(args: argparse.Namespace) -> int:
             return 1
 
     try:
-        try:
-            usdc = trading_lib.get_usdc_balance(clob)
-            ui.print(f"usdc={trading_lib.fmt_usd(usdc)}")
-        except Exception as exc:
-            ui.print(f"usdc=unavailable  error={exc}")
-
+        _print_usdc(ui, clob, account)
         _print_snapshot(ui, clob, account)
 
         expected: list[str] = []
@@ -158,6 +153,23 @@ async def run(args: argparse.Namespace) -> int:
             await stream.disconnect()
 
 
+def _print_usdc(ui: TraderUI, client, account: str) -> None:
+    try:
+        usdc = trading_lib.get_usdc_balance_via_rpc(account)
+        ui.print(f"usdc={trading_lib.fmt_usd(usdc)}")
+        return
+    except Exception as rpc_exc:
+        ui.log_only(f"usdc via rpc failed: {rpc_exc}")
+    try:
+        usdc = trading_lib.get_usdc_balance(client)
+        ui.print(f"usdc={trading_lib.fmt_usd(usdc)}")
+    except Exception as exc:
+        ui.print(
+            "usdc=unavailable  "
+            f"error={trading_lib.explain_api_error('CLOB API', trading_lib.get_clob_api_url(), exc)}"
+        )
+
+
 def _print_snapshot(ui: TraderUI, client, account: str) -> None:
     try:
         open_positions = trading_lib.fetch_positions(account, redeemable=False)
@@ -166,11 +178,11 @@ def _print_snapshot(ui: TraderUI, client, account: str) -> None:
             for p in trading_lib.fetch_positions(account, redeemable=True)
             if float(p.get("curPrice", 0)) > 0
         ]
-        orders = trading_lib.fetch_open_orders(client)
-        mergeable = trading_lib.find_mergeable_pairs(account)
     except Exception as exc:
-        ui.print(f"snapshot unavailable  error={exc}")
-        return
+        ui.print(f"positions unavailable  error={exc}")
+        open_positions, redeemable = [], []
+
+    mergeable = trading_lib.find_mergeable_pairs_from_positions(open_positions)
 
     total = sum(float(p.get("currentValue", 0)) for p in open_positions)
     ui.print(f"positions: {len(open_positions)} ({trading_lib.fmt_usd(total)})")
@@ -204,6 +216,15 @@ def _print_snapshot(ui: TraderUI, client, account: str) -> None:
         if len(title) > 50:
             title = title[:49] + "…"
         ui.print(f"  {trading_lib.fmt_usd(float(m.get('recover_usd', 0))):>8}  {title}")
+
+    try:
+        orders = trading_lib.fetch_open_orders(client)
+    except Exception as exc:
+        ui.print(
+            "open_orders unavailable  "
+            f"error={trading_lib.explain_api_error('CLOB API', trading_lib.get_clob_api_url(), exc)}"
+        )
+        return
 
     ui.print(f"open_orders: {len(orders)}")
     for o in orders:
