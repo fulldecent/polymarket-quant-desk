@@ -160,9 +160,15 @@ async def _wait_for_fill(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Fill-or-kill market buy of one outcome token."
+        description="Fill-or-kill market buy of one outcome token.",
+        epilog="Look up TOKEN_ID: python explorations/token-search/main.py <query>",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("token_id", metavar="TOKEN_ID", help="decimal clobTokenId")
+    parser.add_argument(
+        "token_id",
+        metavar="TOKEN_ID",
+        help="decimal clobTokenId (python explorations/token-search/main.py <query>)",
+    )
     parser.add_argument("--exec", required=True, choices=EXEC_CHOICES)
     parser.add_argument("--listen", required=True, choices=LISTEN_CHOICES)
     parser.add_argument("--amount", type=float, required=True, metavar="USD")
