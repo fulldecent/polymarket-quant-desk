@@ -48,6 +48,31 @@ The full dependency graph for your pipeline is in the [data catalog](docs/Data%2
 
 This is information you use to find alpha!
 
+## Trade
+
+CLOB traffic goes through a local Tor proxy for testing. Start it in a **separate tab** and leave it running:
+
+```sh
+source .venv/bin/activate
+python exchange_client/start_proxy.py
+```
+
+(`brew install tor gost caddy` once, if those are not on the machine yet.)
+
+In another tab, inspect the account or unwind it with `liquidate`. With no action flags it prints a snapshot of positions and open orders:
+
+```sh
+source .venv/bin/activate
+python traders/liquidate/main.py --exec clob --listen rpc
+```
+
+```sh
+python traders/liquidate/main.py --exec clob --listen rpc --cancel-orders
+python traders/liquidate/main.py --exec clob --listen rpc --market-sell --redeem --merge
+```
+
+Other trading strategies are available under [`traders/`](traders/).
+
 ## Explorations
 
 Run any of the scripts in the `explorations/` folder to do ad-hoc analysis or testing.
