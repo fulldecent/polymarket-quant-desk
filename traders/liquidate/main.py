@@ -106,6 +106,7 @@ async def run(args: argparse.Namespace) -> int:
                         fill_hashes.extend(hashes)
 
         if args.redeem:
+            ui.print("")
             try:
                 hashes = await exec_client.redeem_positions(account, dry_run=args.dry_run)
             except Exception as exc:
@@ -119,6 +120,7 @@ async def run(args: argparse.Namespace) -> int:
             ui.print(f"redeem submitted  txs={len(hashes)}")
 
         if args.merge:
+            ui.print("")
             hashes = await exec_client.merge_positions(account, dry_run=args.dry_run)
             expected.extend(hashes)
             ui.print(f"merge submitted  txs={len(hashes)}")
