@@ -14,6 +14,8 @@ from pathlib import Path
 _project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_project_root))
 
+from rich.text import Text  # noqa: E402
+
 from exchange_client.lib import trading_lib  # noqa: E402
 from traders.lib.streams import (  # noqa: E402
     LISTEN_CHOICES,
@@ -23,7 +25,7 @@ from traders.lib.streams import (  # noqa: E402
     settled_stream,
     usdc_notional,
 )
-from traders.lib.ui import TraderUI, format_hms  # noqa: E402
+from traders.lib.ui import COLOR_DONE, TraderUI  # noqa: E402
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -32,12 +34,19 @@ async def run(args: argparse.Namespace) -> int:
     account = os_account()
     mempool_flag = "  mempool" if args.trigger_polynode_mempool else ""
     ui.opening(account=account)
-    ui.log_only(f"listen={args.listen}{mempool_flag}")
+    ui.log_only(f"listen: {args.listen}{mempool_flag}")
 
-    ui.print(f"connecting listen={args.listen}  host={listen_host(args.listen)}")
-    listen = settled_stream(args.listen, on_status=ui.print)
+    def _on_status(msg: str) -> None:
+        if msg.startswith("listen error"):
+            ui.print(msg)
+        else:
+            ui.log_only(msg)
+
+    host = listen_host(args.listen)
+    ui.start_spinner(f"connecting  listen: {args.listen}  host: {host}")
+    listen = settled_stream(args.listen, on_status=_on_status)
     trigger = (
-        mempool_stream(on_status=ui.print) if args.trigger_polynode_mempool else None
+        mempool_stream(on_status=_on_status) if args.trigger_polynode_mempool else None
     )
     started = time.monotonic()
     try:
@@ -93,13 +102,14 @@ async def run(args: argparse.Namespace) -> int:
                 return
             mempool_seen += 1
 
+    def _watch_desc() -> str:
+        block = f"{last_block:,}" if last_block else "—"
+        extra = f"  mempool: {mempool_seen:,}" if trigger is not None else ""
+        return f"watching  last block: {block}  fills: {fills:,}{extra}"
+
     async def _footer_loop() -> None:
         while not stop.is_set():
-            elapsed = format_hms(time.monotonic() - started)
-            extra = f"  mempool={mempool_seen:,}" if trigger is not None else ""
-            ui.update_footer(
-                f"waiting  last_block={last_block:,}  fills={fills:,}{extra}  {elapsed}"
-            )
+            ui.update_spinner(_watch_desc())
             try:
                 await asyncio.wait_for(stop.wait(), timeout=0.25)
             except asyncio.TimeoutError:
@@ -109,7 +119,7 @@ async def run(args: argparse.Namespace) -> int:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
 
-    ui.start_footer("waiting  last_block=none  fills=0  0:00:00")
+    ui.update_spinner(_watch_desc())
     tasks = [
         asyncio.create_task(_listen_loop()),
         asyncio.create_task(_footer_loop()),
@@ -129,9 +139,9 @@ async def run(args: argparse.Namespace) -> int:
             await trigger.disconnect()
         for b in sorted(block_fills):
             _emit_block(ui, b, block_fills[b])
-        extra = f"  mempool={mempool_seen:,}" if args.trigger_polynode_mempool else ""
+        extra = f"  mempool: {mempool_seen:,}" if args.trigger_polynode_mempool else ""
         ui.closing(
-            f"status=ok  fills={fills:,}  last_block={last_block:,}{extra}",
+            f"status=ok  fills: {fills:,}  last block: {last_block:,}{extra}",
             time.monotonic() - started,
         )
     return 0
@@ -141,10 +151,11 @@ def _emit_block(ui: TraderUI, block: int, events: list) -> None:
     accounts = {e.maker for e in events if e.maker} | {e.taker for e in events if e.taker}
     tokens = {outcome_token_id(e) for e in events if outcome_token_id(e)}
     usdc = sum(usdc_notional(e) for e in events)
-    ui.print(
-        f"block={block:,}  fills={len(events):,}  accounts={len(accounts):,}  "
-        f"usdc={usdc:,.2f}  tokens={len(tokens):,}"
-    )
+    line = Text("  -> block: ")
+    line.append(f"{block:,}", style=COLOR_DONE)
+    line.append(f"  fills: {len(events):,}  accounts: {len(accounts):,}  ")
+    line.append(f"usdc: {usdc:,.2f}  tokens: {len(tokens):,}")
+    ui.print(line)
 
 
 def os_account() -> str:

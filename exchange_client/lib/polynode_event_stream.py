@@ -352,7 +352,7 @@ class PolynodeMempoolEventStream:
 
             except Exception as exc:
                 self._status(
-                    f"listen error={type(exc).__name__}: {exc}  retry={reconnect_delay:.0f}s mempool"
+                    f"listen error: {type(exc).__name__}: {exc}  retry: {reconnect_delay:.0f}s  mempool"
                 )
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 60)
@@ -451,7 +451,7 @@ class PolynodeSettledEventStream:
 
             except Exception as exc:
                 self._status(
-                    f"listen error={type(exc).__name__}: {exc}  retry={reconnect_delay:.0f}s settled"
+                    f"listen error: {type(exc).__name__}: {exc}  retry: {reconnect_delay:.0f}s  settled"
                 )
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 60)

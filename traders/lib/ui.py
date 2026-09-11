@@ -9,6 +9,7 @@ from pathlib import Path
 
 from rich.console import Console
 from rich.live import Live
+from rich.progress import Progress, SpinnerColumn, TaskID, TextColumn, TimeElapsedColumn
 from rich.text import Text
 from rich.theme import Theme
 
@@ -71,7 +72,8 @@ class TraderUI:
         self.log.addHandler(handler)
         self.log.propagate = False
         self._live: Live | None = None
-        self._footer = Text("")
+        self._spinner: Progress | None = None
+        self._spinner_task: TaskID | None = None
 
     def print(self, text: str | Text) -> None:
         self.console.print(text, highlight=False, markup=False)
@@ -94,26 +96,40 @@ class TraderUI:
             line.append(f"  {detail}")
         self.print(line)
 
-    def start_footer(self, text: str) -> None:
+    def start_spinner(self, description: str) -> None:
+        """Indeterminate sticky row: spinner + text + elapsed (scraper gold standard)."""
         self.stop_footer()
-        self._footer = Text(text)
+        self._spinner = Progress(
+            SpinnerColumn(),
+            TextColumn("{task.description}"),
+            TimeElapsedColumn(),
+            console=self.console,
+        )
+        self._spinner_task = self._spinner.add_task(description, total=None)
         self._live = Live(
-            self._footer,
+            self._spinner,
             console=self.console,
             refresh_per_second=8,
             transient=True,
         )
         self._live.start()
 
+    def update_spinner(self, description: str) -> None:
+        if self._spinner is not None and self._spinner_task is not None:
+            self._spinner.update(self._spinner_task, description=description)
+
+    def start_footer(self, text: str) -> None:
+        self.start_spinner(text)
+
     def update_footer(self, text: str) -> None:
-        self._footer.plain = text
-        if self._live is not None:
-            self._live.update(self._footer)
+        self.update_spinner(text)
 
     def stop_footer(self) -> None:
         if self._live is not None:
             self._live.stop()
             self._live = None
+        self._spinner = None
+        self._spinner_task = None
 
     def closing(self, status_line: str, elapsed: float) -> None:
         self.stop_footer()

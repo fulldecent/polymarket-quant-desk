@@ -107,7 +107,7 @@ class RpcSettledEventStream:
                     self._connected = True
                     reconnect_delay = 1.0
                     self._ready.set()
-                    self._status(f"connected listen=rpc {label}")
+                    self._status(f"connected  listen: rpc  {label}")
                     async for message in ws:
                         try:
                             data = json.loads(message)
@@ -129,12 +129,12 @@ class RpcSettledEventStream:
                 fatal = "405" in self._last_error or "InvalidStatus" in type(exc).__name__
                 if fatal:
                     self._status(
-                        f"listen error={self._last_error}  "
-                        f"{self._ws_url} is not a WebSocket; set POLYGON_WS_URL"
+                        f"listen error: {self._last_error}  "
+                        f"not a WebSocket; set POLYGON_WS_URL"
                     )
                     return
                 self._status(
-                    f"listen error={self._last_error}  retry={reconnect_delay:.0f}s {label}"
+                    f"listen error: {self._last_error}  retry: {reconnect_delay:.0f}s  {label}"
                 )
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 60)
