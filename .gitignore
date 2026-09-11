@@ -16,6 +16,7 @@ dist/
 *.db
 *.parquet
 logs
+trading-logs/
 
 # IDE
 .vscode/

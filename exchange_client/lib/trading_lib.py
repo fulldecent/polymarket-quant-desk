@@ -32,7 +32,8 @@ from py_clob_client import (
 )
 
 CHAIN_POLYGON = 137
-TRADING_LOGS_DIR = Path(__file__).resolve().parent.parent / "trading-logs"
+TRADING_LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
+_log_file: Path | None = None
 _LOCAL_PROXY_PORTS = {
     9430: "httpbin proxy",
     9431: "CLOB API proxy",
@@ -73,14 +74,18 @@ def require_env(name: str) -> str:
 
 
 def _log_path() -> Path:
-    now = datetime.now(timezone.utc)
-    return TRADING_LOGS_DIR / f"{now.strftime('%Y-%m-%dT%H')}Z.jsonl"
+    """One ``logs/main-{YYYY-MM-DDTHHMMSS}Z.log`` per process, same as derived jobs."""
+    global _log_file
+    if _log_file is None:
+        TRADING_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
+        _log_file = TRADING_LOGS_DIR / f"main-{ts}.log"
+    return _log_file
 
 
 def log_event(event: dict) -> None:
-    """Append a JSON line to the current trading log file."""
+    """Append a JSON line to this process's trading log file."""
     event["timestamp"] = datetime.now(timezone.utc).isoformat()
-    TRADING_LOGS_DIR.mkdir(parents=True, exist_ok=True)
     with open(_log_path(), "a") as f:
         f.write(json.dumps(event) + "\n")
 
@@ -138,6 +143,7 @@ def print_positions(positions: list[dict], label: str) -> None:
 
 
 _CLOB_ORIGIN = "https://clob.polymarket.com"
+_RELAYER_ORIGIN = "https://relayer-v2.polymarket.com"
 _TOR_SOCKS = "socks5://127.0.0.1:9050"
 
 
@@ -1154,6 +1160,54 @@ def dump_all_positions(client: ClobClient, user: str) -> list[dict]:
 # ── Builder relayer client ───────────────────────────────────────────────────
 
 
+def _configure_relayer_http(*, via_tor: bool) -> None:
+    """Builder HMAC uses POLY_BUILDER_* headers. Caddy HTTP/2 mangles them (401)."""
+    import requests
+    from py_builder_relayer_client.exceptions import RelayerApiException
+    from py_builder_relayer_client.http_helpers import helpers as relayer_http
+
+    marker = "tor" if via_tor else "direct"
+    if getattr(relayer_http, "_pqd_relayer_http", None) == marker:
+        return
+
+    proxies = {"http": _TOR_SOCKS, "https": _TOR_SOCKS} if via_tor else None
+
+    def request(endpoint: str, method: str, headers=None, data=None):
+        try:
+            resp = requests.request(
+                method=method,
+                url=endpoint,
+                headers=headers,
+                json=data if data else None,
+                proxies=proxies,
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                raise RelayerApiException(resp)
+            try:
+                return resp.json()
+            except requests.JSONDecodeError:
+                return resp.text
+        except requests.RequestException as exc:
+            raise RelayerApiException(error_msg=f"Request exception: {exc}") from exc
+
+    def post(endpoint, headers=None, data=None):
+        return request(endpoint, "POST", headers, data)
+
+    def get(endpoint, headers=None, data=None):
+        return request(endpoint, "GET", headers, data)
+
+    relayer_http.request = request
+    relayer_http.post = post
+    relayer_http.get = get
+    # client.py imported get/post by name; patch those bindings too.
+    import py_builder_relayer_client.client as relayer_client
+
+    relayer_client.post = post
+    relayer_client.get = get
+    relayer_http._pqd_relayer_http = marker
+
+
 def build_relayer_client():
     """Construct an authenticated RelayClient from environment variables.
 
@@ -1166,6 +1220,10 @@ def build_relayer_client():
 
     load_env()
     private_key = require_env("EOA_PRIVATE_KEY")
+    configured = require_env("RELAYER_API_URL")
+    via_tor = _is_local_url(configured)
+    _configure_relayer_http(via_tor=via_tor)
+    relayer_url = _RELAYER_ORIGIN if via_tor else configured
 
     builder_config = BuilderConfig(
         local_builder_creds=BuilderApiKeyCreds(
@@ -1176,7 +1234,7 @@ def build_relayer_client():
     )
 
     return RelayClient(
-        relayer_url=require_env("RELAYER_API_URL"),
+        relayer_url=relayer_url,
         chain_id=CHAIN_POLYGON,
         private_key=private_key,
         builder_config=builder_config,
@@ -1474,7 +1532,7 @@ def redeem_positions_relayer(
             "method": "relayer",
             "error": str(exc),
         })
-        return []
+        raise
 
 
 def redeem_positions_rpc(user: str, *, dry_run: bool = False) -> list[str]:

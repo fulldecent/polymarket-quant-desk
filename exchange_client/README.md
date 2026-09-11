@@ -103,10 +103,10 @@ pkill tor; pkill gost; pkill caddy
 | `sell_token(client, token_id, size)` | Places a fill-or-kill market sell order |
 | `cancel_all_orders(client)` | Cancels all open CLOB orders |
 | `dump_all_positions(client, user)` | Sells all open positions at market price |
-| `log_event(event)` | Appends a JSON line to the current session's trading log in `trading-logs/` |
+| `log_event(event)` | Appends a JSON line to this process's `logs/main-{YYYY-MM-DDTHHMMSS}Z.log` |
 | `require_env(name)` | Reads a required env var or exits with a clear error message |
 
-All orders are logged to `../trading-logs/` as timestamped JSONL files, with both a `submitted` and `completed`/`failed` entry per order.
+Order events are JSON lines in `logs/main-{YYYY-MM-DDTHHMMSS}Z.log` next to this folder (gitignored, same `logs/` convention as derived jobs and traders).
 
 ## CLI programs
 

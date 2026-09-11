@@ -106,7 +106,15 @@ async def run(args: argparse.Namespace) -> int:
                         expected.extend(_extract_tx_hashes(row.get("response")))
 
         if args.redeem:
-            hashes = await exec_client.redeem_positions(account, dry_run=args.dry_run)
+            try:
+                hashes = await exec_client.redeem_positions(account, dry_run=args.dry_run)
+            except Exception as exc:
+                ui.print(f"redeem failed  error={exc}")
+                ui.closing(
+                    f"status=failed  error={exc}",
+                    time.monotonic() - started,
+                )
+                return 1
             expected.extend(hashes)
             ui.print(f"redeem submitted  txs={len(hashes)}")
 
