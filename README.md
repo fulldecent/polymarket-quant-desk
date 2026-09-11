@@ -4,6 +4,8 @@
 
 An automated suite for analyzing and executing trade strategies against Polymarket
 
+This project is provided with NO WARRANTY, express or implied. Use at your own risk.
+
 ## Hardware requirements
 
 This project scrapes raw events from the Polygon blockchain, derived table analysis and trade execution.
