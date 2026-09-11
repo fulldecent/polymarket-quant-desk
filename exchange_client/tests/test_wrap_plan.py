@@ -83,3 +83,22 @@ def test_usd_to_raw_rounds_micros():
     assert trading_lib._usd_to_raw(2) == 2_000_000
     assert trading_lib._usd_to_raw(2.02) == 2_020_000
     assert trading_lib._usd_to_raw(166.760707) == 166_760_707
+
+
+def test_plan_approves_negrisk_adapter_for_pusd():
+    assert trading_lib._NEGRISK_ADAPTER in trading_lib._PUSD_SPENDERS
+    with patch.object(trading_lib, "_cast_calldata", side_effect=_encode):
+        txs = trading_lib.plan_wrap_and_v2_approvals(
+            OWNER,
+            wrap_raw=0,
+            usdce_onramp_allowance=0,
+            pusd_allowances={
+                s: 0 if s == trading_lib._NEGRISK_ADAPTER else trading_lib._MAX_UINT256
+                for s in trading_lib._PUSD_SPENDERS
+            },
+            ctf_approvals={o: True for o in trading_lib._CTF_OPERATORS},
+        )
+    assert len(txs) == 1
+    assert txs[0][0] == trading_lib._PUSD
+    spender = trading_lib._NEGRISK_ADAPTER
+    assert txs[0][2] == f"approve pUSD → {spender[:6]}…{spender[-4:]}"

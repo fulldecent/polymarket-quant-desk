@@ -1317,12 +1317,33 @@ def build_relayer_client():
         ),
     )
 
+    _silence_relayer_wait_prints()
     return RelayClient(
         relayer_url=relayer_url,
         chain_id=CHAIN_POLYGON,
         private_key=private_key,
         builder_config=builder_config,
     )
+
+
+def _silence_relayer_wait_prints() -> None:
+    """Relayer poll_until_state prints a UUID wait line to stdout."""
+    from py_builder_relayer_client.client import RelayClient
+
+    fn = RelayClient.poll_until_state
+    if getattr(fn, "_pqd_quiet", False):
+        return
+
+    def quiet(self, *args, **kwargs):
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            return fn(self, *args, **kwargs)
+
+    quiet._pqd_quiet = True
+    RelayClient.poll_until_state = quiet
 
 
 # ── Redeem resolved positions ───────────────────────────────────────────────
@@ -1343,6 +1364,7 @@ _PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 _COLLATERAL_ONRAMP = "0x93070a847efEf7F70739046A929D47a521F5B8ee"
 _CTF_EXCHANGE_V2 = "0xE111180000d2663C0091e4f400237545B87B996B"
 _NEGRISK_CTF_EXCHANGE_V2 = "0xe2222d279d744050d28e00520010520000310F59"
+_NEGRISK_CTF_EXCHANGE_V2_B = "0xe2222d002000Ba0053CEF3375333610F64600036"
 _CTF_COLLATERAL_ADAPTER = "0xAdA100Db00Ca00073811820692005400218FcE1f"
 _NEGRISK_CTF_COLLATERAL_ADAPTER = "0xadA2005600Dec949baf300f4C6120000bDB6eAab"
 _MULTISEND_ADDRESS = "0xA238CBeb142c10Ef7Ad8442C6D1f9E89e07e7761"
@@ -1352,10 +1374,13 @@ _DELEGATECALL_OPERATION = 1
 _MAX_UINT256 = 2**256 - 1
 _UNLIMITED_ALLOWANCE = _MAX_UINT256 // 2
 
-# pUSD spenders the CLOB v2 matching engine and CTF adapters pull from.
+# pUSD spenders CLOB v2 checks before matching. NegRiskAdapter is the v1
+# adapter; CLOB still requires a pUSD allowance to it on neg-risk markets.
 _PUSD_SPENDERS = (
     _CTF_EXCHANGE_V2,
     _NEGRISK_CTF_EXCHANGE_V2,
+    _NEGRISK_CTF_EXCHANGE_V2_B,
+    _NEGRISK_ADAPTER,
     _CTF_COLLATERAL_ADAPTER,
     _NEGRISK_CTF_COLLATERAL_ADAPTER,
 )
@@ -1363,6 +1388,7 @@ _PUSD_SPENDERS = (
 _CTF_OPERATORS = (
     _CTF_EXCHANGE_V2,
     _NEGRISK_CTF_EXCHANGE_V2,
+    _NEGRISK_CTF_EXCHANGE_V2_B,
     _NEGRISK_ADAPTER,
     _CTF_COLLATERAL_ADAPTER,
     _NEGRISK_CTF_COLLATERAL_ADAPTER,
@@ -2256,6 +2282,16 @@ def plan_wrap_and_v2_approvals(
             f"CTF setApprovalForAll {operator[:6]}…{operator[-4:]}",
         ))
     return txs
+
+
+def missing_pusd_spenders(owner: str | None = None) -> list[str]:
+    """Return pUSD spenders whose allowance is below unlimited."""
+    wallet = owner or get_funder_address()
+    missing: list[str] = []
+    for spender in _PUSD_SPENDERS:
+        if _erc20_allowance_raw(_PUSD, wallet, spender) < _UNLIMITED_ALLOWANCE:
+            missing.append(spender)
+    return missing
 
 
 def _fetch_wrap_chain_state(owner: str) -> dict:

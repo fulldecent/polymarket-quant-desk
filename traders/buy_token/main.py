@@ -66,7 +66,11 @@ async def run(args: argparse.Namespace) -> int:
         return 1
 
     needed = args.amount
+    wrap_usd: float | None = None
     if pusd + 1e-9 < needed:
+        wrap_usd = round((needed - pusd) * _WRAP_FEE_BUFFER, 6)
+        if wrap_usd < 0.01:
+            wrap_usd = 0.01
         if not args.wrap:
             ui.closing(
                 f"status=failed  error=pUSD {trading_lib.fmt_usd(pusd)} "
@@ -76,9 +80,6 @@ async def run(args: argparse.Namespace) -> int:
                 time.monotonic() - started,
             )
             return 1
-        wrap_usd = round((needed - pusd) * _WRAP_FEE_BUFFER, 6)
-        if wrap_usd < 0.01:
-            wrap_usd = 0.01
         if usdce + 1e-9 < wrap_usd:
             ui.closing(
                 f"status=failed  error=need {trading_lib.fmt_usd(wrap_usd)} pUSD, "
@@ -87,7 +88,33 @@ async def run(args: argparse.Namespace) -> int:
                 time.monotonic() - started,
             )
             return 1
-        ui.print(f"wrap         {trading_lib.fmt_usd(wrap_usd)} USDC.e → pUSD")
+    elif args.wrap:
+        wrap_usd = 0.0
+    else:
+        try:
+            missing = trading_lib.missing_pusd_spenders(account)
+        except Exception as exc:
+            ui.closing(
+                f"status=failed  error={exc}",
+                time.monotonic() - started,
+            )
+            return 1
+        if missing:
+            spenders = " ".join(shorten(s) for s in missing)
+            ui.closing(
+                f"status=failed  error=pUSD allowance 0 for {spenders}. "
+                "Wrap: python traders/liquidate/main.py --exec clob --listen rpc --wrap",
+                time.monotonic() - started,
+            )
+            return 1
+
+    if wrap_usd is not None:
+        amount_s = (
+            "approvals"
+            if wrap_usd == 0
+            else f"{trading_lib.fmt_usd(wrap_usd)} USDC.e → pUSD"
+        )
+        ui.print(f"wrap         {amount_s}")
         ui.start_footer("wrapping  usdc.e → pUSD")
         try:
             result = await asyncio.to_thread(
@@ -107,10 +134,13 @@ async def run(args: argparse.Namespace) -> int:
         for label in result.labels:
             ui.print(f"  {label}")
         tx = result.tx_hashes[0] if result.tx_hashes else ""
-        ui.print(
-            f"wrap mined   tx={shorten(tx)}  "
-            f"pUSD={trading_lib.fmt_usd(result.pusd_after)}"
-        )
+        if result.tx_hashes:
+            ui.print(
+                f"wrap mined   tx={shorten(tx)}  "
+                f"pUSD={trading_lib.fmt_usd(result.pusd_after)}"
+            )
+        elif result.labels:
+            ui.print("wrap none")
         pusd = result.pusd_after
         if pusd + 1e-9 < needed:
             ui.closing(
