@@ -12,6 +12,8 @@ from pathlib import Path
 _project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_project_root))
 
+from rich.text import Text  # noqa: E402
+
 from exchange_client.lib import trading_lib  # noqa: E402
 from exchange_client.lib.event_stream import TradeEvent  # noqa: E402
 from traders.lib.streams import (  # noqa: E402
@@ -22,7 +24,7 @@ from traders.lib.streams import (  # noqa: E402
     listen_host,
     settled_stream,
 )
-from traders.lib.ui import TraderUI, format_hms, shorten  # noqa: E402
+from traders.lib.ui import COLOR_DONE, COLOR_TODO, TraderUI, format_hms, shorten  # noqa: E402
 
 
 def _extract_tx_hashes(raw: object) -> list[str]:
@@ -56,14 +58,9 @@ async def run(args: argparse.Namespace) -> int:
     if args.dry_run:
         actions.append("dry-run")
     has_write = bool(actions)
-    ui.opening(
-        f"liquidate  exec={args.exec}  listen={args.listen}  "
-        f"order-book=clob  redeem/merge={args.exec}  "
-        f"actions={','.join(actions) if actions else 'snapshot'}",
-        account=account,
-    )
-    ui.print(f"order-book: clob")
-    ui.print(f"redeem/merge: {args.exec}")
+    ui.opening(account=account)
+    if actions:
+        ui.log_only(f"actions={','.join(actions)}")
 
     clob = trading_lib.build_client()
     exec_client = execution_client(args.exec)
@@ -172,16 +169,45 @@ async def run(args: argparse.Namespace) -> int:
             await stream.disconnect()
 
 
+def _outcome_style(outcome: str) -> str | None:
+    key = outcome.strip().lower()
+    if key in {"yes", "up"}:
+        return COLOR_DONE
+    if key in {"no", "down"}:
+        return COLOR_TODO
+    return None
+
+
+def _position_line(p: dict) -> Text:
+    outcome = str(p.get("outcome", "?"))
+    if len(outcome) > 6:
+        outcome = outcome[:5] + "…"
+    title = str(p.get("title", "?"))
+    if len(title) > 50:
+        title = title[:49] + "…"
+    value = trading_lib.fmt_usd(float(p.get("currentValue", 0)))
+    line = Text("  ")
+    line.append(f"{value:>8}", style=COLOR_DONE)
+    line.append("  ")
+    line.append(f"{outcome:<6}", style=_outcome_style(outcome))
+    line.append(f"  {title}")
+    return line
+
+
 def _print_usdc(ui: TraderUI, client, account: str) -> None:
     try:
         usdc = trading_lib.get_usdc_balance_via_rpc(account)
-        ui.print(f"usdc={trading_lib.fmt_usd(usdc)}")
+        line = Text("usdc        ")
+        line.append(trading_lib.fmt_usd(usdc), style=COLOR_DONE)
+        ui.print(line)
         return
     except Exception as rpc_exc:
         ui.log_only(f"usdc via rpc failed: {rpc_exc}")
     try:
         usdc = trading_lib.get_usdc_balance(client)
-        ui.print(f"usdc={trading_lib.fmt_usd(usdc)}")
+        line = Text("usdc        ")
+        line.append(trading_lib.fmt_usd(usdc), style=COLOR_DONE)
+        ui.print(line)
     except Exception as exc:
         ui.print(
             "usdc=unavailable  "
@@ -204,37 +230,34 @@ def _print_snapshot(ui: TraderUI, client, account: str) -> None:
     mergeable = trading_lib.find_mergeable_pairs_from_positions(open_positions)
 
     total = sum(float(p.get("currentValue", 0)) for p in open_positions)
-    ui.print(f"positions: {len(open_positions)} ({trading_lib.fmt_usd(total)})")
+    ui.heading("positions", f"{len(open_positions)}   {trading_lib.fmt_usd(total)}")
     for p in open_positions:
-        outcome = str(p.get("outcome", "?"))
-        if len(outcome) > 6:
-            outcome = outcome[:5] + "…"
-        title = str(p.get("title", "?"))
-        if len(title) > 50:
-            title = title[:49] + "…"
-        ui.print(
-            f"  {trading_lib.fmt_usd(float(p.get('currentValue', 0))):>8}  "
-            f"{outcome:6}  {title}"
-        )
+        ui.print(_position_line(p))
     if not open_positions:
-        ui.print("  none")
+        ui.print(Text("  none", style="dim"))
 
-    ui.print(f"redeemable: {len(redeemable)}")
+    redeem_total = sum(float(p.get("currentValue", 0)) for p in redeemable)
+    ui.heading("redeemable", f"{len(redeemable)}   {trading_lib.fmt_usd(redeem_total)}")
     for p in redeemable:
-        title = str(p.get("title", "?"))
-        if len(title) > 50:
-            title = title[:49] + "…"
-        ui.print(
-            f"  {trading_lib.fmt_usd(float(p.get('currentValue', 0))):>8}  {title}"
-        )
+        ui.print(_position_line(p))
+    if not redeemable:
+        ui.print(Text("  none", style="dim"))
 
     recover = sum(float(m.get("recover_usd", 0)) for m in mergeable)
-    ui.print(f"mergeable: {len(mergeable)} ({trading_lib.fmt_usd(recover)})")
+    ui.heading("mergeable", f"{len(mergeable)}   {trading_lib.fmt_usd(recover)}")
     for m in mergeable:
         title = str(m.get("title", "?"))
         if len(title) > 50:
             title = title[:49] + "…"
-        ui.print(f"  {trading_lib.fmt_usd(float(m.get('recover_usd', 0))):>8}  {title}")
+        line = Text("  ")
+        line.append(
+            f"{trading_lib.fmt_usd(float(m.get('recover_usd', 0))):>8}",
+            style=COLOR_DONE,
+        )
+        line.append(f"          {title}")
+        ui.print(line)
+    if not mergeable:
+        ui.print(Text("  none", style="dim"))
 
     try:
         orders = trading_lib.fetch_open_orders(client)
@@ -256,16 +279,22 @@ def _print_snapshot(ui: TraderUI, client, account: str) -> None:
             )
             return
 
-    ui.print(f"open_orders: {len(orders)}")
+    ui.heading("open orders", str(len(orders)))
+    if not orders:
+        ui.print(Text("  none", style="dim"))
+        return
     for o in orders:
-        side = o.get("side", "?")
+        side = str(o.get("side", "?"))
         price = float(o.get("price", 0))
         original = float(o.get("original_size", 0) or o.get("size", 0))
         matched = float(o.get("size_matched", 0) or o.get("sizeMatched", 0) or 0)
         remaining = original - matched
-        ui.print(
-            f"  {side:4} {remaining:>8,.2f} @ {trading_lib.fmt_usd(price)}"
-        )
+        line = Text("  ")
+        side_style = COLOR_DONE if side.upper() == "BUY" else COLOR_TODO
+        line.append(f"{side:<4}", style=side_style)
+        line.append(f"  {remaining:>8,.2f}  @  ")
+        line.append(trading_lib.fmt_usd(price), style=COLOR_DONE)
+        ui.print(line)
 
 
 async def _wait_hashes(

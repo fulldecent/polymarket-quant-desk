@@ -34,11 +34,10 @@ async def run(args: argparse.Namespace) -> int:
     eoa = trading_lib.get_eoa_address()
     skip = {funder.lower(), eoa.lower()} - {""}
     mempool_flag = "on" if args.trigger_polynode_mempool else "off"
-    ui.opening(
-        f"follow_anything  exec={args.exec}  listen={args.listen}  "
-        f"mempool={mempool_flag}  amount={args.amount:.2f}  count={args.count}  "
-        f"warmup={args.warmup_seconds:g}s",
-        account=funder,
+    ui.opening(account=funder)
+    ui.log_only(
+        f"exec={args.exec}  listen={args.listen}  mempool={mempool_flag}  "
+        f"amount={args.amount:.2f}  count={args.count}  warmup={args.warmup_seconds:g}s"
     )
 
     client = execution_client(args.exec)

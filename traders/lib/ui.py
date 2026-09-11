@@ -12,6 +12,8 @@ from rich.live import Live
 from rich.text import Text
 from rich.theme import Theme
 
+from lib.run_logging import format_duration
+
 COLOR_DONE = "green"
 COLOR_TODO = "magenta"
 
@@ -72,18 +74,25 @@ class TraderUI:
         self._footer = Text("")
 
     def print(self, text: str | Text) -> None:
-        if self._live is not None:
-            self.console.print(text, highlight=False, markup=False)
-        else:
-            self.console.print(text, highlight=False, markup=False)
+        self.console.print(text, highlight=False, markup=False)
         self.log.info(text.plain if isinstance(text, Text) else text)
 
     def log_only(self, message: str) -> None:
         self.log.info(message)
 
-    def opening(self, line1: str, *, account: str) -> None:
-        self.print(line1)
-        self.print(f"account={shorten_addr(account)}  log={self.log_path}")
+    def opening(self, *, account: str) -> None:
+        """Match derived jobs: labeled paths, log line, blank line."""
+        acc = account or "none"
+        self.print(Text(f"account: {acc}", style="bold"))
+        self.print(f"log:     {self.log_path}")
+        self.print("")
+
+    def heading(self, title: str, detail: str = "") -> None:
+        self.print("")
+        line = Text(title, style="bold")
+        if detail:
+            line.append(f"  {detail}")
+        self.print(line)
 
     def start_footer(self, text: str) -> None:
         self.stop_footer()
@@ -108,5 +117,16 @@ class TraderUI:
 
     def closing(self, status_line: str, elapsed: float) -> None:
         self.stop_footer()
-        self.print(status_line)
-        self.print(f"elapsed={format_hms(elapsed)}")
+        self.print("")
+        ok = status_line.startswith("status=ok") or status_line == "ok"
+        heading = "run complete" if ok else "run failed"
+        self.print(Text(heading, style=COLOR_DONE if ok else COLOR_TODO))
+        self.print(f"   time: {format_duration(elapsed)}")
+        rest = status_line
+        for prefix in ("status=ok", "status=failed"):
+            if rest.startswith(prefix):
+                rest = rest[len(prefix) :].strip("  ")
+                break
+        if rest and rest not in {"ok", "failed", "snapshot"}:
+            self.print(f"   {rest}")
+        self.print("")

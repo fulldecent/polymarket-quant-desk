@@ -31,10 +31,10 @@ async def run(args: argparse.Namespace) -> int:
     ui = TraderUI("buy_token", __file__)
     account = trading_lib.get_funder_address()
     worst = "none" if args.worst_price is None else f"{args.worst_price:g}"
-    ui.opening(
-        f"buy_token  exec={args.exec}  listen={args.listen}  "
-        f"amount={args.amount:.2f}  worst_price={worst}",
-        account=account,
+    ui.opening(account=account)
+    ui.log_only(
+        f"exec={args.exec}  listen={args.listen}  amount={args.amount:.2f}  "
+        f"worst_price={worst}"
     )
 
     client = execution_client(args.exec)

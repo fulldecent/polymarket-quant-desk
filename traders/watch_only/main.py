@@ -31,7 +31,8 @@ async def run(args: argparse.Namespace) -> int:
     ui = TraderUI("watch_only", __file__)
     account = os_account()
     mempool_flag = "  mempool" if args.trigger_polynode_mempool else ""
-    ui.opening(f"watch_only  listen={args.listen}{mempool_flag}", account=account)
+    ui.opening(account=account)
+    ui.log_only(f"listen={args.listen}{mempool_flag}")
 
     ui.print(f"connecting listen={args.listen}  host={listen_host(args.listen)}")
     listen = settled_stream(args.listen, on_status=ui.print)
