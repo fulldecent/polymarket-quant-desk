@@ -267,6 +267,180 @@ def _build_trade_fields(data: dict) -> dict | None:
     }
 
 
+def _ws_http_status(exc: BaseException) -> int | None:
+    response = getattr(exc, "response", None)
+    if response is not None:
+        for attr in ("status_code", "status"):
+            val = getattr(response, attr, None)
+            if val is not None:
+                try:
+                    return int(val)
+                except (TypeError, ValueError):
+                    pass
+    text = str(exc)
+    for code in (401, 403, 429, 502, 503):
+        if f"HTTP {code}" in text:
+            return code
+    return None
+
+
+_FATAL_WS_HTTP = {401, 403}
+
+
+class _PolynodeHub:
+    """One Polynode WebSocket. Settled + mempool share it.
+
+    Polynode allows one connection per key. Opening listen and mempool as
+    two sockets gets HTTP 429 (and 403 while the first slot is held).
+    """
+
+    def __init__(self, api_key: str, ws_url: str) -> None:
+        self._api_key = api_key
+        self._ws_url = ws_url
+        self._pending: list[asyncio.Queue[MempoolTradeEvent]] = []
+        self._confirmed: list[asyncio.Queue[TradeEvent]] = []
+        self._status_fns: list[StatusFn] = []
+        self._task: asyncio.Task | None = None
+        self._ready = asyncio.Event()
+        self._fatal: BaseException | None = None
+        self._refs = 0
+
+    def _status(self, message: str) -> None:
+        for fn in list(self._status_fns):
+            fn(message)
+
+    async def acquire(
+        self,
+        *,
+        pending: asyncio.Queue[MempoolTradeEvent] | None,
+        confirmed: asyncio.Queue[TradeEvent] | None,
+        on_status: StatusFn | None,
+    ) -> None:
+        self._refs += 1
+        if pending is not None:
+            self._pending.append(pending)
+        if confirmed is not None:
+            self._confirmed.append(confirmed)
+        if on_status is not None and on_status not in self._status_fns:
+            self._status_fns.append(on_status)
+        if self._task is None or self._task.done():
+            self._ready.clear()
+            self._fatal = None
+            self._task = asyncio.create_task(self._listen_loop())
+        try:
+            await asyncio.wait_for(self._ready.wait(), timeout=20)
+        except TimeoutError as exc:
+            raise ConnectionError(
+                "polynode listen failed: subscribe did not complete"
+            ) from exc
+        if self._fatal is not None:
+            raise ConnectionError(str(self._fatal)) from self._fatal
+
+    async def release(
+        self,
+        *,
+        pending: asyncio.Queue[MempoolTradeEvent] | None,
+        confirmed: asyncio.Queue[TradeEvent] | None,
+        on_status: StatusFn | None,
+    ) -> None:
+        if pending is not None and pending in self._pending:
+            self._pending.remove(pending)
+        if confirmed is not None and confirmed in self._confirmed:
+            self._confirmed.remove(confirmed)
+        if on_status is not None and on_status in self._status_fns:
+            self._status_fns.remove(on_status)
+        self._refs = max(0, self._refs - 1)
+        if self._refs > 0:
+            return
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+        self._ready.clear()
+        self._fatal = None
+        _hubs.pop((self._api_key, self._ws_url), None)
+
+    async def _listen_loop(self) -> None:
+        reconnect_delay = 1.0
+        ws_url_with_key = _with_api_key(self._ws_url, self._api_key)
+        while True:
+            try:
+                async with websockets.connect(
+                    ws_url_with_key,
+                    ping_interval=30,
+                    ping_timeout=10,
+                    close_timeout=2,
+                ) as ws:
+                    reconnect_delay = 1.0
+                    await ws.send(
+                        json.dumps({"action": "subscribe", "type": "settlements"})
+                    )
+                    self._fatal = None
+                    self._ready.set()
+                    self._status("connected  listen: polynode")
+                    async for raw in ws:
+                        msg = _decode_message(raw)
+                        if msg is None:
+                            continue
+                        for msg_type, data in _extract_trade_messages(msg):
+                            await self._dispatch(msg_type, data)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                code = _ws_http_status(exc)
+                if code in _FATAL_WS_HTTP:
+                    self._fatal = ConnectionError(
+                        f"polynode WS HTTP {code}: {exc}. "
+                        "One WebSocket per API key; check POLYNODE_API_KEY."
+                    )
+                    self._status(f"listen error: {self._fatal}")
+                    self._ready.set()
+                    return
+                self._status(
+                    f"listen error: {type(exc).__name__}: {exc}  "
+                    f"retry: {reconnect_delay:.0f}s"
+                )
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, 60)
+
+    async def _dispatch(self, msg_type: str, data: dict) -> None:
+        fields = _build_trade_fields(data)
+        if fields is None:
+            return
+        if _is_pending(msg_type, data):
+            event = MempoolTradeEvent(**fields)
+            for queue in list(self._pending):
+                await queue.put(event)
+        if _is_confirmed(msg_type, data):
+            block_number = _int_from_keys(
+                data, "block_number", "blockNumber", "block"
+            )
+            if block_number is None:
+                return
+            event = TradeEvent(
+                **fields,
+                block_number=block_number,
+                log_index=_int_from_keys(data, "log_index", "logIndex"),
+            )
+            for queue in list(self._confirmed):
+                await queue.put(event)
+
+
+_hubs: dict[tuple[str, str], _PolynodeHub] = {}
+
+
+def _hub_for(api_key: str, ws_url: str) -> _PolynodeHub:
+    key = (api_key, ws_url)
+    hub = _hubs.get(key)
+    if hub is None:
+        hub = _PolynodeHub(api_key, ws_url)
+        _hubs[key] = hub
+    return hub
+
+
 class PolynodeMempoolEventStream:
     """Stream low-latency pre-confirmation trade fills from Polynode."""
 
@@ -280,90 +454,32 @@ class PolynodeMempoolEventStream:
         self._api_key = api_key
         self._ws_url = ws_url
         self._on_status = on_status
-        self._ws = None
         self._queue: asyncio.Queue[MempoolTradeEvent] = asyncio.Queue()
-        self._listen_task: asyncio.Task | None = None
-        self._ready = asyncio.Event()
-
-    def _status(self, message: str) -> None:
-        if self._on_status is not None:
-            self._on_status(message)
+        self._connected = False
 
     async def connect(self) -> None:
-        if self._listen_task is None or self._listen_task.done():
-            self._ready.clear()
-            self._listen_task = asyncio.create_task(self._listen_loop())
-        try:
-            await asyncio.wait_for(self._ready.wait(), timeout=20)
-        except TimeoutError as exc:
-            raise ConnectionError(
-                "polynode mempool listen failed: subscribe did not complete"
-            ) from exc
+        if self._connected:
+            return
+        await _hub_for(self._api_key, self._ws_url).acquire(
+            pending=self._queue, confirmed=None, on_status=self._on_status
+        )
+        self._connected = True
 
     async def disconnect(self) -> None:
-        if self._listen_task is not None:
-            self._listen_task.cancel()
-            try:
-                await self._listen_task
-            except asyncio.CancelledError:
-                pass
-            self._listen_task = None
-
-        if self._ws is not None:
-            await self._ws.close()
-            self._ws = None
+        if not self._connected:
+            return
+        await _hub_for(self._api_key, self._ws_url).release(
+            pending=self._queue, confirmed=None, on_status=self._on_status
+        )
+        self._connected = False
 
     def __aiter__(self) -> AsyncIterator[MempoolTradeEvent]:
         return self
 
     async def __anext__(self) -> MempoolTradeEvent:
-        if self._listen_task is None:
+        if not self._connected:
             await self.connect()
         return await self._queue.get()
-
-    async def _listen_loop(self) -> None:
-        reconnect_delay = 1.0
-        ws_url_with_key = _with_api_key(self._ws_url, self._api_key)
-
-        while True:
-            try:
-                async with websockets.connect(
-                    ws_url_with_key,
-                    ping_interval=30,
-                    ping_timeout=10,
-                    close_timeout=2,
-                ) as ws:
-                    self._ws = ws
-                    reconnect_delay = 1.0
-                    await ws.send(json.dumps({"action": "subscribe", "type": "settlements"}))
-                    self._ready.set()
-                    self._status("connected listen=polynode mempool")
-                    async for raw in ws:
-                        msg = _decode_message(raw)
-                        if msg is None:
-                            continue
-                        for msg_type, data in _extract_trade_messages(msg):
-                            event = self._to_trade_event(msg_type, data)
-                            if event is not None:
-                                await self._queue.put(event)
-
-            except asyncio.CancelledError:
-                raise
-
-            except Exception as exc:
-                self._status(
-                    f"listen error: {type(exc).__name__}: {exc}  retry: {reconnect_delay:.0f}s  mempool"
-                )
-                await asyncio.sleep(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 2, 60)
-
-    def _to_trade_event(self, msg_type: str, data: dict) -> MempoolTradeEvent | None:
-        if not _is_pending(msg_type, data):
-            return None
-        trade_fields = _build_trade_fields(data)
-        if trade_fields is None:
-            return None
-        return MempoolTradeEvent(**trade_fields)
 
 
 class PolynodeSettledEventStream:
@@ -379,97 +495,32 @@ class PolynodeSettledEventStream:
         self._api_key = api_key
         self._ws_url = ws_url
         self._on_status = on_status
-        self._ws = None
         self._queue: asyncio.Queue[TradeEvent] = asyncio.Queue()
-        self._listen_task: asyncio.Task | None = None
-        self._ready = asyncio.Event()
-
-    def _status(self, message: str) -> None:
-        if self._on_status is not None:
-            self._on_status(message)
+        self._connected = False
 
     async def connect(self) -> None:
-        if self._listen_task is None or self._listen_task.done():
-            self._ready.clear()
-            self._listen_task = asyncio.create_task(self._listen_loop())
-        try:
-            await asyncio.wait_for(self._ready.wait(), timeout=20)
-        except TimeoutError as exc:
-            raise ConnectionError(
-                "polynode settled listen failed: subscribe did not complete"
-            ) from exc
+        if self._connected:
+            return
+        await _hub_for(self._api_key, self._ws_url).acquire(
+            pending=None, confirmed=self._queue, on_status=self._on_status
+        )
+        self._connected = True
 
     async def disconnect(self) -> None:
-        if self._listen_task is not None:
-            self._listen_task.cancel()
-            try:
-                await self._listen_task
-            except asyncio.CancelledError:
-                pass
-            self._listen_task = None
-
-        if self._ws is not None:
-            await self._ws.close()
-            self._ws = None
+        if not self._connected:
+            return
+        await _hub_for(self._api_key, self._ws_url).release(
+            pending=None, confirmed=self._queue, on_status=self._on_status
+        )
+        self._connected = False
 
     def __aiter__(self) -> AsyncIterator[TradeEvent]:
         return self
 
     async def __anext__(self) -> TradeEvent:
-        if self._listen_task is None:
+        if not self._connected:
             await self.connect()
         return await self._queue.get()
-
-    async def _listen_loop(self) -> None:
-        reconnect_delay = 1.0
-        ws_url_with_key = _with_api_key(self._ws_url, self._api_key)
-
-        while True:
-            try:
-                async with websockets.connect(
-                    ws_url_with_key,
-                    ping_interval=30,
-                    ping_timeout=10,
-                    close_timeout=2,
-                ) as ws:
-                    self._ws = ws
-                    reconnect_delay = 1.0
-                    await ws.send(json.dumps({"action": "subscribe", "type": "settlements"}))
-                    self._ready.set()
-                    self._status("connected listen=polynode settled")
-                    async for raw in ws:
-                        msg = _decode_message(raw)
-                        if msg is None:
-                            continue
-                        for msg_type, data in _extract_trade_messages(msg):
-                            event = self._to_trade_event(msg_type, data)
-                            if event is not None:
-                                await self._queue.put(event)
-
-            except asyncio.CancelledError:
-                raise
-
-            except Exception as exc:
-                self._status(
-                    f"listen error: {type(exc).__name__}: {exc}  retry: {reconnect_delay:.0f}s  settled"
-                )
-                await asyncio.sleep(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 2, 60)
-
-    def _to_trade_event(self, msg_type: str, data: dict) -> TradeEvent | None:
-        if not _is_confirmed(msg_type, data):
-            return None
-        block_number = _int_from_keys(data, "block_number", "blockNumber", "block")
-        if block_number is None:
-            return None
-        trade_fields = _build_trade_fields(data)
-        if trade_fields is None:
-            return None
-        return TradeEvent(
-            **trade_fields,
-            block_number=block_number,
-            log_index=_int_from_keys(data, "log_index", "logIndex"),
-        )
 
 
 # Backward-compatible alias while callers migrate.
