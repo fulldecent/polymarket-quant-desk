@@ -137,16 +137,34 @@ def print_positions(positions: list[dict], label: str) -> None:
 # ── CLOB client ──────────────────────────────────────────────────────────────
 
 
-def _ensure_clob_http1() -> None:
-    """CLOB L1/L2 auth uses POLY_* headers. HTTP/2 lowercases them and CLOB 401s."""
+_CLOB_ORIGIN = "https://clob.polymarket.com"
+_TOR_SOCKS = "socks5://127.0.0.1:9050"
+
+
+def _is_local_url(url: str) -> bool:
+    host = urlparse(url).hostname
+    return host in {"localhost", "127.0.0.1", "::1"}
+
+
+def _configure_clob_http(*, via_tor: bool) -> None:
+    """Send CLOB HTTP through Tor SOCKS when CLOB_API_URL is the local Caddy hop.
+
+    Caddy's reverse_proxy to clob.polymarket.com drops or mangles POLY_* L1/L2
+    auth headers (``Invalid L1 Request headers``). TLS to the real origin via
+    Tor SOCKS keeps Host and POLY_* intact.
+    """
     import httpx
     from py_clob_client.http_helpers import helpers as clob_http
 
+    marker = "tor" if via_tor else "direct"
     existing = getattr(clob_http, "_http_client", None)
-    if getattr(existing, "_pqd_http1", False):
+    if getattr(existing, "_pqd_clob_http", None) == marker:
         return
-    replacement = httpx.Client(http2=False, timeout=30.0)
-    replacement._pqd_http1 = True
+    kwargs: dict = {"timeout": 30.0, "http2": True}
+    if via_tor:
+        kwargs["proxy"] = _TOR_SOCKS
+    replacement = httpx.Client(**kwargs)
+    replacement._pqd_clob_http = marker
     clob_http._http_client = replacement
     if existing is not None:
         try:
@@ -158,8 +176,10 @@ def _ensure_clob_http1() -> None:
 def build_client() -> ClobClient:
     """Construct an authenticated ClobClient from environment variables."""
     load_env()
-    _ensure_clob_http1()
-    host = get_clob_api_url()
+    configured = get_clob_api_url()
+    via_tor = _is_local_url(configured)
+    _configure_clob_http(via_tor=via_tor)
+    host = _CLOB_ORIGIN if via_tor else configured
     pk = require_env("EOA_PRIVATE_KEY")
     funder = require_env("POLYMARKET_PROXY_WALLET")
     chain_id = CHAIN_POLYGON
@@ -252,6 +272,8 @@ def explain_api_error(endpoint_name: str, endpoint_url: str, exc: Exception) -> 
             return (
                 f"{endpoint_name} returned HTTP 401 at {endpoint_url}. "
                 "Check that the endpoint and credentials are valid. "
+                "If CLOB_API_URL is the local proxy, authenticated CLOB calls "
+                "go through Tor SOCKS (start_proxy.py must be running). "
                 f"Response: {detail}"
             )
         return f"{endpoint_name} returned HTTP {status} at {endpoint_url}: {detail}"
@@ -270,7 +292,8 @@ def explain_api_error(endpoint_name: str, endpoint_url: str, exc: Exception) -> 
         if status == "401":
             return (
                 f"{endpoint_name} returned HTTP 401 at {endpoint_url}. "
-                "Check that the endpoint and credentials are valid."
+                "Check that the endpoint and credentials are valid. "
+                "Authenticated CLOB calls use Tor SOCKS when CLOB_API_URL is localhost."
             )
         return f"{endpoint_name} returned HTTP {status} at {endpoint_url}: {message}"
 
