@@ -160,23 +160,26 @@ def _configure_clob_http(*, via_tor: bool) -> None:
     Tor SOCKS keeps Host and POLY_* intact.
     """
     import httpx
-    from py_clob_client.http_helpers import helpers as clob_http
+    from py_clob_client.http_helpers import helpers as clob_http_v1
+    from py_clob_client_v2.http_helpers import helpers as clob_http_v2
 
     marker = "tor" if via_tor else "direct"
-    existing = getattr(clob_http, "_http_client", None)
-    if getattr(existing, "_pqd_clob_http", None) == marker:
-        return
     kwargs: dict = {"timeout": 30.0, "http2": True}
     if via_tor:
         kwargs["proxy"] = _TOR_SOCKS
-    replacement = httpx.Client(**kwargs)
-    replacement._pqd_clob_http = marker
-    clob_http._http_client = replacement
-    if existing is not None:
-        try:
-            existing.close()
-        except Exception:
-            pass
+
+    for helpers in (clob_http_v1, clob_http_v2):
+        existing = getattr(helpers, "_http_client", None)
+        if getattr(existing, "_pqd_clob_http", None) == marker:
+            continue
+        replacement = httpx.Client(**kwargs)
+        replacement._pqd_clob_http = marker
+        helpers._http_client = replacement
+        if existing is not None:
+            try:
+                existing.close()
+            except Exception:
+                pass
 
 
 def build_client() -> ClobClient:
@@ -203,6 +206,30 @@ def build_client() -> ClobClient:
         creds=creds,
         signature_type=2,
         funder=funder,
+    )
+
+
+def build_v2_client():
+    """Authenticated CLOB v2 client (required to post orders after the v2 cutover)."""
+    from py_clob_client_v2 import ApiCreds as ApiCredsV2
+    from py_clob_client_v2 import ClobClient as ClobClientV2
+
+    load_env()
+    configured = get_clob_api_url()
+    via_tor = _is_local_url(configured)
+    _configure_clob_http(via_tor=via_tor)
+    host = _CLOB_ORIGIN if via_tor else configured
+    return ClobClientV2(
+        host=host,
+        chain_id=CHAIN_POLYGON,
+        key=require_env("EOA_PRIVATE_KEY"),
+        creds=ApiCredsV2(
+            api_key=require_env("CLOB_API_KEY"),
+            api_secret=require_env("CLOB_SECRET"),
+            api_passphrase=require_env("CLOB_PASS_PHRASE"),
+        ),
+        signature_type=2,
+        funder=require_env("POLYMARKET_PROXY_WALLET"),
     )
 
 
@@ -585,16 +612,22 @@ def buy_token(
     })
 
     try:
-        order = client.create_market_order(
-            MarketOrderArgs(
+        v2 = build_v2_client()
+        from py_clob_client_v2 import MarketOrderArgsV2, OrderType as OrderTypeV2
+
+        v2.get_tick_size(token_id)
+        v2.get_neg_risk(token_id)
+        v2.get_fee_rate_bps(token_id)
+        order = v2.create_market_order(
+            MarketOrderArgsV2(
                 token_id=token_id,
                 amount=amount_usd,
                 price=max_price,
                 side="BUY",
-                order_type=OrderType.FOK,
+                order_type=OrderTypeV2.FOK,
             ),
         )
-        resp = client.post_order(order, orderType=OrderType.FOK)
+        resp = v2.post_order(order, order_type=OrderTypeV2.FOK)
 
         log_event({
             "action": "buy",

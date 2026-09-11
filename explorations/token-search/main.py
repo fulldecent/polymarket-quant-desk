@@ -260,12 +260,22 @@ def _print_market(console: Console, market: dict, *, event_title: str = "") -> N
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Look up Polymarket CLOB token IDs via Gamma.",
+        epilog="Example: python explorations/token-search/main.py invade iran 2027",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("query", nargs="+", help="URL, slug, keywords, condition id, or token id")
+    parser.add_argument(
+        "query",
+        nargs="*",
+        help="URL, slug, keywords, condition id, or token id",
+    )
     parser.add_argument("--limit", type=int, default=8, metavar="N")
     parser.add_argument("--closed", action="store_true", help="include resolved events")
     parser.add_argument("--json", action="store_true", dest="as_json")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.query:
+        parser.print_help()
+        raise SystemExit(2)
+    return args
 
 
 def main() -> None:

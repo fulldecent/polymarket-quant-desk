@@ -74,6 +74,7 @@ dependencies = [
     "py-builder-relayer-client==0.0.1",
     "py-builder-signing-sdk==0.0.2",
     "py-clob-client==0.34.6",
+    "py-clob-client-v2>=1.1.0",
     "py-order-utils==0.3.2",
     "pyarrow==23.0.1",
     "pycryptodome==3.23.0",
