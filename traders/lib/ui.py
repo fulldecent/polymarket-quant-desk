@@ -9,7 +9,15 @@ from pathlib import Path
 
 from rich.console import Console
 from rich.live import Live
-from rich.progress import Progress, SpinnerColumn, TaskID, TextColumn, TimeElapsedColumn
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskID,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 from rich.text import Text
 from rich.theme import Theme
 
@@ -117,6 +125,37 @@ class TraderUI:
     def update_spinner(self, description: str) -> None:
         if self._spinner is not None and self._spinner_task is not None:
             self._spinner.update(self._spinner_task, description=description)
+
+    def start_bar(self, description: str, total: int) -> None:
+        """Bounded sticky row: spinner + text + bar + done/total + elapsed + ETA."""
+        self.stop_footer()
+        self._spinner = Progress(
+            SpinnerColumn(),
+            TextColumn("{task.description}"),
+            BarColumn(
+                complete_style=COLOR_DONE, finished_style=COLOR_DONE, style=COLOR_TODO
+            ),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=self.console,
+        )
+        self._spinner_task = self._spinner.add_task(description, total=max(1, int(total)))
+        self._live = Live(
+            self._spinner,
+            console=self.console,
+            refresh_per_second=8,
+            transient=True,
+        )
+        self._live.start()
+
+    def update_bar(self, completed: int, description: str | None = None) -> None:
+        if self._spinner is None or self._spinner_task is None:
+            return
+        kw = {"completed": int(completed)}
+        if description is not None:
+            kw["description"] = description
+        self._spinner.update(self._spinner_task, **kw)
 
     def start_footer(self, text: str) -> None:
         self.start_spinner(text)

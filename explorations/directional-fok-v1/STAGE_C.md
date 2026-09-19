@@ -1,23 +1,27 @@
-# Stage C — sequential policy
+# Stage C — always-on decoder
 
-Frozen Stage B heads are **inputs**, including **H30**. C does not
-fit a 30-block model on the labels it is scored on. H30 is trained on
-B’s earlier train slice and frozen in `stage_b.joblib`. C’s search
-starts after B’s `train_cut_block` + embargo.
+C **bets every** Stage A event after the 180-block cooldown. No skip
+head. Frozen Stage B’s four high/low deltas are the only inputs.
 
-**Validation:** train the decoder on calendar day `D`, test on `D+7`
-(same weekday). That is the bar. A policy that only works on the
-weekend it was fit is not C. Needs multiple weeks of tape after B’s
-train cut — four days cannot validate C.
+**Outputs (YES-space deltas to `last(X)`):**
 
-Extra
-last-100-block features Stage B does not emit: unique-account
-`top_share` / `hhi` / `n_acct` (window and at `X`), fee bit (Stage B
-dropped venue). Decoder is a small grid on sequential P&L after the
-180-block cooldown. Train proposes, val promotes only if **≥1
-activation/hour** and **P&L > 0**. Test never selects.
+| Output | How |
+|---|---|
+| Direction | YES if `h1_hi+h30_hi ≥ −h1_lo−h30_lo`, else NO |
+| Entry delta | `in_frac ×` predicted X+1 extreme |
+| Exit delta | `out_frac ×` predicted X+1..X+30 extreme |
+| `should_bet_double` | 1 iff `P_exit−P_entry ≥ double_k` ticks |
 
-Full table: [`stage-c-snapshot.md`](stage-c-snapshot.md).
+`in=0.0 out=0.5 dbl=0` means: FOK at **last**, GTC at **half** of B’s
+30-block predicted extreme, and **every** round is 2× on the score.
+Size stays `1.1 × n_min`. Double is eval weight, not size.
+
+If exit would sit at or below entry, exit is **entry + 1 tick**. GTC
+window is `X+2..X+30`. Leftover after liquidation is **$0**.
+
+Val picks `(in_frac, out_frac, double_k)` by **weighted** PnL
+(`2×` when double). Test never selects. Headline dollars are **raw**
+PnL. Walk-forward: [`walkforward-results.md`](walkforward-results.md).
 
 ## Wider margins (2–3 ticks only)
 

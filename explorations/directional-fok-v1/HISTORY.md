@@ -1,9 +1,12 @@
 # Historical notes
 
 - Complementary two-buy MM: dead; `yes_only + no_only` 60.8%.
-- Stage A freeze moved **3-of-8 → 5-of-8** after Kris Kross (healthy
-  5-of-8 sample; envelope still shows 2-of-8 red). `kris_count_8` is a
-  Stage B persist feature (`sim_lib.kris_count`), not a second A cut.
+- Stage A freeze is **6-of-8 and Kris Kross 10+**. Stage B is four
+  high/low YES-delta heads (X+1 and X+1..X+30), squared error with
+  X+1 weight 2. Stage C always bets: entry/exit deltas plus
+  `should_bet_double` (2× score). Walk-forward concat **+$12.13** vs
+  dummy **−$241.06**, 681 OOS fills. Protocol **prints=yes**. Expected
+  one-day 9.5 trades, $20.68 buys, +$0.17 PnL.
 - Naive FOK `close+1 / close−1` and the 16-cell dollar grid: all red.
 - Stage A persist was briefly 2-of-8 (class-mix knee). Envelope P&L
   is red at 2-of-8 and first green at 3-of-8; freeze is now **5-of-8**.

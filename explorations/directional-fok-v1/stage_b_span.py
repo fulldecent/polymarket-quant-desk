@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Collect Stage B events across the last 9 months of fills, not one weekend.
 
-Random 5-of-8 triggers from equal block bins in that span, plus extra
+Random 6-of-8 + Kris-10+ triggers from equal block bins in that span, plus extra
 draws from special eras that overlap it (Super Bowl 2026, Iran war,
 World Cup 2026, freeze weekend). Then freeze via
 `stage_b.py --from-events`.

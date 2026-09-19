@@ -5,18 +5,14 @@ before the sequential policy (Stage C).
 
 ## Rule
 
-At block `X` on a condition, keep the trigger only if **at least 5 of
-the last 8 blocks** (including `X`) have a fill on that condition.
-
-3-of-8 was the first envelope-green gate (motion +1 tick vs ghost
-full-clip). 5-of-8 is the freeze after Kris Kross: last-7-day 5-of-8
-paths look like live books, not one-block ghosts; keep rate ~27% of
-fill-at-X vs ~41% at 3-of-8. 2-of-8 stays underwater on the envelope
-below.
+At block `X` on a condition, keep the trigger only if **at least 6 of
+the last 8 blocks** (including `X`) have a fill **and** Kris Kross
+count in that window is **≥ 10**.
 
 ```
-PREFILTER_WINDOW = 8
-PREFILTER_NEED   = 5
+PREFILTER_WINDOW   = 8
+PREFILTER_NEED     = 6
+PREFILTER_KRIS_MIN = 10
 ```
 
 `prefilter_alive()` in `sim_lib.py`.

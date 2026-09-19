@@ -37,10 +37,57 @@ class ExecutionClient(Protocol):
         max_price: float = 0,
         neg_risk: bool = False,
     ) -> ExecutionResult: ...
+    async def sell_limit(
+        self,
+        token_id: str,
+        size: float,
+        price: float,
+        *,
+        ttl_seconds: float = 60,
+        neg_risk: bool = False,
+        tick_size: str | float | None = None,
+    ) -> ExecutionResult: ...
+    async def sell_fak(
+        self,
+        token_id: str,
+        size: float,
+        *,
+        min_price: float = 0.01,
+        neg_risk: bool = False,
+        tick_size: str | float | None = None,
+    ) -> ExecutionResult: ...
     async def warmup(self, token_id: str) -> None: ...
     def cached_fee_rate_bps(self, token_id: str) -> int | None: ...
     async def redeem_positions(self, user: str, dry_run: bool = False) -> list[str]: ...
     async def merge_positions(self, user: str, dry_run: bool = False, condition_id: str | None = None) -> list[str]: ...
+
+
+def _result_from_resp(resp: dict, client, token_id: str) -> ExecutionResult:
+    tx_hashes: list[str] = []
+    if isinstance(resp, dict):
+        for x in resp.get("transactionsHashes", []) or []:
+            if isinstance(x, str) and x:
+                tx_hashes.append(x)
+        for x in resp.get("transactionHashes", []) or []:
+            if isinstance(x, str) and x:
+                tx_hashes.append(x)
+        return ExecutionResult(
+            success=bool(resp.get("success", True)),
+            order_id=resp.get("orderID") or resp.get("orderId"),
+            making_amount=resp.get("makingAmount"),
+            taking_amount=resp.get("takingAmount"),
+            tx_hashes=tx_hashes,
+            raw_response=resp,
+            fee_rate_bps=_cached_fee_rate_bps(client, token_id) or 0,
+        )
+    return ExecutionResult(
+        success=False,
+        order_id=None,
+        making_amount=None,
+        taking_amount=None,
+        tx_hashes=[],
+        raw_response={"raw": resp},
+    )
 
 
 def _cached_fee_rate_bps(client, token_id: str) -> int | None:
@@ -105,6 +152,48 @@ class ClobExecutionClient:
             raw_response=resp,
             fee_rate_bps=_cached_fee_rate_bps(self._client, token_id) or 0,
         )
+
+    async def sell_limit(
+        self,
+        token_id: str,
+        size: float,
+        price: float,
+        *,
+        ttl_seconds: float = 60,
+        neg_risk: bool = False,
+        tick_size: str | float | None = None,
+    ) -> ExecutionResult:
+        resp = await asyncio.to_thread(
+            trading_lib.sell_token_limit,
+            self._client,
+            token_id,
+            size,
+            price,
+            ttl_seconds,
+            neg_risk=neg_risk,
+            tick_size=tick_size,
+        )
+        return _result_from_resp(resp, self._client, token_id)
+
+    async def sell_fak(
+        self,
+        token_id: str,
+        size: float,
+        *,
+        min_price: float = 0.01,
+        neg_risk: bool = False,
+        tick_size: str | float | None = None,
+    ) -> ExecutionResult:
+        resp = await asyncio.to_thread(
+            trading_lib.sell_token,
+            self._client,
+            token_id,
+            size,
+            min_price=min_price,
+            neg_risk=neg_risk,
+            tick_size=tick_size,
+        )
+        return _result_from_resp(resp, self._client, token_id)
 
     async def warmup(self, token_id: str) -> None:
         def _warm() -> None:
@@ -228,6 +317,48 @@ class PolynodeExecutionClient:
             raw_response=raw,
             fee_rate_bps=_cached_fee_rate_bps(self._client, token_id) or 0,
         )
+
+    async def sell_limit(
+        self,
+        token_id: str,
+        size: float,
+        price: float,
+        *,
+        ttl_seconds: float = 60,
+        neg_risk: bool = False,
+        tick_size: str | float | None = None,
+    ) -> ExecutionResult:
+        resp = await asyncio.to_thread(
+            trading_lib.sell_token_limit,
+            self._client,
+            token_id,
+            size,
+            price,
+            ttl_seconds,
+            neg_risk=neg_risk,
+            tick_size=tick_size,
+        )
+        return _result_from_resp(resp, self._client, token_id)
+
+    async def sell_fak(
+        self,
+        token_id: str,
+        size: float,
+        *,
+        min_price: float = 0.01,
+        neg_risk: bool = False,
+        tick_size: str | float | None = None,
+    ) -> ExecutionResult:
+        resp = await asyncio.to_thread(
+            trading_lib.sell_token,
+            self._client,
+            token_id,
+            size,
+            min_price=min_price,
+            neg_risk=neg_risk,
+            tick_size=tick_size,
+        )
+        return _result_from_resp(resp, self._client, token_id)
 
     async def warmup(self, token_id: str) -> None:
         def _warm() -> None:

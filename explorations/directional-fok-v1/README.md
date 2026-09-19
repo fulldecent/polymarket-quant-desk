@@ -15,22 +15,19 @@ Not a live trader. Nothing here posts orders.
 
 ## Ticket at block X
 
-**Stage A** persist (5 of last 8 blocks): [`STAGE_A.md`](STAGE_A.md).
-Kris Kross count (`kris_count_8`) is a Stage B persist feature.
-**Stage B** tape-touch (`±k`, inferred tick): [`STAGE_B.md`](STAGE_B.md),
-[`FEATURES.md`](FEATURES.md).
-**Stage C** sequential decoder: frozen Stage B probs **plus** last-100-block
-extras Stage B does not emit (account dominance, unique accounts, fee).
+**Stage A** persist **6 of last 8** and Kris Kross **≥ 10**: [`STAGE_A.md`](STAGE_A.md).
+**Stage B** four high/low YES-deltas (X+1 and X+1..X+30): [`STAGE_B.md`](STAGE_B.md).
+**Stage C** always-on decoder: entry delta, exit delta, `should_bet_double`.
 [`stage_c.py`](stage_c.py).
 
-The model, using only data with `block ≤ X`, outputs:
+The ticket, using only data with `block ≤ X`:
 
 | Field | Meaning |
 |---|---|
-| Direction | Buy YES or buy NO |
-| `P_entry` | Worst price on the FOK take (buy cap) |
-| `P_exit` | Worst price on the resting sell (sell floor, above `P_entry`) |
-| Kelly `f` | Size multiple of the legal floor clip |
+| Direction | Buy YES if predicted upside ≥ downside, else NO |
+| Entry delta | `in_frac ×` B’s X+1 extreme vs `last(X)` → FOK cap |
+| Exit delta | `out_frac ×` B’s X+1..X+30 extreme vs `last(X)` → GTC floor |
+| `should_bet_double` | 1 if predicted edge ≥ `double_k` ticks (2× score, not 2× size) |
 
 The ticket is **one buy**, then **one sell of the same token**. It is
 never a YES buy plus a NO buy.

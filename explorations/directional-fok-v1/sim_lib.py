@@ -16,10 +16,10 @@ HORIZONS = (1, 60)
 TAKER_FEE_RATE = 0.0135
 COOLDOWN_BLOCKS = 180
 LOOKBACK_BLOCKS = 100
-# Stage A persist. Need this many of the last N blocks (including X)
-# to have a fill. Frozen in STAGE_A.md. Do not retune.
+# Stage A persist + Kris Kross. Frozen in STAGE_A.md.
 PREFILTER_WINDOW = 8
-PREFILTER_NEED = 5
+PREFILTER_NEED = 6
+PREFILTER_KRIS_MIN = 10
 ENTRY_LAG = 1
 EXIT_START = 2
 EXIT_END = 60

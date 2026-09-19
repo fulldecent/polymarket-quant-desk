@@ -1,9 +1,16 @@
 # Stage B — tape-touch (frozen)
 
-Applied after Stage A persist (5 of last 8). These probabilities are
-what Stage C will consume. They are not a ticket and not P&L.
-`kris_count_8` (maker YES zigzag count in `{X−7…X}`) sits in the
-persist family.
+Applied after Stage A persist (6 of last 8 **and** Kris Kross 10+).
+Four outputs, all YES-price **deltas vs last(X)**:
+
+- X+1 high
+- X+1 low
+- X+1..X+30 high (includes the FOK bar)
+- X+1..X+30 low
+
+One `HistGradientBoostingRegressor`, **squared error**. Rows for the
+first two heads get `sample_weight=2`; the 30-block heads get 1. That
+is the loss. Not a ticket and not P&L.
 
 **Labels:** CLOB prints in the horizon, plus on-chain resolve **inside
 that horizon** (redeem = infinite liquidity at YES=1.0 / NO=0.0 /

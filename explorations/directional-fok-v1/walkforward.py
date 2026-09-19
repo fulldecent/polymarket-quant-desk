@@ -39,13 +39,11 @@ from sim_lib import (  # noqa: E402
 from stage_b import (  # noqa: E402
     FEAT_KEYS,
     HORIZONS,
-    KS_BAR,
     LOG_DIR,
-    _auc,
     _hgb,
-    pack_act,
-    pack_bar,
+    pack_hl,
     stride_take,
+    weighted_mse,
 )
 from stage_c import (  # noqa: E402
     naive_eval,
@@ -71,32 +69,21 @@ OUT_MD = _HERE / "walkforward-results.md"
 OUT_JSON = LOG_DIR / "walkforward.json"
 PARTIAL = LOG_DIR / "walkforward_partial.json"
 
-PAYS = (0, 1, 2)
-KS = (1, 3, 4, 5)
-GTCS = (30, 60)
-SKIP_FEES = (False, True)
-PRICE = {0: "passive", 1: "pay1", 2: "pay2"}
+IN_FRACS = (0.0, 0.5, 1.0)
+OUT_FRACS = (0.5, 1.0, 1.5)
+DOUBLE_KS = (0, 1, 2, 4)
 
 
 def shortlist():
     cells = []
-    for pay, k, gtc, sf in product(PAYS, KS, GTCS, SKIP_FEES):
-        if pay >= k:
-            continue
+    for in_frac, out_frac, double_k in product(IN_FRACS, OUT_FRACS, DOUBLE_KS):
         cells.append(
             {
-                "t_fill": 0.70,
-                "t_liq": 0.55,
-                "t_range": 0.40,
-                "k_need": k,
-                "price": PRICE[pay],
-                "whale": "any",
-                "skip_fee": sf,
+                "in_frac": in_frac,
+                "out_frac": out_frac,
+                "double_k": double_k,
                 "size_mult": 1.1,
-                "exit_end": gtc,
-                "pay": pay,
-                "k": k,
-                "gtc": gtc,
+                "exit_end": 30,
             }
         )
     return cells
@@ -125,94 +112,57 @@ def _apply_iso(iso, p):
 
 
 def fit_b(train_ev):
-    Xa, ya, _ = pack_act(train_ev)
-    Xb, yb, _ = pack_bar(train_ev)
-    act, bar = _hgb(), _hgb()
-    act.fit(Xa, ya)
-    bar.fit(Xb, yb)
-    return act, bar
+    X, y, w, _ = pack_hl(train_ev)
+    est = _hgb()
+    est.fit(X, y, sample_weight=w)
+    return est
 
 
-def score_b(evs, act, bar):
+def score_b(evs, est):
     from stage_c import attach_stage_b
 
-    attach_stage_b(evs, act, bar, list(FEAT_KEYS))
-
-
-def calib_tail(train_ev, act, bar):
-    if not train_ev:
-        return {}
-    hi = train_ev[-1]["x_block"]
-    lo = hi - CALIB_TAIL
-    tail = [e for e in train_ev if e["x_block"] >= lo]
-    score_b(tail, act, bar)
-    out = {}
-    y1 = np.array([e["y_act_1"] for e in tail], dtype=float)
-    p1 = np.array([e.get("p_act_1", 0.5) for e in tail], dtype=float)
-    out[("act", 1)] = _iso(p1, y1)
-    y30 = np.array([e.get("y_act_30", 0) for e in tail], dtype=float)
-    p30 = np.array([e.get("p_act_30", 0.5) for e in tail], dtype=float)
-    out[("act", 30)] = _iso(p30, y30)
-    for k in KS_BAR:
-        yk = []
-        pk = []
-        for e in tail:
-            last, tick = e["last"], e["tick"]
-            a, h, l = e.get("y_act_30", 0), e.get("h30", 0.0), e.get("l30", 1.0)
-            if a:
-                barrier = last + k * tick
-                lab = int(h >= barrier - 1e-15) if k > 0 else int(l <= barrier + 1e-15)
-            else:
-                lab = 0
-            yk.append(lab)
-            pk.append(e.get("p_bar", {}).get((k, 30), 0.5))
-        out[("bar", k, 30)] = _iso(pk, yk)
-    return out
-
-
-def apply_calib(evs, iso):
-    for e in evs:
-        e["p_act_1"] = float(_apply_iso(iso.get(("act", 1)), [e.get("p_act_1", 0.5)])[0])
-        e["p_act_30"] = float(_apply_iso(iso.get(("act", 30)), [e.get("p_act_30", 0.5)])[0])
-        d = e.get("p_bar") or {}
-        for k in KS_BAR:
-            iso_b = iso.get(("bar", k, 30))
-            d[(k, 30)] = float(_apply_iso(iso_b, [d.get((k, 30), 0.5)])[0])
-        e["p_bar"] = d
+    attach_stage_b(evs, est, list(FEAT_KEYS))
 
 
 def neighbors(cell):
     out = []
-    for pay in (cell["pay"] - 1, cell["pay"] + 1):
-        if pay in PAYS and pay < cell["k"]:
-            out.append({**cell, "pay": pay, "price": PRICE[pay]})
-    for k in (cell["k"] - 1, cell["k"] + 1):
-        if k in KS and cell["pay"] < k:
-            out.append({**cell, "k": k, "k_need": k})
-    other_gtc = 60 if cell["gtc"] == 30 else 30
-    out.append({**cell, "gtc": other_gtc, "exit_end": other_gtc})
+    for inf in IN_FRACS:
+        if inf != cell["in_frac"]:
+            out.append({**cell, "in_frac": inf})
+    for of in OUT_FRACS:
+        if of != cell["out_frac"]:
+            out.append({**cell, "out_frac": of})
+    for dk in DOUBLE_KS:
+        if dk != cell["double_k"]:
+            out.append({**cell, "double_k": dk})
     return out
 
 
 def promote(ranked, naive_pnl):
     """ranked: list of (cell, eval) on val, best-first by pnl."""
+    def _sc(ev):
+        s = ev.get("score")
+        if s is None:
+            s = ev.get("pnl")
+        return s
+
     ok = [
         r
         for r in ranked
         if not r[1]["hard_fail"]
-        and r[1]["pnl"] is not None
-        and r[1]["pnl"] > 0
+        and _sc(r[1]) is not None
+        and _sc(r[1]) > 0
         and r[1]["n_part"] >= MIN_PART_VAL
         and r[1]["per_hour"] >= 1.0
     ]
     if naive_pnl is not None:
-        ok = [r for r in ok if r[1]["pnl"] > naive_pnl]
+        ok = [r for r in ok if (r[1].get("pnl") or 0) > naive_pnl]
     for cell, ev in ok:
-        floor = -max(NEIGHBOR_ABS, NEIGHBOR_MULT * abs(ev["pnl"]))
+        floor = -max(NEIGHBOR_ABS, NEIGHBOR_MULT * abs(ev.get("pnl") or 0))
         disaster = False
-        by = {(c["pay"], c["k"], c["gtc"], c["skip_fee"]): e for c, e in ranked}
+        by = {(c["in_frac"], c["out_frac"], c["double_k"]): e for c, e in ranked}
         for nb in neighbors(cell):
-            key = (nb["pay"], nb["k"], nb["gtc"], nb["skip_fee"])
+            key = (nb["in_frac"], nb["out_frac"], nb["double_k"])
             nev = by.get(key)
             if nev is None or nev["pnl"] is None:
                 continue
@@ -285,17 +235,11 @@ def _do_sim(e, ticket, asks_i, tbuy_i, bids_i):
 
 
 def precompute_fires(evs, cells, asks_i, tbuy_i, bids_i):
-    """One sim per unique ticket; then 48 cooldown passes are cheap."""
+    """One sim per unique ticket; cooldown passes are cheap."""
     sim_cache = {}
     fires = [[] for _ in cells]
     n_sim = 0
-    t_fill_min = min(c["t_fill"] for c in cells)
-    t_liq_min = min(c["t_liq"] for c in cells)
     for i, e in enumerate(evs):
-        if float(e.get("p_act_1", 0.0)) < t_fill_min:
-            continue
-        if float(e.get("p_act_30", 0.0)) < t_liq_min:
-            continue
         for ci, p in enumerate(cells):
             ticket = pick_ticket(e, **p)
             if ticket is None:
@@ -304,16 +248,23 @@ def precompute_fires(evs, cells, asks_i, tbuy_i, bids_i):
                 e["x_block"],
                 e["cid"],
                 ticket["side"],
-                ticket["din"],
-                ticket["dout"],
+                round(float(ticket["p_in"]), 8),
+                round(float(ticket["p_out"]), 8),
                 round(float(ticket["n"]), 6),
-                int(ticket.get("exit_end", 60)),
+                int(ticket.get("exit_end", 30)),
                 int(bool(e.get("fee_market"))),
             )
             if skey not in sim_cache:
                 sim_cache[skey] = _do_sim(e, ticket, asks_i, tbuy_i, bids_i)
                 n_sim += 1
-            fires[ci].append((e["cid"], e["x_block"], sim_cache[skey]))
+            fires[ci].append(
+                (
+                    e["cid"],
+                    e["x_block"],
+                    sim_cache[skey],
+                    int(ticket.get("should_bet_double", 0)),
+                )
+            )
     return fires, n_sim
 
 
@@ -322,13 +273,17 @@ def seq_from_fires(fires_one, lo, hi):
 
     cool: dict[str, int] = {}
     n_part = pnl = n_ok = 0
-    qe = ql = qz = buy = 0.0
-    for cid, x, sim in fires_one:
+    qe = ql = qz = buy = score = 0.0
+    for row in fires_one:
+        cid, x, sim = row[0], row[1], row[2]
+        dbl = int(row[3]) if len(row) > 3 else 0
         if x < cool.get(cid, -1):
             continue
         n_part += 1
         cool[cid] = x + COOLDOWN_BLOCKS
-        pnl += sim["pnl"]
+        raw = float(sim["pnl"])
+        pnl += raw
+        score += raw * (2.0 if dbl else 1.0)
         n_ok += int(sim["entry_ok"])
         if sim.get("entry_ok"):
             buy += float(sim.get("usdc_in", 0.0))
@@ -345,6 +300,7 @@ def seq_from_fires(fires_one, lo, hi):
         "per_hour": rate,
         "hard_fail": hard,
         "pnl": None if hard else pnl,
+        "score": None if hard else score,
         "hit": (n_ok / n_part) if n_part else 0.0,
         "q_zero": (qz / qt) if qt else 0.0,
         "q_liq": (ql / qt) if qt else 0.0,
@@ -453,14 +409,28 @@ def attach_heat_events(events):
 
 
 def brier_slice(evs, key="p_act_1", ykey="y_act_1"):
-    y = np.array([e.get(ykey, 0) for e in evs], dtype=float)
-    p = np.array([e.get(key, 0.5) for e in evs], dtype=float)
-    if len(y) < 40 or y.min() == y.max():
+    if not evs or "b_h1_hi" not in evs[0]:
         return float("nan")
-    try:
-        return float(brier_score_loss(y, np.clip(p, EPS_P, 1 - EPS_P)))
-    except Exception:
-        return float("nan")
+    y, p, w = [], [], []
+    for e in evs:
+        y.extend(
+            [
+                float(e.get("y_h1_hi", 0.0)),
+                float(e.get("y_h1_lo", 0.0)),
+                float(e.get("y_h130_hi", 0.0)),
+                float(e.get("y_h130_lo", 0.0)),
+            ]
+        )
+        p.extend(
+            [
+                float(e.get("b_h1_hi", 0.0)),
+                float(e.get("b_h1_lo", 0.0)),
+                float(e.get("b_h130_hi", 0.0)),
+                float(e.get("b_h130_lo", 0.0)),
+            ]
+        )
+        w.extend([2.0, 2.0, 1.0, 1.0])
+    return weighted_mse(y, p, w)
 
 
 def main() -> int:
@@ -529,12 +499,9 @@ def main() -> int:
                 json.dumps({"fold_i": fold_i, "next_t": t, "concat": concat, "folds": folds}, default=str)
             )
             continue
-        act, bar = fit_b(train)
-        iso = calib_tail(train, act, bar)
-        score_b(val_e, act, bar)
-        score_b(test_e, act, bar)
-        apply_calib(val_e, iso)
-        apply_calib(test_e, iso)
+        est = fit_b(train)
+        score_b(val_e, est)
+        score_b(test_e, est)
         print("    load sim fills …", flush=True)
         cids = {e["cid"] for e in val_e} | {e["cid"] for e in test_e}
         asks, tbuy, bids = load_sim(v_lo, s_hi, cids)
@@ -546,7 +513,13 @@ def main() -> int:
         for ci, p in enumerate(cells):
             ev = seq_from_fires(val_fires[ci], v_lo, v_hi - 1)
             ranked.append((p, ev))
-        ranked.sort(key=lambda r: (r[1]["pnl"] is not None, r[1]["pnl"] or -1e99), reverse=True)
+        ranked.sort(
+            key=lambda r: (
+                r[1].get("score") is not None,
+                r[1].get("score") if r[1].get("score") is not None else -1e99,
+            ),
+            reverse=True,
+        )
         print("    naive val/test …", flush=True)
         naive_v = naive_eval(val_e, lo=v_lo, hi=v_hi - 1, asks_i=asks, tbuy_i=tbuy, bids_i=bids)
         naive_t = naive_eval(test_e, lo=s_lo, hi=s_hi - 1, asks_i=asks, tbuy_i=tbuy, bids_i=bids)
@@ -574,8 +547,9 @@ def main() -> int:
             )
             test_ev["skipped"] = False
             print(
-                f"    ticket k={cell['k']} {cell['price']} gtc={cell['gtc']} "
-                f"val ${val_ev['pnl']:.2f}  test "
+                f"    ticket in={cell['in_frac']} out={cell['out_frac']} "
+                f"dbl_k={cell['double_k']} val ${val_ev['pnl']:.2f} "
+                f"score ${val_ev.get('score') or 0:.2f}  test "
                 + ("hard-fail" if test_ev["hard_fail"] else f"${test_ev['pnl']:.2f}"),
                 flush=True,
             )
@@ -595,7 +569,9 @@ def main() -> int:
                 "days": test_days,
                 "naive_fill": 0 if naive_t["hard_fail"] else int(naive_t.get("n_fill", 0)),
                 "naive_buy": 0.0 if naive_t["hard_fail"] else float(naive_t.get("buy_usdc", 0.0)),
-                "ticket": None if cell is None else {k: cell[k] for k in ("k", "price", "gtc", "skip_fee")},
+                "ticket": None
+                if cell is None
+                else {k: cell[k] for k in ("in_frac", "out_frac", "double_k")},
                 "brier_act1": brier_slice(test_e),
             }
         )
@@ -673,7 +649,7 @@ def main() -> int:
     ]
     for c in concat:
         tk = c["ticket"]
-        tks = "skip" if not tk else f"k={tk['k']} {tk['price']} z={tk['gtc']}"
+        tks = "skip" if not tk else f"in={tk['in_frac']} out={tk['out_frac']} dbl={tk['double_k']}"
         lines.append(
             f"| {c['fold']} | {c['test_pnl']:.2f} | {c['naive_pnl']:.2f} | "
             f"{c.get('n_fill', 0):,} | {c.get('buy_usdc', 0):.2f} | {tks} | {c['brier_act1']:.4f} |"

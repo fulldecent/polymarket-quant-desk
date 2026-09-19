@@ -8,5 +8,6 @@ No-model live traders. Shared project code lives in top-level `lib/` and `exchan
 | [`buy_token/`](buy_token/) | One FOK market buy, wait on `--listen` for the fill block. |
 | [`liquidate/`](liquidate/) | Cancel / sell on CLOB; redeem / merge via `--exec`; wrap USDC.e → pUSD. |
 | [`follow_anything/`](follow_anything/) | Copy N settled buy fills; measure block lag. |
+| [`directional_fok/`](directional_fok/) | Frozen 6-of-8 + Kris-10+ FOK/GTC; max 3 open; 100-block warmup. |
 
 Flags: `--exec {clob,polynode}`, `--listen {rpc,polynode}` (always settled), optional `--trigger-polynode-mempool`.

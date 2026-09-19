@@ -18,11 +18,8 @@ because one bucket failed.
 
 ## Stage A — persist (before any model)
 
-See [`STAGE_A.md`](STAGE_A.md) (frozen). At least **5 of the last 8
-blocks** have a fill. 3-of-8 was the first envelope-green gate; 5-of-8
-is the freeze after Kris Kross. The maker zigzag **count** in that
-window (`kris_count_8`) is a Stage B persist feature, not a second A
-cut.
+See [`STAGE_A.md`](STAGE_A.md) (frozen). **6 of the last 8** blocks
+have a fill **and** Kris Kross count ≥ **10**.
 
 ## Stage B — tape-touch (the heads)
 

@@ -4,7 +4,7 @@ This is the timing protocol. The weekend sliver (+$0.29 val / +$4.80
 test) and a one-shot 9-month B freeze are **not** a go-live. They are
 history.
 
-A is frozen (5-of-8) for the whole study. Test never selects: not the
+A is frozen (6-of-8 and Kris Kross 10+) for the whole study. Test never selects: not the
 ticket, not the B window, not the feature pack, not the promotion rule.
 
 ## Picture

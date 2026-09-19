@@ -43,6 +43,7 @@ from sim_lib import (  # noqa: E402
     PREFILTER_WINDOW,
     Level,
     infer_tick,
+    clip_px,
     long_caps,
     n_min,
     prefilter_alive,
@@ -50,6 +51,8 @@ from sim_lib import (  # noqa: E402
     taker_fee_usdc,
 )
 from stage_b import (  # noqa: E402
+    FEAT_KEYS,
+    HL_HEADS,
     HORIZONS,
     feat_window,
     stride_take,
@@ -203,72 +206,62 @@ def passes_whale(st: dict, mode: str) -> bool:
 def pick_ticket(
     ev: dict,
     *,
-    t_fill: float,
-    t_liq: float,
-    t_range: float,
-    k_need: int,
-    price: str,
-    whale: str,
-    skip_fee: bool,
-    size_mult: float,
+    in_frac: float = 1.0,
+    out_frac: float = 1.0,
+    double_k: float = 1.0,
+    size_mult: float = 1.1,
     exit_end: int = 30,
     **_ignore,
 ) -> dict | None:
-    """Fire only if FOK-bar, 30-block liquidity, and a k-tick range all clear.
+    """Always-on decoder from Stage B high/low deltas.
 
-    `price`: passive/pay1/pay2 → how many ticks we pay on the FOK (din).
-    Exit is last ± k_need ticks. None = skip.
+    entry/exit are deltas to last(X) in YES space. Direction is the larger
+    predicted excursion. should_bet_double if predicted edge ≥ double_k ticks.
+    Size is 1× floor (double is an eval weight, not a skip).
     """
-    if float(ev.get("p_act_1", 0.0)) < t_fill:
-        return None
-    if float(ev.get("p_act_30", 0.0)) < t_liq:
-        return None
-    if skip_fee and ev.get("fee_market"):
-        return None
-    if not passes_whale(ev, whale):
-        return None
     last = float(ev["last"])
     tick = float(ev["tick"])
     if tick <= 0 or not (0 < last < 1):
         return None
-    din = int(PRICE_DIN.get(price, 0))
-    dout = int(k_need)
-    if dout <= din:
+    h1h = float(ev.get("b_h1_hi", 0.0))
+    h1l = float(ev.get("b_h1_lo", 0.0))
+    h30h = float(ev.get("b_h130_hi", 0.0))
+    h30l = float(ev.get("b_h130_lo", 0.0))
+    up = h1h + h30h
+    dn = (-h1l) + (-h30l)
+    if up >= dn:
+        side = "yes"
+        d_in = float(in_frac) * h1h
+        d_out = float(out_frac) * h30h
+        p_in = clip_px(last + d_in, tick)
+        p_out = clip_px(last + d_out, tick)
+    else:
+        side = "no"
+        d_in = float(in_frac) * h1l
+        d_out = float(out_frac) * h30l
+        p_in = clip_px(1.0 - (last + d_in), tick)
+        p_out = clip_px(1.0 - (last + d_out), tick)
+    if p_out <= p_in + 1e-15:
+        p_out = clip_px(p_in + tick, tick)
+    if p_out <= p_in + 1e-15:
         return None
-    p_bar = ev.get("p_bar") or {}
-    p_act = float(ev.get("p_act_1", 0.0))
-    fee_pen = 0.0
-    if ev.get("fee_market"):
-        fee_pen = 2.0 * taker_fee_usdc(1.0, last, True)
-    best = None
-    best_sc = 0.0
-    for sign, side in ((1, "yes"), (-1, "no")):
-        pe = float(p_bar.get((sign * dout, 30), 0.0))
-        if pe < t_range:
-            continue
-        close_side = last if side == "yes" else 1.0 - last
-        caps = long_caps(close_side, din, dout, tick)
-        if caps is None:
-            continue
-        p_in, p_out = caps
-        edge = p_out - p_in
-        if edge + 1e-15 < tick:
-            continue
-        sc = p_act * pe * edge - fee_pen
-        if sc > best_sc:
-            n = max(MIN_SHARES, size_mult * n_min(p_in))
-            best_sc = sc
-            best = {
-                "side": side,
-                "p_in": p_in,
-                "p_out": p_out,
-                "n": float(n),
-                "din": din,
-                "dout": dout,
-                "score": sc,
-                "exit_end": int(exit_end),
-            }
-    return best
+    n = max(MIN_SHARES, float(size_mult) * n_min(p_in))
+    edge = p_out - p_in
+    double = int(edge + 1e-15 >= float(double_k) * tick)
+    d_in_yes = (p_in if side == "yes" else 1.0 - p_in) - last
+    d_out_yes = (p_out if side == "yes" else 1.0 - p_out) - last
+    return {
+        "side": side,
+        "p_in": p_in,
+        "p_out": p_out,
+        "n": float(n),
+        "din": d_in_yes,
+        "dout": d_out_yes,
+        "entry_delta": d_in_yes,
+        "exit_delta": d_out_yes,
+        "should_bet_double": double,
+        "exit_end": int(exit_end),
+    }
 
 
 def sequential_eval(
@@ -284,7 +277,7 @@ def sequential_eval(
 ) -> dict:
     cool: dict[str, int] = {}
     n_part = pnl = n_ok = 0
-    qe = ql = qz = buy = 0.0
+    qe = ql = qz = buy = score = 0.0
     for ev in events:
         x, cid = ev["x_block"], ev["cid"]
         if x < cool.get(cid, -1):
@@ -294,7 +287,13 @@ def sequential_eval(
             continue
         n_part += 1
         cool[cid] = x + COOLDOWN_BLOCKS
-        key = (id(ev), ticket["side"], ticket["din"], ticket["dout"], ticket["n"])
+        key = (
+            id(ev),
+            ticket["side"],
+            round(float(ticket["din"]), 8),
+            round(float(ticket["dout"]), 8),
+            ticket["n"],
+        )
         if sims is not None and key in sims:
             sim = sims[key]
         else:
@@ -324,7 +323,10 @@ def sequential_eval(
                 liq_start=x_end + 1,
                 liq_end=x_end + 60,
             )
-        pnl += sim["pnl"]
+        raw = float(sim["pnl"])
+        pnl += raw
+        dbl = int(ticket.get("should_bet_double", 0))
+        score += raw * (2.0 if dbl else 1.0)
         n_ok += int(sim["entry_ok"])
         if sim.get("entry_ok"):
             buy += float(sim.get("usdc_in", 0.0))
@@ -340,6 +342,7 @@ def sequential_eval(
         "per_hour": rate,
         "hard_fail": hard,
         "pnl": None if hard else pnl,
+        "score": None if hard else score,
         "hit": (n_ok / n_part) if n_part else 0.0,
         "q_zero": (qz / qt) if qt else 0.0,
         "q_exit": (qe / qt) if qt else 0.0,
@@ -418,44 +421,30 @@ def naive_eval(events, *, lo, hi, asks_i, tbuy_i, bids_i) -> dict:
     }
 
 
-def attach_stage_b(events, est_act, est_bar, keys: list[str]) -> None:
-    """Score frozen B heads. Z=30 must have been in B's training set."""
+def attach_stage_b(events, est, keys: list[str] | None = None) -> None:
+    """Score the four high/low delta heads onto each event."""
+    keys = keys or list(FEAT_KEYS)
     n = len(events)
     if n == 0:
         return
-    ks = [k for k in range(-K_MAX, K_MAX + 1) if k != 0]
-    zs = tuple(float(z) for z in HORIZONS)
-    Xa = np.zeros((n * len(zs), len(keys) + 1), dtype=np.float32)
+    n_h = len(HL_HEADS)
+    X = np.zeros((n * n_h, len(keys) + 2), dtype=np.float32)
     r = 0
     for e in events:
-        base = [e["feat"][k] for k in keys]
-        for z in zs:
-            Xa[r, :-1] = base
-            Xa[r, -1] = z
+        feat = e.get("feat") or {}
+        base = [float(feat.get(k, 0.0)) for k in keys]
+        for z, is_hi, _yk in HL_HEADS:
+            X[r, :-2] = base
+            X[r, -2] = float(z)
+            X[r, -1] = float(is_hi)
             r += 1
-    pa = est_act.predict_proba(Xa)[:, 1]
-    Xb = np.zeros((n * len(ks) * len(zs), len(keys) + 2), dtype=np.float32)
+    pred = est.predict(X)
     r = 0
     for e in events:
-        base = [e["feat"][k] for k in keys]
-        for z in zs:
-            for k in ks:
-                Xb[r, :-2] = base
-                Xb[r, -2] = k
-                Xb[r, -1] = z
-                r += 1
-    pb = est_bar.predict_proba(Xb)[:, 1]
-    ra = rb = 0
-    for e in events:
-        for z in HORIZONS:
-            e[f"p_act_{z}"] = float(pa[ra])
-            ra += 1
-        d = {}
-        for z in HORIZONS:
-            for k in ks:
-                d[(k, z)] = float(pb[rb])
-                rb += 1
-        e["p_bar"] = d
+        e["b_h1_hi"] = float(pred[r]); r += 1
+        e["b_h1_lo"] = float(pred[r]); r += 1
+        e["b_h130_hi"] = float(pred[r]); r += 1
+        e["b_h130_lo"] = float(pred[r]); r += 1
 
 
 def _idx(rows) -> dict:
