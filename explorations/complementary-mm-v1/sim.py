@@ -110,7 +110,14 @@ def _levels_from_rows(rows: list[tuple]) -> dict[tuple, list[Level]]:
     return out
 
 
-def run(trigger_days: float, interp: str, kappa: float, max_attempts: int | None) -> int:
+def run(
+    trigger_days: float,
+    interp: str,
+    kappa: float,
+    max_attempts: int | None,
+    *,
+    fee_free: bool = False,
+) -> int:
     if interp != "C":
         _fail("v0 only implements interpretation C (maker-sell asks).")
     for name, val in (
@@ -133,7 +140,12 @@ def run(trigger_days: float, interp: str, kappa: float, max_attempts: int | None
     fill_lo = x_lo
     fill_hi = x_hi + COMPLEMENT_BLOCKS + HORIZON_BLOCKS
     started = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    print(f"naive baseline  interp=C  m=1  kappa={kappa:g}", flush=True)
+    snap_path = _HERE / ("fee-free-snapshot.md" if fee_free else "baseline-snapshot.md")
+    print(
+        f"naive baseline  interp=C  m=1  kappa={kappa:g}"
+        + ("  fee-free" if fee_free else ""),
+        flush=True,
+    )
     print(f"  trigger X  {x_lo:,}–{x_hi:,}  ({trigger_days:g}d)", flush=True)
     print(f"  fills      {fill_lo:,}–{fill_hi:,}  frontier {frontier:,}", flush=True)
 
@@ -285,11 +297,34 @@ def run(trigger_days: float, interp: str, kappa: float, max_attempts: int | None
           AND y.vwap + n.vwap < {PAIR_COST_FIRE}
         """
     )
+    con.execute(
+        """
+        CREATE TABLE fee_cids AS
+        SELECT cid
+        FROM fills
+        GROUP BY 1
+        HAVING sum(fee_usdc) > 0
+        """
+    )
+    if fee_free:
+        con.execute(
+            """
+            CREATE OR REPLACE TABLE candidates AS
+            SELECT c.*
+            FROM candidates c
+            LEFT JOIN fee_cids f ON f.cid = c.cid
+            WHERE f.cid IS NULL
+            """
+        )
+        print("  fee-free filter on", flush=True)
     n_cand = con.execute("SELECT count(*) FROM candidates").fetchone()[0]
     print(f"  candidates {n_cand:,}", flush=True)
     if n_cand == 0:
-        _write_snapshot(started, x_lo, x_hi, frontier, interp, kappa, [], time.time() - t0)
-        print(f"wrote {SNAP_PATH}", flush=True)
+        _write_snapshot(
+            started, x_lo, x_hi, frontier, interp, kappa, [], time.time() - t0, None,
+            snap_path=snap_path, fee_free=fee_free,
+        )
+        print(f"wrote {snap_path}", flush=True)
         return 0
 
     if max_attempts is not None and n_cand > max_attempts:
@@ -322,15 +357,6 @@ def run(trigger_days: float, interp: str, kappa: float, max_attempts: int | None
             WHERE c.block_number = cand.x_block AND c.cid = cand.cid
         )"""
 
-    con.execute(
-        f"""
-        CREATE TABLE fee_cids AS
-        SELECT cid
-        FROM fills
-        GROUP BY 1
-        HAVING sum(fee_usdc) > 0
-        """
-    )
     if c10k_files:
         con.execute(
             f"""
@@ -514,7 +540,9 @@ def run(trigger_days: float, interp: str, kappa: float, max_attempts: int | None
 
     out_dir = Path(SCRATCH) / "complementary-mm-v1"
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_parq = out_dir / "naive_attempts.parquet"
+    out_parq = out_dir / (
+        "naive_attempts_feefree.parquet" if fee_free else "naive_attempts.parquet"
+    )
     if attempts:
         import pandas as pd
 
@@ -526,8 +554,12 @@ def run(trigger_days: float, interp: str, kappa: float, max_attempts: int | None
         print(f"  attempts parquet  {out_parq}  rows {len(df):,}", flush=True)
 
     elapsed = time.time() - t0
-    _write_snapshot(started, x_lo, x_hi, frontier, interp, kappa, attempts, elapsed, out_parq if attempts else None)
-    print(f"wrote {SNAP_PATH}", flush=True)
+    _write_snapshot(
+        started, x_lo, x_hi, frontier, interp, kappa, attempts, elapsed,
+        out_parq if attempts else None,
+        snap_path=snap_path, fee_free=fee_free,
+    )
+    print(f"wrote {snap_path}", flush=True)
     print(f"run complete  time: {elapsed:.1f}s", flush=True)
     con.close()
     return 0
@@ -543,6 +575,8 @@ def _write_snapshot(
     attempts: list[dict],
     elapsed: float,
     parquet: Path | None = None,
+    snap_path: Path | None = None,
+    fee_free: bool = False,
 ) -> None:
     n = len(attempts)
     by_state = defaultdict(int)
@@ -635,7 +669,17 @@ def _write_snapshot(
         "inventory, including dump-miss = $0."
     )
     lines.append("")
-    SNAP_PATH.write_text("\n".join(lines))
+    out = snap_path or SNAP_PATH
+    header = "# Naive baseline snapshot"
+    if fee_free:
+        header = "# Fee-free complementary-MM snapshot"
+        lines[0] = header
+        lines.insert(
+            2,
+            "Fee-charging conditions dropped (5m crypto factories). "
+            "Pair-cost fire `< 0.99` is Stage A.",
+        )
+    out.write_text("\n".join(lines))
 
 
 def main() -> int:
@@ -648,8 +692,19 @@ def main() -> int:
                    help="competition multiple on required ask depth (1=C, 2=B-style)")
     p.add_argument("--max-attempts", type=int, default=None,
                    help="optional cap on naive candidates (deterministic first N by block)")
+    p.add_argument(
+        "--fee-free",
+        action="store_true",
+        help="drop conditions that ever charged taker fee (skip 5m crypto factories)",
+    )
     args = p.parse_args()
-    return run(args.trigger_days, args.interp, args.kappa, args.max_attempts)
+    return run(
+        args.trigger_days,
+        args.interp,
+        args.kappa,
+        args.max_attempts,
+        fee_free=args.fee_free,
+    )
 
 
 if __name__ == "__main__":

@@ -1,25 +1,46 @@
-"""Directional FOK / GTC fill mechanics. Shares and USDC as float, prices in (0, 1)."""
+"""Directional FOK / GTC fill mechanics. Shares and USDC as float, prices in (0, 1).
+
+Walks and clip live in `explorations.frame` (see FRAME.md). This module
+keeps the one-sided windows, Stage A persist constants, and round-trip.
+"""
 
 from __future__ import annotations
 
 import json
-import math
-from dataclasses import dataclass
+import sys
+from pathlib import Path
 
-MIN_SHARES = 5.0
-MIN_WORST_NOTIONAL = 1.20
-TICK = 0.01  # fallback only; infer_tick() is the Stage B step size
-LEGAL_TICKS = (0.1, 0.01, 0.005, 0.0025, 0.001, 0.0001)  # coarsest → finest
+_ROOT = Path(__file__).resolve().parents[2]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from explorations.frame.clip import (  # noqa: E402
+    BLOCKS_PER_DAY,
+    BLOCK_SEC,
+    COOLDOWN_BLOCKS,
+    LEGAL_TICKS,
+    LOOKBACK_BLOCKS,
+    MIN_SHARES,
+    MIN_WORST_NOTIONAL,
+    TAKER_FEE_RATE,
+    TICK,
+    clip_px,
+    infer_tick,
+    n_min,
+    taker_fee_usdc,
+    yes_px,
+)
+from explorations.frame.ticket import CapTouch, ShareNeed  # noqa: E402
+from explorations.frame.walk import Level, walk_rest_sell, walk_take_buy  # noqa: E402
+
 K_MAX = 5  # C shortlist uses k in {1,3,4,5}
 # H1 = X+1 (FOK bar). H60 = X+2..X+60 (GTC window, excludes X+1).
 HORIZONS = (1, 60)
-TAKER_FEE_RATE = 0.0135
-COOLDOWN_BLOCKS = 180
-LOOKBACK_BLOCKS = 100
-# Stage A persist + Kris Kross. Frozen in STAGE_A.md.
+# Stage A persist + Kris Kross. Live formula.json is 3-of-8 / criss 5.
+# STAGE_A.md freeze card is 6-of-8 / Kris 10. See explorations/README.md.
 PREFILTER_WINDOW = 8
-PREFILTER_NEED = 6
-PREFILTER_KRIS_MIN = 10
+PREFILTER_NEED = 3
+PREFILTER_KRIS_MIN = 5
 ENTRY_LAG = 1
 EXIT_START = 2
 EXIT_END = 60
@@ -28,30 +49,6 @@ LIQ_END = 120
 BUCKETS = (1, 5, 15, 30, 60, 100)
 MIN_PRICE = TICK
 MAX_PRICE = 1.0 - TICK
-BLOCKS_PER_DAY = 41136
-BLOCK_SEC = 2.1
-
-
-@dataclass(frozen=True)
-class Level:
-    px: float
-    tokens: float
-
-
-def n_min(p: float) -> int:
-    if p <= 0:
-        raise ValueError("p must be positive")
-    return max(5, math.ceil(MIN_WORST_NOTIONAL / p - 1e-12))
-
-
-def yes_px(gross_usdc: float, net_yes_tokens: float) -> float | None:
-    """YES-equivalent price of a fill. Complementary: NO at p ↔ YES at 1-p."""
-    if net_yes_tokens == 0:
-        return None
-    g, n = float(gross_usdc), float(net_yes_tokens)
-    if (g > 0 and n > 0) or (g < 0 and n < 0):
-        return g / n
-    return 1.0 + g / n
 
 
 def prefilter_alive(fill_blocks: set[int], x: int,
@@ -141,40 +138,7 @@ def fold_resolve(a, h, l, lo: int, hi: int, resolved_block, settle_yes: float | 
     return int(a), float(h), float(l)
 
 
-def infer_tick(prices: list[float]) -> float:
-    """Coarsest documented tick that fits every price in the last-100-block window.
 
-    Legal set: 0.1, 0.01, 0.005, 0.0025, 0.001, 0.0001
-    (docs.polymarket.com/market-data/market-details).
-
-    Sparse prints that all lie on 0.10 (e.g. only 0.50 and 0.60) must not
-    coarsen past 0.01 — that is a 1¢ book until a 10¢-only grid is obvious.
-    """
-    uniq = sorted({round(float(p), 8) for p in prices if p is not None and 0 < p < 1})
-    if not uniq:
-        return 0.01
-
-    def _fits(t: float) -> bool:
-        return all(abs(round(p / t) * t - p) <= max(1e-9, t * 1e-6) for p in uniq)
-
-    for t in LEGAL_TICKS:
-        if not _fits(t):
-            continue
-        if t == 0.1 and len(uniq) < 3:
-            continue
-        return t
-    return 0.0001
-
-
-def clip_px(p: float, tick: float | None = None) -> float:
-    t = TICK if tick is None else tick
-    return min(1.0 - t, max(t, p))
-
-
-def taker_fee_usdc(shares: float, px: float, fee_market: bool) -> float:
-    if not fee_market or shares <= 0:
-        return 0.0
-    return TAKER_FEE_RATE * min(px, 1.0 - px) * shares
 
 
 def offset_caps(
@@ -209,44 +173,14 @@ def naive_caps(close_side: float, tick: float = TICK) -> tuple[float, float] | N
 
 
 def walk_fok_buy(levels: list[Level], *, cap: float, n: float) -> tuple[float, float] | None:
-    """FOK buy: px <= cap, need at least n shares. Cap-touch counts. Returns (usdc, vwap)."""
-    if n < MIN_SHARES or n * cap < MIN_WORST_NOTIONAL:
+    """FOK buy: inclusive cap-touch, at least n shares. Returns (usdc, vwap)."""
+    fill = walk_take_buy(
+        levels, cap=cap, n=n,
+        cap_touch=CapTouch.INCLUSIVE, share_need=ShareNeed.AT_LEAST,
+    )
+    if fill is None:
         return None
-    ordered = sorted((lv for lv in levels if lv.tokens > 0 and lv.px <= cap + 1e-15), key=lambda lv: lv.px)
-    avail = sum(lv.tokens for lv in ordered)
-    if avail + 1e-12 < n:
-        return None
-    left = n
-    cost = 0.0
-    for lv in ordered:
-        take = min(left, lv.tokens)
-        cost += take * lv.px
-        left -= take
-        if left <= 1e-12:
-            break
-    if left > 1e-12:
-        return None
-    return cost, cost / n
-
-
-def _consume_sell(
-    levels: list[Level], remaining: float, ok
-) -> tuple[float, float]:
-    """Hit highest qualifying px first. Returns (shares_taken, usdc)."""
-    if remaining <= 1e-12:
-        return 0.0, 0.0
-    ordered = sorted((lv for lv in levels if lv.tokens > 0 and ok(lv.px)), key=lambda lv: -lv.px)
-    taken = 0.0
-    usdc = 0.0
-    left = remaining
-    for lv in ordered:
-        take = min(left, lv.tokens)
-        taken += take
-        usdc += take * lv.px
-        left -= take
-        if left <= 1e-12:
-            break
-    return taken, usdc
+    return fill.usdc, fill.vwap
 
 
 def simulate_roundtrip(
@@ -290,12 +224,14 @@ def simulate_roundtrip(
             break
         rel = blk - x_block
         if rel == 2:
-            pred = lambda px, pe=p_exit: px > pe + 1e-15
+            touch = CapTouch.STRICT
         elif 3 <= rel <= exit_end:
-            pred = lambda px, pe=p_exit: px + 1e-15 >= pe
+            touch = CapTouch.INCLUSIVE
         else:
             continue
-        taken, usd = _consume_sell(levels, remaining, pred)
+        taken, usd = walk_rest_sell(
+            levels, floor=p_exit, remaining=remaining, cap_touch=touch,
+        )
         q_exit += taken
         usdc_exit += usd
         remaining -= taken
@@ -309,7 +245,9 @@ def simulate_roundtrip(
             rel = blk - x_block
             if rel < liq_start or rel > liq_end:
                 continue
-            taken, usd = _consume_sell(levels, remaining, lambda px: True)
+            taken, usd = walk_rest_sell(
+                levels, floor=0.0, remaining=remaining, cap_touch=CapTouch.INCLUSIVE,
+            )
             q_liq += taken
             usdc_liq += usd
             remaining -= taken

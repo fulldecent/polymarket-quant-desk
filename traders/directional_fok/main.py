@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live directional FOK/GTC from the frozen 6-of-8 + Kris-10+ formula.
+"""Live directional FOK/GTC from formula.json (3-of-8 + criss 5).
 
 Warm up 100 blocks (progress bar), then hot. Max 3 outstanding bets.
 FOK buy then GTC sell in the same turn — no wait on exposure.
@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import json
 import math
+import re
 import sys
 import time
 from pathlib import Path
@@ -40,10 +41,36 @@ from traders.lib.streams import (  # noqa: E402
 from traders.lib.ui import COLOR_DONE, TraderUI, format_hms, shorten  # noqa: E402
 
 FORMULA_PATH = _HERE / "formula.json"
+_CRYPTO_RE = re.compile(
+    r"(btc|eth|sol|xrp|doge|bnb|hype|zec|bitcoin|ethereum|solana|dogecoin)"
+    r".*(updown|up or down|up-or-down|up-down)"
+    r"|(updown-(5m|15m|1h|4h|1d))",
+    re.I,
+)
 
 
 def load_formula() -> dict:
     return json.loads(FORMULA_PATH.read_text())
+
+
+def is_crypto_market(title: str, outcome: str = "") -> bool:
+    blob = f"{title or ''} {outcome or ''}"
+    if _CRYPTO_RE.search(blob):
+        return True
+    if re.search(r"\b(up|down)\b", blob, re.I) and re.search(
+        r"\b(btc|eth|sol|xrp|doge|bitcoin|ethereum|solana)\b", blob, re.I
+    ):
+        return True
+    return False
+
+
+def _is_our_sell(event: TradeEvent, token: str, our_addrs: set[str] | None = None) -> bool:
+    """True when *we* sold `token` for collateral (GTC/FAK), not when we bought it."""
+    if event.maker_asset_id != token or event.taker_asset_id not in {"", "0"}:
+        return False
+    if not our_addrs:
+        return False
+    return (event.maker or "").lower() in our_addrs
 
 
 def _lot2(n: float) -> float:
@@ -140,12 +167,12 @@ async def run(args: argparse.Namespace) -> int:
     b_keys = list(blob.get("feat_keys") or FEAT_KEYS)
     ui.log_only(
         f"exec={args.exec}  listen={args.listen}  "
-        f"gate={a['need']}-of-{a['window']} kris={a['kris_min']}+  "
+        f"gate={a['need']}-of-{a['window']} criss={a.get('criss_min', a.get('kris_min'))}+  "
         f"in={c['in_frac']} out={c['out_frac']} dbl={c['double_k']}  "
         f"max_open={port['max_open']}  warmup={port['warmup_blocks']}"
     )
     ui.print(
-        f"formula    {a['need']}-of-{a['window']}  kris {a['kris_min']}+  "
+        f"formula    {a['need']}-of-{a['window']}  criss {a.get('criss_min', a.get('kris_min'))}+  "
         f"in={c['in_frac']}  out={c['out_frac']}  dbl_k={c['double_k']}"
     )
     ui.print(f"portfolio  max_open={port['max_open']}  warmup={port['warmup_blocks']} blocks")
@@ -181,13 +208,27 @@ async def run(args: argparse.Namespace) -> int:
     book = LiveBook()
     warmup_n = int(port["warmup_blocks"])
     need = int(a["need"])
-    kris_min = int(a["kris_min"])
+    criss_min = int(a.get("criss_min", a.get("kris_min", 5)))
     max_open = int(port["max_open"])
     cooldown_blocks = int(port["cooldown_blocks"])
     min_notional = float(c.get("min_notional_usd", 2.0))
     size_mult = float(c.get("size_mult", 1.1))
     gtc_blocks = int(c.get("exit_end", 30))
     gtc_ttl = 240.0
+    max_loss = float(port.get("max_loss_usd") or 30.0)
+    report_profit = float(port.get("report_profit_usd") or 100.0)
+    recover_every = float(port.get("recover_seconds") or 180.0)
+    start_pusd = trading_lib.get_pusd_balance_via_rpc(funder)
+    start_usdce = trading_lib.get_usdc_balance_via_rpc(funder)
+    start_liq = start_pusd + start_usdce
+    ui.print(
+        f"start_liq  {trading_lib.fmt_usd(start_liq)}  "
+        f"kill=-{max_loss:.0f}  report=+{report_profit:.0f}"
+    )
+    last_recover = time.monotonic()
+    recovering = False
+    profit_hits = 0
+    stop_reason = ""
 
     seen_blocks: set[int] = set()
     high_water = 0
@@ -237,10 +278,18 @@ async def run(args: argparse.Namespace) -> int:
             return
         if x < cooldown.get(cid, -1):
             return
-        if not book.gate(cid, x, need=need, kris_min=kris_min):
+        if not book.gate(cid, x, need=need, criss_min=criss_min):
+            return
+        title = book.titles.get(cid, "")
+        if c.get("skip_crypto") and is_crypto_market(title):
+            return
+        if c.get("skip_fee") and book.fee_any.get(cid):
             return
         feat, last, tick = book.features(cid, x)
         if feat is None or last is None:
+            return
+        min_last = float(c.get("min_last") or 0.0)
+        if last < min_last or last > 1.0 - min_last:
             return
         ev = {
             "last": last,
@@ -268,10 +317,22 @@ async def run(args: argparse.Namespace) -> int:
         if p_out <= p_in:
             p_out = _px4(p_in + max(tick, 0.0001))
         n = _lot2(float(ticket["n"]))
+        max_n = float(c.get("max_shares") or 20.0)
+        if n > max_n:
+            n = _lot2(max_n)
         if n < 5:
             n = 5.0
         spent = max(min_notional, n * p_in)
+        if spent > 6.0:
+            spent = 6.0
         neg = bool(book.neg_risk.get(cid, False))
+        try:
+            pusd_now = trading_lib.get_pusd_balance_via_rpc(funder)
+        except Exception:
+            pusd_now = 0.0
+        if pusd_now + 1e-9 < min_notional:
+            ui.print(f"  -> skip_pusd  have={trading_lib.fmt_usd(pusd_now)}")
+            return
         cooldown[cid] = x + cooldown_blocks
         t_fok = time.monotonic()
         if args.dry_run:
@@ -310,24 +371,57 @@ async def run(args: argparse.Namespace) -> int:
             ui.print(f"  -> fok_miss  cid={shorten(cid)}  p_in={p_in:.4f}")
             return
         n_fok += 1
-        shares = _lot2(
+        shares_resp = _lot2(
             _shares_from_resp(bought.taking_amount, bought.making_amount, p_in, spent)
         )
-        if shares < 5:
-            shares = n
+        if shares_resp < 5:
+            shares_resp = n
         landed = asyncio.Event()
         pending_fill[token] = landed
+        tape_n = 0.0
         try:
             await asyncio.wait_for(landed.wait(), timeout=8.0)
-            shares = _lot2(pending_size.get(token, shares))
+            tape_n = _lot2(pending_size.get(token, 0.0))
         except asyncio.TimeoutError:
             ui.print(f"  -> fok_unseen  cid={shorten(cid)}  token={shorten(token)}")
-            pending_fill.pop(token, None)
-            return
         pending_fill.pop(token, None)
-        if shares < 5:
-            ui.print(f"  -> fok_dust  cid={shorten(cid)}  shares={shares:.2f}")
+        try:
+            pusd_after = trading_lib.get_pusd_balance_via_rpc(funder)
+        except Exception:
+            pusd_after = pusd_now
+        # CLOB can report success / tape can match another fill without a spend.
+        if pusd_after >= pusd_now - 0.05:
+            ui.print(f"  -> fok_phantom  cid={shorten(cid)}  pUSD unchanged")
             return
+        # Tape size can be another fill on the same token. Prefer it only when
+        # it looks like our lot; otherwise keep the CLOB response size.
+        if 5 <= tape_n <= max_n:
+            shares = tape_n
+        else:
+            shares = shares_resp
+        if shares > max_n:
+            shares = _lot2(max_n)
+        if shares < 5:
+            ui.print(
+                f"  -> fok_dust  cid={shorten(cid)}  shares={shares:.2f}  dumping"
+            )
+            try:
+                tick_s = float(tick or 0.01)
+                if tick_s < 0.01:
+                    tick_s = 0.01
+                await client.sell_fak(
+                    token,
+                    _lot2(max(shares, 0.01)),
+                    min_price=_px4(tick_s),
+                    neg_risk=neg,
+                    tick_size=tick_s,
+                )
+                n_dump += 1
+            except Exception as dump_exc:
+                ui.print(f"  -> dump_fail  error={dump_exc}")
+            return
+        gtc_ok = False
+        sold = bought
         try:
             sold = await client.sell_limit(
                 token,
@@ -337,6 +431,7 @@ async def run(args: argparse.Namespace) -> int:
                 neg_risk=neg,
                 tick_size=tick,
             )
+            gtc_ok = True
         except Exception as exc:
             ui.print(
                 f"  -> gtc_fail  cid={shorten(cid)}  shares={shares:.2f}  "
@@ -351,10 +446,11 @@ async def run(args: argparse.Namespace) -> int:
                     tick_size=tick if tick >= 0.01 else 0.01,
                 )
                 n_dump += 1
+                return
             except Exception as dump_exc:
                 ui.print(f"  -> dump_fail  error={dump_exc}")
-            return
-        n_gtc += 1
+        if gtc_ok:
+            n_gtc += 1
         open_pos.append(
             {
                 "cid": cid,
@@ -365,8 +461,11 @@ async def run(args: argparse.Namespace) -> int:
                 "tick": tick,
                 "neg_risk": neg,
                 "entry_block": x,
-                "exit_end": x + gtc_blocks,
-                "order_id": sold.order_id or bought.order_id or "",
+                "exit_end": x + (
+                    max(gtc_blocks, int(gtc_ttl / 1.5) + 10) if gtc_ok else 5
+                ),
+                "order_id": getattr(sold, "order_id", None) or bought.order_id or "",
+                "dump_tries": 0,
             }
         )
         ms = int((time.monotonic() - t_fok) * 1000)
@@ -390,10 +489,23 @@ async def run(args: argparse.Namespace) -> int:
                     f"shares={pos['shares']:.2f}  block={now_block:,}"
                 )
                 continue
-            nxt = int(pos.get("dump_next", 0))
-            if nxt and now_block < nxt:
+            tries = int(pos.get("dump_tries") or 0)
+            if tries >= 8:
+                err_last = str(pos.get("dump_err") or "").lower()
+                if "balance is not enough" in err_last or "balance: 0" in err_last:
+                    ui.print(
+                        f"  -> dump_drop  cid={shorten(pos['cid'])}  "
+                        f"no balance after {tries} tries"
+                    )
+                    continue
                 keep.append(pos)
                 continue
+            last_dump = int(pos.get("dump_block") or 0)
+            if last_dump and now_block < last_dump + 10:
+                keep.append(pos)
+                continue
+            pos["dump_tries"] = tries + 1
+            pos["dump_block"] = now_block
             try:
                 tick_s = float(pos.get("tick") or 0.01)
                 if tick_s < 0.01:
@@ -411,8 +523,9 @@ async def run(args: argparse.Namespace) -> int:
                     f"shares={pos['shares']:.2f}  block={now_block:,}"
                 )
             except Exception as exc:
-                pos["dump_next"] = now_block + 20
                 ui.print(f"  -> dump_fail  cid={shorten(pos['cid'])}  error={exc}")
+                pos["dump_err"] = str(exc)
+                pos["exit_end"] = now_block + 10
                 keep.append(pos)
         open_pos[:] = keep
 
@@ -426,6 +539,44 @@ async def run(args: argparse.Namespace) -> int:
                 break
             await _enter(cid, x)
 
+    def _equity() -> tuple[float, float, float, float]:
+        pusd = trading_lib.get_pusd_balance_via_rpc(funder)
+        usdce = trading_lib.get_usdc_balance_via_rpc(funder)
+        mark = 0.0
+        for pos in open_pos:
+            last = book.last.get(pos["cid"], pos["p_in"])
+            mark += float(pos["shares"]) * float(last)
+        return pusd, usdce, mark, pusd + usdce + mark
+
+    async def _recover() -> None:
+        nonlocal recovering
+        if recovering or args.dry_run:
+            return
+        recovering = True
+        try:
+            usdce = trading_lib.get_usdc_balance_via_rpc(funder)
+            if usdce >= 1.0:
+                ui.print(f"  -> wrap  {trading_lib.fmt_usd(usdce)} USDC.e → pUSD")
+                result = await asyncio.to_thread(
+                    trading_lib.wrap_usdce_to_pusd,
+                    funder,
+                    amount_usd=None,
+                    dry_run=False,
+                )
+                ui.print(
+                    f"  -> wrapped  pUSD={trading_lib.fmt_usd(result.pusd_after)}  "
+                    f"usdc.e={trading_lib.fmt_usd(result.usdce_after)}"
+                )
+            hashes = await asyncio.to_thread(
+                trading_lib.redeem_positions, funder, dry_run=False
+            )
+            if hashes:
+                ui.print(f"  -> redeem  txs={len(hashes)}")
+        except Exception as exc:
+            ui.print(f"  -> recover_fail  error={exc}")
+        finally:
+            recovering = False
+
     try:
         while not stop.is_set():
             if deadline and time.monotonic() >= deadline:
@@ -438,6 +589,35 @@ async def run(args: argparse.Namespace) -> int:
                 event = await asyncio.wait_for(listen_q.get(), timeout=0.25)
             except asyncio.TimeoutError:
                 elapsed = format_hms(time.monotonic() - started)
+                if hot and time.monotonic() - last_recover >= recover_every:
+                    last_recover = time.monotonic()
+                    await _recover()
+                    try:
+                        pusd, usdce, mark, eq = _equity()
+                    except Exception as exc:
+                        ui.print(f"  -> equity_fail  error={exc}")
+                    else:
+                        pnl = eq - start_liq
+                        ui.print(
+                            f"  -> equity  tot={trading_lib.fmt_usd(eq)}  "
+                            f"pUSD={trading_lib.fmt_usd(pusd)}  "
+                            f"usdc.e={trading_lib.fmt_usd(usdce)}  "
+                            f"open_mark={trading_lib.fmt_usd(mark)}  "
+                            f"pnl={pnl:+.2f}"
+                        )
+                        if pnl <= -max_loss:
+                            stop_reason = (
+                                f"kill  pnl={pnl:.2f}  cap=-{max_loss:.0f}"
+                            )
+                            ui.print(f"  -> {stop_reason}")
+                            stop.set()
+                            break
+                        if pnl >= report_profit * (profit_hits + 1):
+                            profit_hits += 1
+                            ui.print(
+                                f"  -> profit_mark  +{pnl:.2f} vs start  "
+                                f"keep going"
+                            )
                 if hot:
                     ui.update_footer(
                         f"hot  open={len(open_pos)}/{max_open}  "
@@ -516,6 +696,7 @@ async def run(args: argparse.Namespace) -> int:
                 yes_token=yes_tok,
                 no_token=no_tok,
                 tick_size=mkt_tick,
+                title=event.market_title or "",
             )
             if ours:
                 for tok in (event.maker_asset_id, event.taker_asset_id, yes_tok, no_tok):
@@ -523,12 +704,9 @@ async def run(args: argparse.Namespace) -> int:
                         pending_size[tok] = shares
                         pending_fill[tok].set()
                         break
-                # our GTC fill frees a slot
                 keep = []
                 for pos in open_pos:
-                    if pos["token"] in {event.maker_asset_id, event.taker_asset_id} and (
-                        not is_buy_yes
-                    ):
+                    if _is_our_sell(event, pos["token"], skip):
                         ui.print(
                             f"  -> filled_exit  cid={shorten(pos['cid'])}  "
                             f"block={blk:,}"
@@ -544,7 +722,9 @@ async def run(args: argparse.Namespace) -> int:
         await listen.disconnect()
 
     ui.closing(
-        f"status=ok  fok={n_fok}  gtc={n_gtc}  dump={n_dump}  open={len(open_pos)}",
+        f"status={'failed' if stop_reason.startswith('kill') else 'ok'}  "
+        f"fok={n_fok}  gtc={n_gtc}  dump={n_dump}  open={len(open_pos)}"
+        + (f"  {stop_reason}" if stop_reason else ""),
         time.monotonic() - started,
     )
     return 0

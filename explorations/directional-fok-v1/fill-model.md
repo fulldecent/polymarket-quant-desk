@@ -1,5 +1,9 @@
 # Fill model
 
+Specialization of [`../FRAME.md`](../FRAME.md) for the one-sided
+FOK-then-GTC ticket (`cap_touch=INCLUSIVE` on entry; GTC first block
+STRICT, then INCLUSIVE). Shared walks: `explorations.frame`.
+
 Research rules for the directional FOK / GTC book. Not CLOB law. Change
 this file and rerun; do not quietly patch a backtest.
 

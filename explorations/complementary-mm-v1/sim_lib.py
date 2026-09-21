@@ -1,44 +1,47 @@
 """Pure fill-model helpers. Units: shares as float, USDC as float, prices in [0, 1].
 
-See fill-model.md. Do not read this as CLOB law.
+Walks and clip live in `explorations.frame` (see FRAME.md). Two-sided
+windows, inventory recipe, and pair-cost fire stay here.
 """
 
 from __future__ import annotations
 
-import math
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 
-MIN_SHARES = 5.0
-MIN_WORST_NOTIONAL = 1.20
-TICK = 0.01
-TAKER_FEE_RATE = 0.0135  # net ~135 bps of min(p, 1-p) per share, in USDC
+_ROOT = Path(__file__).resolve().parents[2]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from explorations.frame.clip import (  # noqa: E402
+    BLOCKS_PER_DAY,
+    BLOCKS_PER_HOUR,
+    MIN_SHARES,
+    MIN_WORST_NOTIONAL,
+    TAKER_FEE_RATE,
+    TICK,
+    n_min,
+    taker_fee_usdc,
+)
+from explorations.frame.ticket import CapTouch, ShareNeed  # noqa: E402
+from explorations.frame.walk import (  # noqa: E402
+    Fill,
+    Level,
+    walk_dump,
+    walk_take_buy,
+    walk_take_buy_window as _walk_take_buy_window,
+)
+
 COMPLEMENT_BLOCKS = 30
 GRACE_BLOCKS = 15  # ~30s minimum time on the book
-BLOCKS_PER_HOUR = 1714
-BLOCKS_PER_DAY = 41136
 # Cutover from fixed-price complement rest to market sale: 15 minutes.
-# Floor is grace (30s); ceiling allowed is 12h. 15m is a session slice
-# without sitting as a directional book for hours.
 CUTOVER_BLOCKS = BLOCKS_PER_HOUR // 4  # 428
 HORIZON_DAYS = 3
 HORIZON_BLOCKS = BLOCKS_PER_DAY * HORIZON_DAYS  # 123_408
 PAIR_COST_FIRE = 0.99
 MIN_PRICE = TICK
 MAX_PRICE = 1.0 - TICK
-
-
-@dataclass(frozen=True)
-class Level:
-    px: float
-    tokens: float
-
-
-@dataclass(frozen=True)
-class Fill:
-    shares: float
-    usdc: float
-    vwap: float
-    block: int
 
 
 @dataclass(frozen=True)
@@ -52,13 +55,6 @@ class InventoryMark:
     at_block: int | None
 
 
-def n_min(p: float) -> int:
-    """Smallest legal share count at worst price p."""
-    if p <= 0:
-        raise ValueError("p must be positive")
-    return max(5, math.ceil(MIN_WORST_NOTIONAL / p - 1e-12))
-
-
 def clip_cap(p: float) -> float:
     return min(MAX_PRICE, max(MIN_PRICE, p))
 
@@ -70,12 +66,6 @@ def caps_from_close(close_yes: float, tick: float = TICK) -> tuple[float, float]
     return p_yes, p_no
 
 
-def taker_fee_usdc(shares: float, px: float, fee_market: bool) -> float:
-    if not fee_market or shares <= 0:
-        return 0.0
-    return TAKER_FEE_RATE * min(px, 1.0 - px) * shares
-
-
 def walk_buy(
     levels: list[Level],
     *,
@@ -83,37 +73,11 @@ def walk_buy(
     n: float,
     kappa: float = 1.0,
 ) -> Fill | None:
-    """FOK buy: prices strictly below cap, need strictly more than n*kappa shares.
-
-    `levels` are already in the required order (best-first within a block;
-    block order for a multi-block window).
-    """
-    if n < MIN_SHARES or n * cap < MIN_WORST_NOTIONAL:
-        return None
-    need_avail = n * kappa
-    available = 0.0
-    for lv in levels:
-        if lv.px >= cap:
-            continue
-        if lv.tokens <= 0:
-            continue
-        available += lv.tokens
-    if available <= need_avail:
-        return None
-    remaining = n
-    cost = 0.0
-    for lv in levels:
-        if remaining <= 0:
-            break
-        if lv.px >= cap or lv.tokens <= 0:
-            continue
-        take = min(remaining, lv.tokens)
-        cost += take * lv.px
-        remaining -= take
-    if remaining > 1e-9:
-        return None
-    vwap = cost / n
-    return Fill(shares=n, usdc=cost, vwap=vwap, block=0)
+    """FOK buy: STRICT cap-touch, strictly more than n*kappa shares."""
+    return walk_take_buy(
+        levels, cap=cap, n=n, kappa=kappa,
+        cap_touch=CapTouch.STRICT, share_need=ShareNeed.STRICTLY_MORE,
+    )
 
 
 def walk_buy_window(
@@ -124,27 +88,10 @@ def walk_buy_window(
     kappa: float = 1.0,
 ) -> Fill | None:
     """Complement: blocks in order, best-first inside each block."""
-    flat: list[Level] = []
-    block_of: list[int] = []
-    for blk, levels in by_block:
-        ordered = sorted(levels, key=lambda lv: (lv.px, ))
-        for lv in ordered:
-            flat.append(lv)
-            block_of.append(blk)
-    fill = walk_buy(flat, cap=cap, n=n, kappa=kappa)
-    if fill is None:
-        return None
-    remaining = n
-    fill_block = by_block[0][0] if by_block else 0
-    for lv, blk in zip(flat, block_of):
-        if lv.px >= cap or lv.tokens <= 0:
-            continue
-        take = min(remaining, lv.tokens)
-        remaining -= take
-        fill_block = blk
-        if remaining <= 1e-9:
-            break
-    return Fill(shares=fill.shares, usdc=fill.usdc, vwap=fill.vwap, block=fill_block)
+    return _walk_take_buy_window(
+        by_block, cap=cap, n=n, kappa=kappa,
+        cap_touch=CapTouch.STRICT, share_need=ShareNeed.STRICTLY_MORE,
+    )
 
 
 def floor_walk_vwap(levels: list[Level]) -> tuple[float, float] | None:
@@ -160,29 +107,7 @@ def floor_walk_vwap(levels: list[Level]) -> tuple[float, float] | None:
     return None
 
 
-def walk_dump(levels: list[Level], q: float) -> tuple[float, float, float] | None:
-    """Forced sell: best bid first. Largest legal prefix with n≤q.
 
-    Returns (shares, proceeds, vwap) or None if no legal dump.
-    """
-    if q < MIN_SHARES:
-        return None
-    ordered = sorted((lv for lv in levels if lv.tokens > 0), key=lambda lv: -lv.px)
-    taken = 0.0
-    proceeds = 0.0
-    worst = None
-    best_legal: tuple[float, float, float] | None = None
-    for lv in ordered:
-        if taken >= q:
-            break
-        take = min(q - taken, lv.tokens)
-        new_taken = taken + take
-        new_proc = proceeds + take * lv.px
-        new_worst = lv.px if worst is None else min(worst, lv.px)
-        taken, proceeds, worst = new_taken, new_proc, new_worst
-        if taken + 1e-12 >= MIN_SHARES and taken * worst >= MIN_WORST_NOTIONAL:
-            best_legal = (taken, proceeds, proceeds / taken)
-    return best_legal
 
 
 def yes_payout(payout_numerators: str | None) -> float | None:

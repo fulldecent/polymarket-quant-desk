@@ -1,6 +1,10 @@
 # Complementary market making (v1)
 
-**DEAD.** Do not extend this line. Naive interpretation-C baseline
+**DEAD.** Ticket = [`two_sided_take_pair`](../FRAME.md) (wide-spread
+follow-up = [`two_sided_make_pair`](../FRAME.md)). Map:
+[`../README.md`](../README.md). Do not extend this line.
+
+Naive interpretation-C baseline
 (`sim.py`, 7 days of triggers, 9,058 attempts): **yes_only 28.5% +
 no_only 32.3% = 60.8% one-sided**. Both-leg completes were only 27.9%.
 Merge P&L (+$631) was more than wiped by inventory (−$653). Headline

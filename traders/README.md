@@ -1,6 +1,14 @@
 # traders
 
-No-model live traders. Shared project code lives in top-level `lib/` and `exchange_client/lib/`. Trader-only helpers live in [`lib/`](lib/) (`ui.py`, `streams.py`).
+Live programs. Research archive (tickets, FOK vs GTC, one-sided vs
+two-sided) is [`../explorations/README.md`](../explorations/README.md)
+and [`../explorations/FRAME.md`](../explorations/FRAME.md). Shared
+project code lives in top-level `lib/` and `exchange_client/lib/`.
+Trader-only helpers live in [`lib/`](lib/) (`ui.py`, `streams.py`).
+
+`directional_fok` is the only strategy that came out of that archive.
+It is **not** a go-ahead. Formula is 3-of-8 / criss 5; see
+[`IDEAS.md`](IDEAS.md) for what was not built.
 
 | Program | Job |
 |---|---|

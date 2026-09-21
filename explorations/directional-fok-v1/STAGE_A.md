@@ -1,5 +1,10 @@
 # Stage A — persist liveness (frozen)
 
+This card is **6 of last 8 and Kris ≥ 10**. The live trader and
+`sim_lib.py` defaults are **3 of last 8 and criss ≥ 5**. See
+[`../README.md`](../README.md) lineage. Shared frame:
+[`../FRAME.md`](../FRAME.md).
+
 Hardcoded gate, not a model. Applied before tape-touch (Stage B) and
 before the sequential policy (Stage C).
 

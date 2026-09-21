@@ -1,5 +1,9 @@
 # Fill model
 
+Specialization of [`../FRAME.md`](../FRAME.md) for the two-sided take
+pair (`cap_touch=STRICT`, `share_need=STRICTLY_MORE`). Complement is a
+**take-window on asks**, not a MAKE bid. Shared walks: `explorations.frame`.
+
 **DEAD research line.** See [`README.md`](README.md). Kept as the
 archive of the two-buy simulator. `yes_only + no_only` was too large.
 

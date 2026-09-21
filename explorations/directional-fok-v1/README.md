@@ -1,5 +1,12 @@
 # Directional FOK entry / GTC exit (v1)
 
+**Archive. No sports alpha.** Ticket = [`one_sided_fok_then_gtc`](../FRAME.md).
+Map: [`../README.md`](../README.md). Live formula (3-of-8 / criss 5) is
+[`../../traders/directional_fok/formula.json`](../../traders/directional_fok/formula.json),
+not the 6-of-8 card in STAGE_A.md.
+
+---
+
 One outcome, one direction. At block `X` a model names **YES or NO**, an
 **entry cap**, an **exit floor**, and a **Kelly size**. The entry is a
 fill-or-kill take in `X+1`. If that fills, a resting sell works `X+2`

@@ -38,32 +38,33 @@ def _fill(book: LiveBook, cid: str, block: int, px: float, *, maker: bool = True
 
 def test_formula_is_the_frozen_cell():
     a, c, p = FORMULA["stage_a"], FORMULA["stage_c"], FORMULA["portfolio"]
-    assert a["need"] == 6 and a["window"] == 8 and a["kris_min"] == 10
+    assert a["need"] == 3 and a["window"] == 8 and a.get("criss_min") == 5
     assert c["in_frac"] == 1.0 and c["out_frac"] == 0.5 and c["double_k"] == 4
     assert c["size_mult"] == 1.1 and c["min_notional_usd"] == 2.0 and c["min_shares"] == 5
+    assert c["skip_crypto"] and c["skip_fee"] and c["min_last"] == 0.10
+    assert c["max_shares"] == 20
     assert p["max_open"] == 3 and p["warmup_blocks"] == 100
+    assert p["max_loss_usd"] == 30.0
 
 
-def test_gate_needs_six_of_eight_and_kris():
+def test_gate_needs_three_of_eight_and_five_crosses():
     book = LiveBook()
     cid = "aa" * 32
-    # 6 of 8 blocks, but flat maker tape → kris 0
     for i, b in enumerate([10, 11, 12, 13, 14, 15]):
         _fill(book, cid, b, 0.40)
     assert book.persist_count(cid, 15) == 6
     assert book.kris(cid, 15) == 0
-    assert not book.gate(cid, 15, need=6, kris_min=10)
+    assert not book.gate(cid, 15, need=3, criss_min=5)
 
     book2 = LiveBook()
-    # several maker prints per block so 8 blocks can exceed 10 crosses
     for b in range(100, 108):
         for j in range(4):
             px = 0.40 + (0.02 if (b + j) % 2 == 0 else 0.00)
             _fill(book2, cid, b, px)
     x = 107
-    assert book2.persist_count(cid, x) >= 6
-    assert book2.kris(cid, x) >= 10
-    assert book2.gate(cid, x, need=6, kris_min=10)
+    assert book2.persist_count(cid, x) >= 3
+    assert book2.kris(cid, x) >= 5
+    assert book2.gate(cid, x, need=3, criss_min=5)
 
 
 def test_sizing_floor_is_five_shares_and_two_dollars():
@@ -121,6 +122,47 @@ def test_yes_px_parses_polynode_decimals():
     assert abs(yes_px - 0.4) < 1e-9
     assert is_buy_yes
     assert not is_taker
+
+
+def test_crypto_updown_is_banned():
+    from main import is_crypto_market, _is_our_sell
+    from exchange_client.lib.event_stream import TradeEvent
+
+    assert is_crypto_market("Bitcoin Up or Down - September 18, 6:10PM-6:15PM ET")
+    assert is_crypto_market("ETH Up or Down 15m")
+    assert not is_crypto_market("Will the Chargers win the 2027 NFL league championship?")
+    ev = TradeEvent(
+        tx_hash="0x" + "ab" * 32,
+        contract_address="0x" + "11" * 20,
+        event_type="OrderFilled",
+        maker="0x" + "aa" * 20,
+        taker="0x" + "bb" * 20,
+        maker_asset_id="999",
+        taker_asset_id="0",
+        maker_amount="5.0",
+        taker_amount="2.0",
+        fee="0",
+        block_number=1,
+        log_index=0,
+    )
+    ours = {"0x" + "aa" * 20}
+    assert _is_our_sell(ev, "999", ours)
+    assert not _is_our_sell(ev, "999", {"0x" + "cc" * 20})
+    ev_buy = TradeEvent(
+        tx_hash="0x" + "ab" * 32,
+        contract_address="0x" + "11" * 20,
+        event_type="OrderFilled",
+        maker="0x" + "aa" * 20,
+        taker="0x" + "bb" * 20,
+        maker_asset_id="0",
+        taker_asset_id="999",
+        maker_amount="2.0",
+        taker_amount="5.0",
+        fee="0",
+        block_number=1,
+        log_index=0,
+    )
+    assert not _is_our_sell(ev_buy, "999", ours)
 
 
 def test_max_three_open_slots():

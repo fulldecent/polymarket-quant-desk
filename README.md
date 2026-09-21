@@ -77,9 +77,10 @@ Other trading strategies are available under [`traders/`](traders/).
 
 ## Explorations
 
-Run any of the scripts in the `explorations/` folder to do ad-hoc analysis or testing.
-
-- [polynode_inclusion_test.py](explorations/polynode_inclusion_test.py) — see how fast Polynode sees new trades compared to the RPC logs.
+The research archive is [`explorations/README.md`](explorations/README.md)
+(shared ticket frame: [`explorations/FRAME.md`](explorations/FRAME.md)).
+Complementary MM, directional FOK/GTC, and large-taker fade are **closed
+lines** in that map. Polynode lag: [polynode_inclusion_test.py](explorations/polynode_inclusion_test.py).
 
 ## Testing
 

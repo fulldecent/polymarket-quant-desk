@@ -1,6 +1,9 @@
 # Proposal: directional FOK / GTC research
 
-**Status:** research proposal, not a trading go-ahead.
+**Status: archive.** No sports alpha on the live 3-of-8 cell. Shared
+ticket: [`../FRAME.md`](../FRAME.md). Map: [`../README.md`](../README.md).
+
+**Former status:** research proposal, not a trading go-ahead.
 **Companion:** [`README.md`](README.md), [`fill-model.md`](fill-model.md).
 
 Predecessor complementary MM is **dead**

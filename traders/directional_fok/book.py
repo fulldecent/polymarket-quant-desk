@@ -47,6 +47,8 @@ class LiveBook:
         self.no_id: dict[str, str] = {}
         self.neg_risk: dict[str, bool] = {}
         self.tick_size: dict[str, float] = {}
+        self.titles: dict[str, str] = {}
+        self.fee_any: dict[str, bool] = {}
         self.printed: dict[int, set[str]] = defaultdict(set)
 
     def ingest(
@@ -66,6 +68,7 @@ class LiveBook:
         yes_token: str = "",
         no_token: str = "",
         tick_size: float = 0.0,
+        title: str = "",
     ) -> None:
         if not cid or not (0 < yes_px < 1) or block <= 0:
             return
@@ -77,6 +80,10 @@ class LiveBook:
             self.neg_risk[cid] = True
         if tick_size and tick_size > 0:
             self.tick_size[cid] = float(tick_size)
+        if title:
+            self.titles[cid] = title
+        if fee > 0:
+            self.fee_any[cid] = True
         bars = self.bars[cid]
         bar = bars.get(block)
         if bar is None:
@@ -140,8 +147,8 @@ class LiveBook:
         px = [p for b, p in self.makers.get(cid, ()) if lo <= b <= x]
         return kris_count(px)
 
-    def gate(self, cid: str, x: int, *, need: int, kris_min: int) -> bool:
-        return self.persist_count(cid, x) >= need and self.kris(cid, x) >= kris_min
+    def gate(self, cid: str, x: int, *, need: int, criss_min: int) -> bool:
+        return self.persist_count(cid, x) >= need and self.kris(cid, x) >= criss_min
 
     def features(self, cid: str, x: int):
         last = self.last.get(cid)
