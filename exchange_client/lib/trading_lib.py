@@ -679,19 +679,73 @@ def _sign_v2_fok_buy(
     )
 
 
-def _post_v2_order(v2, order) -> dict:
+def _tick_str(tick: float | str | None) -> str:
+    if isinstance(tick, str) and tick:
+        return tick
+    try:
+        t = float(tick) if tick is not None else 0.01
+    except (TypeError, ValueError):
+        t = 0.01
+    for s in ("0.1", "0.01", "0.005", "0.0025", "0.001", "0.0001"):
+        if abs(float(s) - t) < 1e-12:
+            return s
+    return "0.01"
+
+
+def _post_v2_order(v2, order, order_type=None) -> dict:
     """One POST /order. Does not poll for transaction hashes."""
     from py_clob_client_v2 import OrderType as OrderTypeV2
     from py_clob_client_v2.client import order_to_json_v2
     from py_clob_client_v2.endpoints import POST_ORDER
 
+    ot = order_type or OrderTypeV2.FOK
     owner = v2.creds.api_key or ""
-    payload = order_to_json_v2(order, owner, OrderTypeV2.FOK, False, False)
+    payload = order_to_json_v2(order, owner, ot, False, False)
     serialized = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     headers = v2._l2_headers(
         "POST", POST_ORDER, body=payload, serialized_body=serialized
     )
     return v2._post(f"{v2.host}{POST_ORDER}", headers=headers, data=serialized)
+
+
+def _sign_v2_limit_sell(
+    v2, token_id: str, size: float, price: float, *, expiration: int, neg_risk: bool, tick_size: str
+):
+    from py_clob_client_v2 import OrderArgsV2
+    from py_clob_client_v2.clob_types import CreateOrderOptions
+
+    return v2.builder.build_order(
+        OrderArgsV2(
+            token_id=token_id,
+            price=price,
+            size=size,
+            side="SELL",
+            expiration=int(expiration),
+        ),
+        CreateOrderOptions(tick_size=tick_size, neg_risk=bool(neg_risk)),
+        version=2,
+        fee_rate_bps=None,
+    )
+
+
+def _sign_v2_fak_sell(
+    v2, token_id: str, size: float, *, min_price: float, neg_risk: bool, tick_size: str
+):
+    from py_clob_client_v2 import MarketOrderArgsV2, OrderType as OrderTypeV2
+    from py_clob_client_v2.clob_types import CreateOrderOptions
+
+    return v2.builder.build_market_order(
+        MarketOrderArgsV2(
+            token_id=token_id,
+            amount=size,
+            price=min_price if min_price else 0.01,
+            side="SELL",
+            order_type=OrderTypeV2.FAK,
+        ),
+        CreateOrderOptions(tick_size=tick_size, neg_risk=bool(neg_risk)),
+        version=2,
+        fee_rate_bps=None,
+    )
 
 
 def buy_token(
@@ -873,28 +927,41 @@ def cancel_all_orders(client: ClobClient, *, dry_run: bool = False,
     print()
 
 
-def sell_token(client: ClobClient, token_id: str, size: float) -> dict:
-    """Place a fill-and-kill market sell order. Returns the API response."""
+def sell_token(
+    client: ClobClient,
+    token_id: str,
+    size: float,
+    *,
+    min_price: float = 0.01,
+    neg_risk: bool = False,
+    tick_size: str | float | None = None,
+) -> dict:
+    """Place a fill-and-kill market sell (CLOB v2)."""
+    from py_clob_client_v2 import OrderType as OrderTypeV2
+
+    tick = _tick_str(tick_size)
     log_event({
         "action": "sell",
         "phase": "submitted",
         "token_id": token_id,
         "size": size,
+        "min_price": min_price,
+        "neg_risk": bool(neg_risk),
+        "tick_size": tick,
         "side": "SELL",
         "order_type": "FAK",
     })
-
     try:
-        order = client.create_market_order(
-            MarketOrderArgs(
-                token_id=token_id,
-                amount=size,
-                side="SELL",
-                order_type=OrderType.FAK,
-            ),
+        v2 = get_v2_client()
+        order = _sign_v2_fak_sell(
+            v2,
+            token_id,
+            size,
+            min_price=min_price,
+            neg_risk=neg_risk,
+            tick_size=tick,
         )
-        resp = client.post_order(order, orderType=OrderType.FAK)
-
+        resp = _post_v2_order(v2, order, OrderTypeV2.FAK)
         log_event({
             "action": "sell",
             "phase": "completed",
@@ -919,11 +986,20 @@ def sell_token(client: ClobClient, token_id: str, size: float) -> dict:
 
 
 def sell_token_limit(
-    client: ClobClient, token_id: str, size: float,
-    price: float, ttl_seconds: float,
+    client: ClobClient,
+    token_id: str,
+    size: float,
+    price: float,
+    ttl_seconds: float,
+    *,
+    neg_risk: bool = False,
+    tick_size: str | float | None = None,
 ) -> dict:
-    """Place a GTD limit sell order. Returns the API response."""
-    expiration = str(int(time.time() + ttl_seconds))
+    """Place a GTD limit sell (CLOB v2). Expiration is at least now+60s."""
+    from py_clob_client_v2 import OrderType as OrderTypeV2
+
+    tick = _tick_str(tick_size)
+    expiration = int(time.time() + max(200.0, float(ttl_seconds)))
     log_event({
         "action": "sell_limit",
         "phase": "submitted",
@@ -931,20 +1007,23 @@ def sell_token_limit(
         "size": size,
         "price": price,
         "ttl_seconds": ttl_seconds,
+        "neg_risk": bool(neg_risk),
+        "tick_size": tick,
         "side": "SELL",
         "order_type": "GTD",
     })
     try:
-        order = client.create_order(
-            OrderArgs(
-                token_id=token_id,
-                price=price,
-                size=size,
-                side="SELL",
-                expiration=expiration,
-            )
+        v2 = get_v2_client()
+        order = _sign_v2_limit_sell(
+            v2,
+            token_id,
+            size,
+            price,
+            expiration=expiration,
+            neg_risk=neg_risk,
+            tick_size=tick,
         )
-        resp = client.post_order(order, orderType=OrderType.GTD)
+        resp = _post_v2_order(v2, order, OrderTypeV2.GTD)
         log_event({
             "action": "sell_limit",
             "phase": "completed",

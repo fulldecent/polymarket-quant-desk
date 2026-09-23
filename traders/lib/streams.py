@@ -80,14 +80,31 @@ def execution_client(name: str) -> ExecutionClient:
     raise ValueError(f"unknown --exec {name!r}")
 
 
-def usdc_notional(event: TradeEvent | MempoolTradeEvent) -> float:
-    try:
-        if event.maker_asset_id == "0":
-            return int(event.maker_amount) / 1e6
-        if event.taker_asset_id == "0":
-            return int(event.taker_amount) / 1e6
-    except (TypeError, ValueError):
+def parse_units(raw: str | int | float | None, *, decimals: int = 6) -> float:
+    """USDC/token amount: human decimal ("2.5") or raw 6-dec integer ("2500000")."""
+    if raw is None:
         return 0.0
+    s = str(raw).strip()
+    if not s:
+        return 0.0
+    try:
+        v = float(s)
+    except ValueError:
+        return 0.0
+    if "." in s:
+        return v
+    # RPC logs are 6-dec integers (990000 = $0.99). Polynode uses "2" or "2.50".
+    digits = s.lstrip("-")
+    if digits.isdigit() and len(digits) >= 5:
+        return v / float(10 ** decimals)
+    return v
+
+
+def usdc_notional(event: TradeEvent | MempoolTradeEvent) -> float:
+    if event.maker_asset_id == "0":
+        return parse_units(event.maker_amount)
+    if event.taker_asset_id == "0":
+        return parse_units(event.taker_amount)
     return 0.0
 
 

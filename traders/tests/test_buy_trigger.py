@@ -15,6 +15,8 @@ from traders.lib.streams import (  # noqa: E402
     exchange_is_neg_risk,
     extract_buy_trigger,
     is_live_trigger,
+    parse_units,
+    usdc_notional,
 )
 
 TOKEN = "123"
@@ -146,3 +148,22 @@ def test_neg_risk_from_exchange_address():
     assert exchange_is_neg_risk("0xC5d563A36AE78145C45a50134d48A1215220f80a")
     assert not exchange_is_neg_risk("0xE111180000d2663C0091e4f400237545B87B996B")
     assert not exchange_is_neg_risk("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E")
+
+
+def test_parse_units_human_and_raw():
+    assert parse_units("2.5") == 2.5
+    assert parse_units("2") == 2.0
+    assert parse_units("2500000") == 2.5
+    assert parse_units("2000000") == 2.0
+    assert parse_units("990000") == 0.99
+    assert parse_units("") == 0.0
+
+
+def test_usdc_notional_polynode_decimal():
+    ev = _event(
+        maker_asset="0",
+        taker_asset=TOKEN,
+        maker_amt="2.50",
+        taker_amt="5.0",
+    )
+    assert usdc_notional(ev) == 2.5
