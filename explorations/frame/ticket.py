@@ -76,7 +76,7 @@ class Ticket:
         return tuple(lg for lg in self.legs if lg.action is Action.SELL)
 
 
-def one_sided_fok_then_gtc(
+def one_sided_take_then_make(
     *,
     signal_block: int,
     condition_id: str,

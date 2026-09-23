@@ -28,7 +28,7 @@ from explorations.frame.ticket import (  # noqa: F401
     Ticket,
     TicketKind,
     Tif,
-    one_sided_fok_then_gtc,
+    one_sided_take_then_make,
     two_sided_make_pair,
     two_sided_take_pair,
 )

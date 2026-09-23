@@ -11,7 +11,7 @@ from explorations.frame import (
     TicketKind,
     Tif,
     n_min,
-    one_sided_fok_then_gtc,
+    one_sided_take_then_make,
     two_sided_make_pair,
     two_sided_take_pair,
     walk_dump,
@@ -82,7 +82,7 @@ def test_dump_legal_prefix():
 
 
 def test_one_sided_and_two_sided_tickets_share_leg_shape():
-    one = one_sided_fok_then_gtc(
+    one = one_sided_take_then_make(
         signal_block=10, condition_id="c", outcome=Outcome.YES,
         n=5, p_entry=0.51, p_exit=0.52,
     )

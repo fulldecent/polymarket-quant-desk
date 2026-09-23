@@ -5,8 +5,8 @@ Any new line uses [`../explorations/FRAME.md`](../explorations/FRAME.md)
 (same ticket object for FOK/GTC and one-sided/two-sided). Do not fork
 a third fill language.
 
-Closed: complementary two-buy, wide 97¢ dual-maker, directional
-buy-then-sell on sports, large-taker fade after PRIME.
+Closed: `pair-v1` two-buy and 97¢ dual-maker, `directional-v1`
+buy-then-sell on sports, `directional-fade-v1` after PRIME.
 
 ## Opposite of criss-cross — directional, not market-neutral
 
@@ -41,7 +41,7 @@ spreads, fee-free, cid alive ≥ ~50 min, not resolving in ~5 min.
 through X+120 (~3 min). One leg (YES) hit 3/17; NO never. So “wide
 spread, rest both, expect both fills next block” does **not** show up
 on non-crypto, non-expiry tape. Detail:
-[`../explorations/complementary-mm-v1/wide-spread-maker.md`](../explorations/complementary-mm-v1/wide-spread-maker.md).
+[`../explorations/pair-v1/wide-spread-maker.md`](../explorations/pair-v1/wide-spread-maker.md).
 
 Still untested (still ±, not directional shock):
 
@@ -49,5 +49,5 @@ Still untested (still ±, not directional shock):
   (join last−1¢ and 1−last−1¢, no FOK). Sports may never complete a
   dollar cheaply; this is a quote, not a lock.
 - Sequential hedge (buy one, *then* buy complement) — cleaner risk,
-  extra block of lag (see complementary-mm README).
+  extra block of lag (see pair-v1 README).
 - Relax pair fire to `< 1.02` (pay to complete; probably worse).

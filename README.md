@@ -79,8 +79,8 @@ Other trading strategies are available under [`traders/`](traders/).
 
 The research archive is [`explorations/README.md`](explorations/README.md)
 (shared ticket frame: [`explorations/FRAME.md`](explorations/FRAME.md)).
-Complementary MM, directional FOK/GTC, and large-taker fade are **closed
-lines** in that map. Polynode lag: [polynode_inclusion_test.py](explorations/polynode_inclusion_test.py).
+Pair, directional, and directional-fade are **closed lines** in that
+map. Polynode lag: [polynode_inclusion_test.py](explorations/polynode_inclusion_test.py).
 
 ## Testing
 

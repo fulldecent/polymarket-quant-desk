@@ -38,7 +38,7 @@ Each `Leg`:
 | cap_touch | **INCLUSIVE** (signed FOK worst) / **STRICT** (no cap-touch, no time priority) |
 | share_need | at-least-n / strictly-more-than-n |
 
-Factories: `one_sided_fok_then_gtc`, `two_sided_take_pair`,
+Factories: `one_sided_take_then_make`, `two_sided_take_pair`,
 `two_sided_make_pair` in [`frame/ticket.py`](frame/ticket.py).
 
 ## How the tape is walked (interpretation C)
@@ -58,8 +58,8 @@ Best-first inside a block. Multi-block windows keep **block order**
 best-first lists — do not globally sort). κ=1 headline; κ=2 is a
 competition band.
 
-**Cap-touch is the only FOK vs “inside” split.** Directional FOK entry
-is INCLUSIVE (the cap is a signed worst). Complementary take is STRICT
+**Cap-touch is the only FOK vs “inside” split.** Directional entry
+is INCLUSIVE (the cap is a signed worst). Pair take is STRICT
 (research “strictly better than P”). GTC first rest block is STRICT
 (we do not have time priority); later rest blocks are INCLUSIVE.
 
@@ -72,12 +72,12 @@ resolve unless resolve is inside the window).
 
 ## Recipes we actually ran
 
-| Recipe | Ticket | Entry | Exit / other leg |
+| Line | Ticket | Entry | Exit / other leg |
 |---|---|---|---|
-| Directional FOK/GTC | one-sided | FOK TAKE buy, INCLUSIVE, S+1 | GTC MAKE sell S+2..S+60; dump S+61..S+120 |
-| Complementary two-buy | two-sided | FOK TAKE YES, STRICT, S+1 | TAKE-window NO S+1..S+30 (ask walk, not a true rest bid); then inventory recipe |
-| Wide-spread maker | two-sided | GTC MAKE buy both, STRICT | fill = other side hits our bid |
-| Large-taker fade | one-sided | FOK TAKE the anti-whale side at T+1 | dump / GTC take-profit |
+| `directional-v1` | `one_sided_take_then_make` | FOK TAKE buy, INCLUSIVE, S+1 | GTC MAKE sell S+2..S+60; dump S+61..S+120 |
+| `pair-v1` take | `two_sided_take_pair` | FOK TAKE YES, STRICT, S+1 | TAKE-window NO S+1..S+30 (ask walk, not a true rest bid); then inventory recipe |
+| `pair-v1` make | `two_sided_make_pair` | GTC MAKE buy both, STRICT | fill = other side hits our bid |
+| `directional-fade-v1` | one-sided TAKE fade | FOK TAKE the anti-whale side at T+1 | dump / GTC take-profit |
 
 Cooldown is per **condition**, default 180 blocks. An entry miss still
 consumes it.
