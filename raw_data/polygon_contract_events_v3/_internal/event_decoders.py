@@ -557,8 +557,8 @@ def _decode_fee_refunded(log: dict, topics: list[str]) -> tuple[str, dict]:
     row["order_hash"] = _hex_to_bytes(topics[1])
     row["receiver"] = _addr_from_topic(topics[2])
     # ``feeCharged`` is the third indexed parameter (uint256). Encoded
-    # as a 32-byte topic, stored as BLOB(32).
-    row["fee_charged"] = _hex_to_bytes(topics[3])
+    # as a 32-byte topic; the schema stores it as a uint256 decimal string.
+    row["fee_charged"] = _u256_str(_parse_hex(topics[3]))
     token_id, refund = _decode_data(["uint256", "uint256"], log["data"])
     row["token_id"] = token_id.to_bytes(32, "big")
     row["refund"] = _u256_str(refund)

@@ -329,7 +329,7 @@ These contracts pair 1:1 with their corresponding v1 exchange (FeeModuleCTF ↔ 
 
 Fee refund emitted by the fee module after each v1 `OrderFilled`. The `fee` field in v1 `OrderFilled` is the gross fee; most of it is refunded back to the trader. The actual net fee retained by the protocol is `fee_charged`.
 
-Solidity event: `FeeRefunded(bytes32 indexed orderHash, address indexed to, uint256 tokenId, uint256 refund, uint256 feeCharged)`
+Solidity event: `FeeRefunded(bytes32 indexed orderHash, address indexed to, uint256 tokenId, uint256 refund, uint256 indexed feeCharged)`
 
 | Column | Parquet logical type | Description |
 |---|---|---|
