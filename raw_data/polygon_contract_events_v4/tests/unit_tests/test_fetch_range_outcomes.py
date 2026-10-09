@@ -64,7 +64,7 @@ def test_rate_limit_is_throttling_and_carries_the_status_code():
     assert result["http_status"] == 429
 
 
-@pytest.mark.parametrize("status_code", [500, 502, 503, 504])
+@pytest.mark.parametrize("status_code", [403, 500, 502, 503, 504])
 def test_server_errors_are_throttling_not_failures(status_code):
     result = fetch(FakeRpcClient(error=HTTPError(status_code)))
 
@@ -72,7 +72,7 @@ def test_server_errors_are_throttling_not_failures(status_code):
     assert result["http_status"] == status_code
 
 
-@pytest.mark.parametrize("status_code", [400, 401, 403, 404])
+@pytest.mark.parametrize("status_code", [400, 401, 404])
 def test_permanent_http_errors_fail_fast(status_code):
     result = fetch(FakeRpcClient(error=HTTPError(status_code)))
 

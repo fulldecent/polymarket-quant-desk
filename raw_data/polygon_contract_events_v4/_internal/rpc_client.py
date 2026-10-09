@@ -70,8 +70,9 @@ _TOO_MANY_RESULTS_KEYWORDS = (
 )
 
 # HTTP status codes that warrant retry. Everything else is treated as
-# permanent failure.
-_RETRYABLE_HTTP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+# permanent failure. 403 is in the set because some providers return it
+# as a WAF / rate-limit after 429 bursts.
+_RETRYABLE_HTTP_STATUSES = frozenset({403, 408, 425, 429, 500, 502, 503, 504})
 
 
 # ---------------------------------------------------------------------------
@@ -116,8 +117,8 @@ class RPCTimeout(RPCError):
 class HTTPError(RPCError):
     """HTTP-level error from the provider.
 
-    ``is_retryable`` is computed from ``status_code``: True for 408,
-    425, 429, 500, 502, 503, 504; False otherwise.
+    ``is_retryable`` is computed from ``status_code``: True for 403,
+    408, 425, 429, 500, 502, 503, 504; False otherwise.
     """
 
     def __init__(self, status_code: int) -> None:

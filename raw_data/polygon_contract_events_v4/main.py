@@ -605,7 +605,7 @@ def _fetch_range(
                 "elapsed_sec": time.monotonic() - t0,
                 "http_status": e.status_code,
             }
-        # 401/403 and friends never fix themselves; retrying just burns the backlog.
+        # 401/404 and friends never fix themselves; retrying just burns the backlog.
         return {
             "status": "fatal",
             "wid": wid,
