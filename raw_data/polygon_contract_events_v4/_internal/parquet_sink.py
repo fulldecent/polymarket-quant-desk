@@ -133,7 +133,6 @@ from .persistence import ProgressCallback
 from .tables import (
     SCRAPE_START_BLOCK,
     PARTITION_SIZE_10K,
-    CONTRACTS_BY_NAME,
     all_columns,
     all_targets,
     table_name,
@@ -174,12 +173,9 @@ def _manifest_dir(cold_path: Path, partition_start: int) -> Path:
 
 
 def _expected_targets_for_partition(partition_start: int) -> list[tuple[str, str]]:
-    # DATA_DICTIONARY.md defines expected targets by deployment <= partition lower bound.
-    return [
-        (contract, event)
-        for contract, event in all_targets()
-        if CONTRACTS_BY_NAME[contract].deployment_block <= partition_start
-    ]
+    # Completeness matches write_partition_files: a contract deployed by
+    # partition end still gets files in this 10K (DATA_DICTIONARY.md).
+    return targets_active_at(partition_end(partition_start))
 
 
 def _validate_manifest_partition_dir(manifest_partition_dir: Path) -> None:

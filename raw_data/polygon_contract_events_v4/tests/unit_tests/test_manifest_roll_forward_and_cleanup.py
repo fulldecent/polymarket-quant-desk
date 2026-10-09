@@ -6,6 +6,7 @@ from raw_data.polygon_contract_events_v4._internal.errors import V4Error
 from raw_data.polygon_contract_events_v4._internal.parquet_sink import (
     _expected_targets_for_partition,
     cleanup_temp_dirs_after_frontier,
+    get_sunk_frontier,
     roll_forward_manifests_to_exhaustion,
 )
 from raw_data.polygon_contract_events_v4._internal.tables import (
@@ -102,3 +103,12 @@ def test_roll_forward_treats_empty_partition_dir_as_incomplete(tmp_path: Path) -
 
     assert written == 0
     assert not empty_partition_dir.exists()
+
+
+def test_roll_forward_does_not_publish_first_partition_on_empty_cold(tmp_path: Path) -> None:
+    p0 = (SCRAPE_START_BLOCK // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
+    written = roll_forward_manifests_to_exhaustion(str(tmp_path))
+
+    assert written == 0
+    assert get_sunk_frontier(str(tmp_path)) == SCRAPE_START_BLOCK - 1
+    assert not _manifest_success_path(tmp_path, p0).is_file()

@@ -64,8 +64,8 @@ The producer makes exactly the following guarantees regarding file visibility an
   - Any folder existing with this path pattern shall contain exactly one file: `_SUCCESS`. **The producer shall never modify, replace or delete this file.**
   - Its `1M={N}/10K={N}` path part shall be lexicographically greater than or equal to `1M=33000000/10K=33600000` (this is the partition containing `SCRAPE_START_BLOCK`).
   - For every pattern  `1M={N}/10K={N}` lexicographically between `1M=33000000/10K=33600000` and this folder (inclusive), a folder at that path `manifests/1M={N}/10K={N}/` shall also exist.
-  - Let the "block lower bound" for this partition be the number `N` in  `10K={N}`.
-  - For every (contract, event) [specified below](#events-by-contract) with deployment block less than or equal to the block lower bound, the folder `{contract}/{event}/1M={N}/10K={N}/` shall exist. **The producer shall never modify, replace or delete its two files.**
+  - Let the "block upper bound" for this partition be `N + 9,999`, where `N` is the number in `10K={N}`.
+  - For every (contract, event) [specified below](#events-by-contract) with deployment block less than or equal to that upper bound, the folder `{contract}/{event}/1M={N}/10K={N}/` shall exist. A contract that deploys mid-partition still gets files in that 10K. **The producer shall never modify, replace or delete its two files.**
 
 The folder existing with the lexicographically highest pattern `manifests/1M={N}/10K={N}/` is called the "frontier". For the avoidance of doubt, no guarantees are made regarding the existance, completeness or immutability of files in ``{contract}/{event}/1M={N}/10K={N}/`` folders which are lexicographically higher than that.
 
