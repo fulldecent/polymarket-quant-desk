@@ -155,6 +155,7 @@ RPC_CALL_TIMEOUT_SEC: float = 30.0
 RPC_BLOCK_NUMBER_TIMEOUT_SEC: float = 5.0
 RPC_MAX_RETRIES: int = 3
 RPC_BACKOFF_BASE_SEC: float = 0.5
+CHAIN_HEAD_ATTEMPTS: int = 4
 
 POLL_TIMEOUT_SEC: float = 0.5
 """How long ``concurrent.futures.wait`` blocks before the loop refreshes the footer.
@@ -542,6 +543,48 @@ def _interruptible_sleep(seconds: float) -> None:
         slice_sec = min(remaining, 0.1)
         time.sleep(slice_sec)
         remaining -= slice_sec
+
+
+def _chain_head_retry_wait_sec(attempt: int) -> float:
+    """Backoff after a failed chain-head attempt (1-based). Capped at 8s."""
+    return min(8.0, 2.0 * (2 ** (attempt - 1)))
+
+
+def fetch_block_number_with_retries(
+    get_block_number,
+    *,
+    attempts: int = CHAIN_HEAD_ATTEMPTS,
+    sleep_fn=_interruptible_sleep,
+    on_retry=None,
+    is_stop=None,
+) -> int:
+    """Call ``get_block_number`` up to ``attempts`` times.
+
+    Retryable HTTP / rate-limit errors print via ``on_retry(attempt, attempts, status, wait)``
+    and sleep. Permanent errors raise immediately. Exhaustion raises ``RuntimeError``
+    with the last status (for example ``HTTP 403``).
+    """
+    last_status = "no response"
+    for attempt in range(1, attempts + 1):
+        try:
+            return get_block_number()
+        except HTTPError as e:
+            if not e.is_retryable:
+                raise
+            last_status = f"HTTP {e.status_code}"
+        except RPCError as e:
+            if not is_rate_limit_message(str(e)):
+                raise
+            last_status = "rate limited"
+        if attempt == attempts:
+            break
+        wait = _chain_head_retry_wait_sec(attempt)
+        if on_retry is not None:
+            on_retry(attempt, attempts, last_status, wait)
+        sleep_fn(wait)
+        if is_stop is not None and is_stop():
+            raise OperationCancelled("chain head query interrupted")
+    raise RuntimeError(last_status)
 
 
 def _fetch_range(
@@ -1112,25 +1155,20 @@ def main() -> None:
         stop_event=_stop_event,
     )
 
-    def _query_chain_head() -> int:
-        last: BaseException | None = None
-        for i in range(12):
-            try:
-                return rpc_client.get_block_number()
-            except HTTPError as e:
-                if not e.is_retryable:
-                    raise
-                last = e
-            except RPCError as e:
-                if not is_rate_limit_message(str(e)):
-                    raise
-                last = e
-            wait = min(60.0, 2.0 * (2 ** min(i, 5)))
-            _print_message(f"chain head {last}; retry in {wait:.0f}s")
-            _interruptible_sleep(wait)
-            if _stop_event.is_set():
-                raise OperationCancelled("chain head query interrupted")
-        raise last  # type: ignore[misc]
+    def _query_chain_head(*, label: str = "Querying chain head") -> int:
+        def _on_retry(attempt: int, attempts: int, status: str, wait: float) -> None:
+            _print_message(
+                f"  chain head {attempt}/{attempts}  {status}  retry in {wait:.0f}s"
+            )
+            status_ui.spinner("head", f"{label} {attempt + 1}/{attempts}")
+
+        status_ui.spinner("head", f"{label} 1/{CHAIN_HEAD_ATTEMPTS}")
+        return fetch_block_number_with_retries(
+            rpc_client.get_block_number,
+            attempts=CHAIN_HEAD_ATTEMPTS,
+            on_retry=_on_retry,
+            is_stop=_stop_event.is_set,
+        )
 
     head_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="startup-head")
     head_future = head_executor.submit(_query_chain_head)
@@ -1309,7 +1347,10 @@ def main() -> None:
         try:
             chain_head = head_future.result()
         except Exception as e:  # noqa: BLE001
-            sys.exit(f"FATAL: could not read chain head: {type(e).__name__}: {e}")
+            sys.exit(
+                f"FATAL: could not read chain head "
+                f"({CHAIN_HEAD_ATTEMPTS}/{CHAIN_HEAD_ATTEMPTS}): {e}"
+            )
         finally:
             head_executor.shutdown(wait=False)
             status_ui.clear("head")
@@ -1709,9 +1750,12 @@ def main() -> None:
             if not pending_ranges and not rpc_futures and not draining_epoch:
                 status_ui.spinner("head", "Rechecking chain head")
                 try:
-                    new_head = _query_chain_head()
+                    new_head = _query_chain_head(label="Rechecking chain head")
                 except (RPCError, RuntimeError, OperationCancelled) as e:
-                    fatal_reason = f"failed to recheck chain head: {type(e).__name__}: {e}"
+                    fatal_reason = (
+                        f"failed to recheck chain head "
+                        f"({CHAIN_HEAD_ATTEMPTS}/{CHAIN_HEAD_ATTEMPTS}): {e}"
+                    )
                     _print_message(f"FATAL: {fatal_reason}")
                     _stop_event.set()
                     break
