@@ -12,11 +12,9 @@ bytes into a VARCHAR column. That is poison:
     does not write. Hot may still hold earlier blocks of the same 10K
     in the NUL-padded form.
 
-A scrape that ran that decoder through the v1 fee-module window
-(blocks ~81,270,000–86,120,000) cannot keep those ``fee_refunded``
-rows. Delete the hot DB and rescarpe unsunk blocks. Sunk parquet that
-fails :func:`sql_poison_predicate` is invalid; do not run derived jobs
-on it.
+Refuse those encodings at hot open, persist, and sink so a retry cannot
+publish them. Landed v3 parquet on this desk is decimal; the dataset
+version stays ``v3``.
 """
 
 from __future__ import annotations
@@ -29,10 +27,8 @@ FEE_REFUNDED_TABLES: tuple[str, ...] = (
 )
 
 POISON_MESSAGE = (
-    "fee_charged is not a uint256 decimal string. The decoder used to "
-    "store the indexed feeCharged topic as 32 raw bytes (NUL-padded UTF-8 "
-    "or DuckDB '\\xNN' escapes). Delete the hot DB and rescarpe unsunk "
-    "blocks. Sunk fee_refunded parquet with this encoding is invalid."
+    "fee_charged is not a uint256 decimal string. The decoder must emit "
+    "a canonical uint256 decimal, not the 32-byte indexed feeCharged topic."
 )
 
 _DECIMAL = "^(0|[1-9][0-9]*)$"
