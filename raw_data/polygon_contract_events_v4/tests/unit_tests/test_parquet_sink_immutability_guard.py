@@ -30,8 +30,12 @@ from pathlib import Path
 
 import pytest
 
-from raw_data.polygon_contract_events_v4._internal.parquet_sink import write_partition_files
+from raw_data.polygon_contract_events_v4._internal.parquet_sink import (
+    _expected_targets_for_partition,
+    write_partition_files,
+)
 from raw_data.polygon_contract_events_v4._internal.tables import SCRAPE_START_BLOCK, PARTITION_SIZE_10K
+from lib.partition_utils import partition_dir
 
 
 def test_write_partition_files_refuses_to_overwrite_existing_data_parquet():
@@ -63,8 +67,30 @@ def test_write_partition_files_refuses_to_overwrite_existing_data_parquet():
         # If the guard works, we should see the V4Error about refusing to overwrite.
         error_msg = str(exc_info.value).lower()
         assert (
-            "overwrite" in error_msg
+            "partial" in error_msg
+            or "overwrite" in error_msg
             or "immutable" in error_msg
             or "already sunk" in error_msg
-            or "does not exist" in error_msg  # db_path check happens first
+            or "does not exist" in error_msg
         ), f"Expected immutability-related error, got: {exc_info.value}"
+
+
+def test_write_partition_files_is_idempotent_when_all_targets_already_landed(tmp_path: Path) -> None:
+    cold_root = tmp_path / "cold"
+    cold_root.mkdir()
+    partition_start = (SCRAPE_START_BLOCK // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
+    targets = _expected_targets_for_partition(partition_start)
+    assert targets
+    rel = partition_dir(partition_start)
+    for contract, event in targets:
+        folder = cold_root / contract / event / rel
+        folder.mkdir(parents=True)
+        (folder / "data.parquet").write_bytes(b"pq")
+        (folder / "metadata.json").write_text("{}")
+
+    result = write_partition_files("/no/such.db", str(cold_root), partition_start)
+    assert result.partition_start == partition_start
+    assert result.files_written == len(targets)
+    # Original bytes must still be there.
+    sample = next(cold_root.glob("**/data.parquet"))
+    assert sample.read_bytes() == b"pq"

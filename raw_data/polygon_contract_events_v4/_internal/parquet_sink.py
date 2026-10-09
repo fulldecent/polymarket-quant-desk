@@ -661,12 +661,48 @@ def write_partition_files(
     cold_path = Path(cold_root)
     if not cold_path.is_dir():
         raise ValueError(f"cold_root does not exist or is not a directory: {cold_root}")
-    if not Path(db_path).is_file():
-        raise ValueError(f"db_path does not exist: {db_path}")
 
     p_end = partition_end(partition_start)
     rel_path = partition_dir(partition_start)
     targets = targets_active_at(p_end)
+
+    complete_files: list[Path] = []
+    missing = 0
+    for contract, event in targets:
+        folder = cold_path / contract / event / rel_path
+        pq = folder / "data.parquet"
+        meta = folder / "metadata.json"
+        has_pq = pq.is_file()
+        has_meta = meta.is_file()
+        if has_pq and has_meta:
+            complete_files.append(pq)
+        elif has_pq or has_meta:
+            raise V4Error(
+                f"partial cold files for {contract}/{event} partition "
+                f"{partition_start}: expected data.parquet and metadata.json"
+            )
+        else:
+            missing += 1
+
+    if complete_files and missing:
+        raise V4Error(
+            f"partition {partition_start} is partially on disk "
+            f"({len(complete_files)} complete, {missing} missing targets)"
+        )
+    if complete_files and not missing:
+        # Crash recovery: the writer already landed every file. Do not
+        # touch them; the orchestrator still has to publish the manifest
+        # and commit_sink in frontier order.
+        return PartitionWriteResult(
+            partition_start=partition_start,
+            files_written=len(complete_files),
+            rows_total=0,
+            bytes_total=sum(p.stat().st_size for p in complete_files),
+            elapsed_ms=0.0,
+        )
+
+    if not Path(db_path).is_file():
+        raise ValueError(f"db_path does not exist: {db_path}")
 
     t0 = time.monotonic()
     pending_renames: list[tuple[Path, Path]] = []
