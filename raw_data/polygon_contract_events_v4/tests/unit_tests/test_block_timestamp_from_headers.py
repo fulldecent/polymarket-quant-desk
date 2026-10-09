@@ -49,3 +49,44 @@ def test_missing_header_is_fatal():
     client._rpc_batch = lambda calls: [{"id": calls[0]["id"], "result": None}]
     with pytest.raises(JSONRPCError, match="missing header timestamp"):
         client.get_block_timestamps([10])
+
+
+def test_rate_limited_batch_item_is_retried():
+    client = _client()
+    client._backoff_wait = lambda attempt: None
+    attempts = {"n": 0}
+
+    def fake_batch(calls):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return [
+                {
+                    "id": calls[0]["id"],
+                    "error": {
+                        "message": "You've exceeded the RPS limit available on the current plan."
+                    },
+                }
+            ]
+        return [
+            {"id": c["id"], "result": {"timestamp": hex(1_700_000_000 + c["id"])}}
+            for c in calls
+        ]
+
+    client._rpc_batch = fake_batch
+    assert client.get_block_timestamps([10]) == {10: 1_700_000_010}
+    assert attempts["n"] == 2
+
+
+def test_rate_limited_batch_exhausted_raises():
+    client = _client()
+    client._backoff_wait = lambda attempt: None
+    client._rpc_batch = lambda calls: [
+        {
+            "id": calls[0]["id"],
+            "error": {
+                "message": "You've exceeded the RPS limit available on the current plan."
+            },
+        }
+    ]
+    with pytest.raises(JSONRPCError, match="RPS limit"):
+        client.get_block_timestamps([10])

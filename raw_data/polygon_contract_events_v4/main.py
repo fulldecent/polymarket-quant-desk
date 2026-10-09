@@ -135,6 +135,7 @@ from _internal.rpc_client import (
     RPCError,
     RPCTimeout,
     TooManyResults,
+    is_rate_limit_message,
 )
 from _internal.tables import (
     PARTITION_SIZE_10K,
@@ -613,6 +614,13 @@ def _fetch_range(
         }
     except (RPCError, RuntimeError) as e:
         _interruptible_sleep(sleep_after_response_sec)
+        if is_rate_limit_message(str(e)):
+            return {
+                "status": "throttled",
+                "wid": wid,
+                "elapsed_sec": time.monotonic() - t0,
+                "http_status": 429,
+            }
         return {
             "status": "error",
             "wid": wid,
@@ -650,8 +658,30 @@ def _fetch_range(
             ts_by_block = rpc_client.get_block_timestamps(list(block_numbers))
         except OperationCancelled:
             return {"status": "cancelled", "wid": wid, "elapsed_sec": time.monotonic() - t0}
+        except HTTPError as e:
+            _interruptible_sleep(sleep_after_response_sec)
+            if e.is_retryable:
+                return {
+                    "status": "throttled",
+                    "wid": wid,
+                    "elapsed_sec": time.monotonic() - t0,
+                    "http_status": e.status_code,
+                }
+            return {
+                "status": "fatal",
+                "wid": wid,
+                "elapsed_sec": time.monotonic() - t0,
+                "error_message": f"header fetch: HTTP {e.status_code} from the RPC provider",
+            }
         except Exception as e:
             _interruptible_sleep(sleep_after_response_sec)
+            if is_rate_limit_message(str(e)):
+                return {
+                    "status": "throttled",
+                    "wid": wid,
+                    "elapsed_sec": time.monotonic() - t0,
+                    "http_status": 429,
+                }
             return {
                 "status": "error",
                 "wid": wid,

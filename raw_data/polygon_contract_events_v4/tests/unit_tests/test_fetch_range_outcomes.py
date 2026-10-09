@@ -87,6 +87,39 @@ def test_jsonrpc_error_is_retryable_by_the_caller():
     assert "server busy" in result["error_message"]
 
 
+def test_jsonrpc_rps_limit_is_throttling():
+    result = fetch(
+        FakeRpcClient(
+            error=JSONRPCError(
+                None,
+                "You've exceeded the RPS limit available on the current plan.",
+            )
+        )
+    )
+
+    assert result["status"] == "throttled"
+    assert result["http_status"] == 429
+
+
+def test_header_fetch_rps_limit_is_throttling(monkeypatch):
+    monkeypatch.setattr(
+        scraper,
+        "decode_batch_strict",
+        lambda logs: [("ConditionalTokens", "position_split", {"block_number": 1000})],
+    )
+
+    class Client(FakeRpcClient):
+        def get_block_timestamps(self, block_numbers):
+            raise JSONRPCError(
+                None,
+                "You've exceeded the RPS limit available on the current plan.",
+            )
+
+    result = fetch(Client(logs=[{"dummy": True}]))
+    assert result["status"] == "throttled"
+    assert result["http_status"] == 429
+
+
 def test_cancellation_is_not_reported_as_a_failure():
     assert fetch(FakeRpcClient(error=OperationCancelled("stopping")))["status"] == "cancelled"
 

@@ -31,7 +31,9 @@ Exception types (every one inherits from ``RPCError``):
     HTTPError       — HTTP-level error. Retryable for 408/425/429/5xx;
                       not retryable otherwise.
     JSONRPCError    — JSON-RPC ``error`` field returned by the provider.
-                      Not retryable.
+                      Rate-limit messages are retried on header batches and
+                      surfaced as throttling to the caller; other JSON-RPC
+                      errors are not retryable.
 
 Every exception carries an ``is_retryable: bool`` attribute. The client
 retries transient errors internally; the caller only sees exceptions
@@ -168,6 +170,20 @@ def _is_timeout_error(exc: Exception) -> bool:
 def _is_too_many_results_message(message: str) -> bool:
     msg = message.lower()
     return any(keyword in msg for keyword in _TOO_MANY_RESULTS_KEYWORDS)
+
+
+_RATE_LIMIT_KEYWORDS = (
+    "rps",
+    "rate limit",
+    "rate-limit",
+    "too many requests",
+)
+
+
+def is_rate_limit_message(message: str) -> bool:
+    """True when a provider error is an RPS / request-rate rejection."""
+    msg = message.lower()
+    return any(keyword in msg for keyword in _RATE_LIMIT_KEYWORDS)
 
 
 # ---------------------------------------------------------------------------
@@ -352,30 +368,55 @@ class RpcClient:
         out: dict[int, int] = {}
         batch_size = 64
         for i in range(0, len(unique), batch_size):
-            chunk = unique[i : i + batch_size]
-            calls = [
-                {
-                    "jsonrpc": "2.0",
-                    "method": "eth_getBlockByNumber",
-                    "params": [_to_hex(n), False],
-                    "id": n,
-                }
-                for n in chunk
-            ]
+            out.update(self._header_timestamps_for_chunk(unique[i : i + batch_size]))
+        return out
+
+    def _header_timestamps_for_chunk(self, chunk: list[int]) -> dict[int, int]:
+        calls = [
+            {
+                "jsonrpc": "2.0",
+                "method": "eth_getBlockByNumber",
+                "params": [_to_hex(n), False],
+                "id": n,
+            }
+            for n in chunk
+        ]
+        last_rate_limit = ""
+        for attempt in range(self.config.max_retries):
+            if self.stop_event is not None and self.stop_event.is_set():
+                raise OperationCancelled("RPC call interrupted")
             results = self._rpc_batch(calls)
             by_id = {item["id"]: item for item in results}
+            parsed: dict[int, int] = {}
+            rate_limited = False
             for n in chunk:
                 item = by_id.get(n)
                 if item is None:
                     raise JSONRPCError(None, f"batch response missing id {n}")
                 if "error" in item:
                     err = item["error"]
-                    raise JSONRPCError(err.get("code"), err.get("message", str(err)))
+                    if isinstance(err, dict):
+                        code = err.get("code")
+                        msg = err.get("message", str(err))
+                    else:
+                        code = None
+                        msg = str(err)
+                    if is_rate_limit_message(msg):
+                        rate_limited = True
+                        last_rate_limit = msg
+                        break
+                    raise JSONRPCError(code, msg)
                 header = item.get("result")
                 if not isinstance(header, dict) or not header.get("timestamp"):
                     raise JSONRPCError(None, f"missing header timestamp for block {n}")
-                out[n] = _parse_hex(header["timestamp"])
-        return out
+                parsed[n] = _parse_hex(header["timestamp"])
+            if rate_limited:
+                if attempt < self.config.max_retries - 1:
+                    self._backoff_wait(attempt)
+                    continue
+                raise JSONRPCError(None, last_rate_limit or "rate limited")
+            return parsed
+        raise JSONRPCError(None, last_rate_limit or "rate limited")
 
     # ------------------------------------------------------------------
     # Private: connection management
