@@ -1113,7 +1113,24 @@ def main() -> None:
     )
 
     def _query_chain_head() -> int:
-        return rpc_client.get_block_number()
+        last: BaseException | None = None
+        for i in range(12):
+            try:
+                return rpc_client.get_block_number()
+            except HTTPError as e:
+                if not e.is_retryable:
+                    raise
+                last = e
+            except RPCError as e:
+                if not is_rate_limit_message(str(e)):
+                    raise
+                last = e
+            wait = min(60.0, 2.0 * (2 ** min(i, 5)))
+            _print_message(f"chain head {last}; retry in {wait:.0f}s")
+            _interruptible_sleep(wait)
+            if _stop_event.is_set():
+                raise OperationCancelled("chain head query interrupted")
+        raise last  # type: ignore[misc]
 
     head_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="startup-head")
     head_future = head_executor.submit(_query_chain_head)
@@ -1685,8 +1702,8 @@ def main() -> None:
             if not pending_ranges and not rpc_futures and not draining_epoch:
                 status_ui.spinner("head", "Rechecking chain head")
                 try:
-                    new_head = rpc_client.get_block_number()
-                except (RPCError, RuntimeError) as e:
+                    new_head = _query_chain_head()
+                except (RPCError, RuntimeError, OperationCancelled) as e:
                     fatal_reason = f"failed to recheck chain head: {type(e).__name__}: {e}"
                     _print_message(f"FATAL: {fatal_reason}")
                     _stop_event.set()
