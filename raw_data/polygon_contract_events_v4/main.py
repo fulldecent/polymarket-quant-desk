@@ -1625,12 +1625,12 @@ def main() -> None:
                     )
                     # dRPC (and some others) return HTTP 500 for a range that is
                     # too heavy, not a rate limit. Shrink the span so we do not
-                    # retry the same 18-block window forever at sleep=0.
+                    # retry the same window forever, and still drop workers /
+                    # add sleep so a 16-wide burst does not livelock.
                     if http_status in {500, 502} and chunk_span > 1:
                         planner.record_rejection(blocks=chunk_span)
                         optimizer.record_rejection()
-                    else:
-                        optimizer.record_throttled(http_status)
+                    optimizer.record_throttled(http_status)
                     _return_chunk(pending_ranges, chunk)
                     _print_message(
                         f"Scraping {endpoint_label} backing off"
