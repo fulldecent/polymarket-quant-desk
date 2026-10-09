@@ -283,13 +283,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "token_id",
-        nargs="?",
         metavar="TOKEN_ID",
         help="decimal clobTokenId",
     )
-    parser.add_argument("--exec", choices=EXEC_CHOICES)
-    parser.add_argument("--listen", choices=LISTEN_CHOICES)
-    parser.add_argument("--amount", type=float, metavar="USD")
+    parser.add_argument("--exec", required=True, choices=EXEC_CHOICES)
+    parser.add_argument("--listen", required=True, choices=LISTEN_CHOICES)
+    parser.add_argument("--amount", required=True, type=float, metavar="USD")
     parser.add_argument(
         "--worst-price",
         type=float,
@@ -303,20 +302,6 @@ def parse_args() -> argparse.Namespace:
         help="wrap just enough USDC.e → pUSD before the buy (CLOB v2 collateral)",
     )
     args = parser.parse_args()
-    if not args.token_id:
-        parser.print_help()
-        raise SystemExit(2)
-    missing = [
-        name
-        for name, ok in (
-            ("--exec", args.exec),
-            ("--listen", args.listen),
-            ("--amount", args.amount is not None),
-        )
-        if not ok
-    ]
-    if missing:
-        parser.error("the following arguments are required: " + ", ".join(missing))
     if args.amount < 2:
         parser.error("--amount must be >= 2")
     return args

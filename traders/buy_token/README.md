@@ -4,8 +4,10 @@ One fill-or-kill market buy of a single outcome token, then wait on `--listen` f
 
 ```sh
 source .venv/bin/activate
-python traders/buy_token/main.py TOKEN_ID --exec {clob,polynode} --listen {rpc,polynode} --amount USD [--worst-price P] [--wrap]
+python traders/buy_token/main.py --exec {clob,polynode} --listen {rpc,polynode} --amount USD [--worst-price P] [--wrap] TOKEN_ID
 ```
+
+`--exec`, `--listen`, `--amount`, and `TOKEN_ID` are required. `--worst-price` and `--wrap` are optional.
 
 `TOKEN_ID` is a CLOB outcome token (Yes or No). Look one up with:
 
