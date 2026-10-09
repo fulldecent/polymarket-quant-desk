@@ -153,21 +153,19 @@ def _is_local_url(url: str) -> bool:
     return host in {"localhost", "127.0.0.1", "::1"}
 
 
-def _configure_clob_http(*, via_tor: bool) -> None:
-    """Send CLOB HTTP through Tor SOCKS when CLOB_API_URL is the local Caddy hop.
+def _configure_clob_http() -> None:
+    """Talk to the CLOB origin directly.
 
-    Caddy's reverse_proxy to clob.polymarket.com drops or mangles POLY_* L1/L2
-    auth headers (``Invalid L1 Request headers``). TLS to the real origin via
-    Tor SOCKS keeps Host and POLY_* intact.
+    A localhost CLOB_API_URL is the Caddy hop. Caddy's HTTP/2 proxy mangles
+    POLY_* headers, and that hop is not required for an order. Authenticated
+    calls use TLS to clob.polymarket.com on a normal socket.
     """
     import httpx
     from py_clob_client.http_helpers import helpers as clob_http_v1
     from py_clob_client_v2.http_helpers import helpers as clob_http_v2
 
-    marker = "tor" if via_tor else "direct"
+    marker = "direct"
     kwargs: dict = {"timeout": 30.0, "http2": True}
-    if via_tor:
-        kwargs["proxy"] = _TOR_SOCKS
 
     for helpers in (clob_http_v1, clob_http_v2):
         existing = getattr(helpers, "_http_client", None)
@@ -187,9 +185,8 @@ def build_client() -> ClobClient:
     """Construct an authenticated ClobClient from environment variables."""
     load_env()
     configured = get_clob_api_url()
-    via_tor = _is_local_url(configured)
-    _configure_clob_http(via_tor=via_tor)
-    host = _CLOB_ORIGIN if via_tor else configured
+    _configure_clob_http()
+    host = _CLOB_ORIGIN if _is_local_url(configured) else configured
     pk = require_env("EOA_PRIVATE_KEY")
     funder = require_env("POLYMARKET_PROXY_WALLET")
     chain_id = CHAIN_POLYGON
@@ -217,9 +214,8 @@ def build_v2_client():
 
     load_env()
     configured = get_clob_api_url()
-    via_tor = _is_local_url(configured)
-    _configure_clob_http(via_tor=via_tor)
-    host = _CLOB_ORIGIN if via_tor else configured
+    _configure_clob_http()
+    host = _CLOB_ORIGIN if _is_local_url(configured) else configured
     return ClobClientV2(
         host=host,
         chain_id=CHAIN_POLYGON,
@@ -237,6 +233,26 @@ def build_v2_client():
 _v2_client = None
 _FOK_TICK = "0.01"
 _FOK_WORST_BUY = 0.99
+_builder_code: str | None = None
+
+
+def our_builder_code() -> str:
+    """Bytes32 from the builder profile, stamped into every v2 order.
+
+    OrderFilled.builder is this signed field. BUILDER_API_KEY, BUILDER_SECRET,
+    and BUILDER_PASSPHRASE authenticate the relayer. They do not set it.
+    """
+    global _builder_code
+    if _builder_code is not None:
+        return _builder_code
+    raw = require_env("BUILDER_CODE").strip()
+    if len(raw) != 66 or raw[:2].lower() != "0x" or not re.fullmatch(r"[0-9a-fA-F]{64}", raw[2:]):
+        sys.exit(
+            "Error: BUILDER_CODE must be 0x followed by 64 hex characters "
+            "(polymarket.com/settings?tab=builder)"
+        )
+    _builder_code = "0x" + raw[2:].lower()
+    return _builder_code
 
 
 def get_v2_client():
@@ -323,8 +339,8 @@ def explain_api_error(endpoint_name: str, endpoint_url: str, exc: Exception) -> 
             return (
                 f"{endpoint_name} returned HTTP 401 at {endpoint_url}. "
                 "Check that the endpoint and credentials are valid. "
-                "If CLOB_API_URL is the local proxy, authenticated CLOB calls "
-                "go through Tor SOCKS (start_proxy.py must be running). "
+                "Authenticated CLOB calls go to clob.polymarket.com directly "
+                "when CLOB_API_URL is the local proxy. "
                 f"Response: {detail}"
             )
         return f"{endpoint_name} returned HTTP {status} at {endpoint_url}: {detail}"
@@ -344,7 +360,8 @@ def explain_api_error(endpoint_name: str, endpoint_url: str, exc: Exception) -> 
             return (
                 f"{endpoint_name} returned HTTP 401 at {endpoint_url}. "
                 "Check that the endpoint and credentials are valid. "
-                "Authenticated CLOB calls use Tor SOCKS when CLOB_API_URL is localhost."
+                "Authenticated CLOB calls go to clob.polymarket.com directly "
+                "when CLOB_API_URL is localhost."
             )
         return f"{endpoint_name} returned HTTP {status} at {endpoint_url}: {message}"
 
@@ -672,6 +689,7 @@ def _sign_v2_fok_buy(
             price=price,
             side="BUY",
             order_type=OrderTypeV2.FOK,
+            builder_code=our_builder_code(),
         ),
         CreateOrderOptions(tick_size=_FOK_TICK, neg_risk=bool(neg_risk)),
         version=2,
@@ -721,6 +739,7 @@ def _sign_v2_limit_sell(
             size=size,
             side="SELL",
             expiration=int(expiration),
+            builder_code=our_builder_code(),
         ),
         CreateOrderOptions(tick_size=tick_size, neg_risk=bool(neg_risk)),
         version=2,
@@ -741,6 +760,7 @@ def _sign_v2_fak_sell(
             price=min_price if min_price else 0.01,
             side="SELL",
             order_type=OrderTypeV2.FAK,
+            builder_code=our_builder_code(),
         ),
         CreateOrderOptions(tick_size=tick_size, neg_risk=bool(neg_risk)),
         version=2,
