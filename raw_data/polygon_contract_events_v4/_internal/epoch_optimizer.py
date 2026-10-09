@@ -346,8 +346,10 @@ class EpochOptimizer:
         """
         self._workers_ramping = False
         sleep = self._active.sleep_after_response_sec
-        if status_code == 429:
-            # Being rate limited is what the sleep knob exists for; concurrency alone will not fix it.
+        if status_code in {429, 500, 502}:
+            # 429 is a rate limit. 500/502 from some providers (dRPC) is a
+            # too-heavy range that the client already retried; sleep so a
+            # leftover 1-block failure does not hammer the endpoint.
             sleep = min(MAX_SLEEP_SEC, sleep * 2 if sleep > 0 else MIN_SLEEP_STEP_SEC * 4)
         self._active = replace(
             self._active,

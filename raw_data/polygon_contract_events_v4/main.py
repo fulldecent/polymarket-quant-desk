@@ -1623,8 +1623,15 @@ def main() -> None:
                         f"  THROTTLED  w:{wid}  HTTP {http_status}  "
                         f"[{from_b:,}-{to_b:,}]"
                     )
+                    # dRPC (and some others) return HTTP 500 for a range that is
+                    # too heavy, not a rate limit. Shrink the span so we do not
+                    # retry the same 18-block window forever at sleep=0.
+                    if http_status in {500, 502} and chunk_span > 1:
+                        planner.record_rejection(blocks=chunk_span)
+                        optimizer.record_rejection()
+                    else:
+                        optimizer.record_throttled(http_status)
                     _return_chunk(pending_ranges, chunk)
-                    optimizer.record_throttled(http_status)
                     _print_message(
                         f"Scraping {endpoint_label} backing off"
                         f"{_tuning_suffix(optimizer, planner)}"

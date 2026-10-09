@@ -386,6 +386,17 @@ def test_server_error_eases_concurrency_without_adding_sleep():
     assert opt.params.sleep_after_response_sec == 0.0
 
 
+def test_http_500_introduces_sleep_and_halves_workers():
+    opt, _ = make_optimizer()
+    finish_ramp(opt)
+    opt._active = Params(workers=16, result_budget=800, sleep_after_response_sec=0.0)
+
+    opt.record_throttled(500)
+
+    assert opt.params.workers == 8
+    assert opt.params.sleep_after_response_sec > 0.0
+
+
 def test_spoiled_epoch_is_re_measured_rather_than_scored():
     opt, clock = make_optimizer()
     finish_ramp(opt)
