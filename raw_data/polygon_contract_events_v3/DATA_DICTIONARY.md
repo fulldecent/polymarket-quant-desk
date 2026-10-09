@@ -329,7 +329,7 @@ These contracts pair 1:1 with their corresponding v1 exchange (FeeModuleCTF ↔ 
 
 Fee refund emitted by the fee module after each v1 `OrderFilled`. The `fee` field in v1 `OrderFilled` is the gross fee; most of it is refunded back to the trader. The actual net fee retained by the protocol is `fee_charged`.
 
-Solidity event: `FeeRefunded(bytes32 indexed orderHash, address indexed to, uint256 tokenId, uint256 refund, uint256 feeCharged)`
+Solidity event: `FeeRefunded(bytes32 indexed orderHash, address indexed to, uint256 tokenId, uint256 refund, uint256 indexed feeCharged)`
 
 | Column | Parquet logical type | Description |
 |---|---|---|
@@ -339,7 +339,9 @@ Solidity event: `FeeRefunded(bytes32 indexed orderHash, address indexed to, uint
 | `refund` | `STRING` | uint256 decimal string — amount refunded to the trader, in raw token units |
 | `fee_charged` | `STRING` | uint256 decimal string — net fee retained by the protocol, in raw token units |
 
-Invariant: `refund + fee_charged = order_filled.fee` for the corresponding v1 fill.
+Invariant: `refund + fee_charged = order_filled.fee` for the corresponding v1 fill. Canonical form is `^(0|[1-9][0-9]*)$`.
+
+The producer must emit `fee_charged` as that decimal string. It used to pass the 32-byte indexed topic through as `bytes`; Arrow persist then crashed (issue #15). Landed v3 parquet already stores decimals, so this stays `v3`.
 
 ### NegRiskAdapter
 
@@ -583,4 +585,4 @@ Not exchange-specific.
 
 ## Versioning
 
-This is `v3`. The producer shall not make a material breaking change to the schema or guarantees without incrementing the version.
+This is `v3`. The producer shall not make a material breaking change to the schema or guarantees without incrementing the version. Decoding `fee_charged` as a decimal string (rather than raw topic bytes) matches the schema this version already published; it is not a new dataset.

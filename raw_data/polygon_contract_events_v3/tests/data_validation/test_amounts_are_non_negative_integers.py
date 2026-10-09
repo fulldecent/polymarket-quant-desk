@@ -41,6 +41,8 @@ def test_amounts_are_non_negative_integers(con, ranges):
 
     for table, col in [
         ("fee_charged", "amount"),
+        ("fee_refunded", "fee_charged"),
+        ("fee_refunded", "refund"),
         ("payout_redemption", "payout"),
         ("position_split", "amount"),
         ("positions_merge", "amount"),

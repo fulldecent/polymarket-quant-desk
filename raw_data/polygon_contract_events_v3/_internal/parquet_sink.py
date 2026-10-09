@@ -128,6 +128,7 @@ from lib.atomic_publish import (
 )
 
 from .errors import DuplicateRowError, OperationCancelled, V3Error
+from .fee_charged import sql_poison_predicate
 from .persistence import ProgressCallback
 from .tables import (
     SCRAPE_START_BLOCK,
@@ -733,6 +734,22 @@ def write_partition_files(
                     f"could not count source rows for {contract}/{event} partition {partition_start}: empty result"
                 )
             raw_count = int(raw_row[0])
+
+            if event == "fee_refunded" and raw_count > 0:
+                poison = con.execute(
+                    f"SELECT COUNT(*) FROM {tbl} "
+                    f"WHERE block_number BETWEEN {partition_start} AND {p_end} "
+                    f"AND ({sql_poison_predicate()})"
+                ).fetchone()
+                n_poison = int(poison[0]) if poison else 0
+                if n_poison:
+                    raise V3Error(
+                        f"{contract}/{event} partition {partition_start}: "
+                        f"{n_poison} fee_charged value(s) are not uint256 decimals. "
+                        "The decoder stored the indexed feeCharged topic as 32 raw bytes. "
+                        "Delete the hot DB and rescarpe unsunk blocks. "
+                        "Do not publish this partition."
+                    )
 
             # COPY with DISTINCT ON deduplicates and sorts in one pass.
             copy_sql = (
