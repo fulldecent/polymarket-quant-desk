@@ -20,7 +20,7 @@ Forbidden command-line flags, anywhere in this repo: `--force`, `--skip-errors`,
 
 ## Frontier
 
-The frontier is the highest block whose data is finalized and stable upstream. For raw `polygon_contract_events_v3`, get it from `get_sunk_frontier(RAW)`; the stable partitions are exactly those backed by a `manifests/.../_SUCCESS` marker.
+The frontier is the highest block whose data is finalized and stable upstream. For raw `polygon_contract_events_v4`, get it from `get_sunk_frontier(RAW)`; the stable partitions are exactly those backed by a `manifests/.../_SUCCESS` marker.
 
 - A derived job includes a partition only if `partition_end(k) <= frontier`.
 - Discover the frontier once at startup; never read past it.
@@ -30,7 +30,7 @@ The frontier is the highest block whose data is finalized and stable upstream. F
 
 Partition discovery for a derived dataset is by BLOCK RANGE, not by source-folder existence.
 
-- The start partition is the 10K partition containing the dataset's first relevant block. For Polymarket-wide data this is the partition containing `SCRAPE_START_BLOCK` (`raw_data/polygon_contract_events_v3`).
+- The start partition is the 10K partition containing the dataset's first relevant block. For Polymarket-wide data this is the partition containing `SCRAPE_START_BLOCK` (`raw_data/polygon_contract_events_v4`).
 - Enumerate every 10K partition from the start partition through the highest partition with `partition_end(k) <= frontier`. No gaps are permitted.
 - Every enumerated partition produces an output folder. If the partition has no rows to emit, write a zero-row `data.parquet` with the correct schema plus its `metadata.json`. A missing partition folder is a bug; an empty partition folder is correct and expected.
 - Already-landed partitions (output folder exists) are immutable and skipped. They must not be re-read, re-computed, or shown in progress output.
@@ -45,7 +45,7 @@ Every partition becomes visible atomically.
 
 ## Logical types
 
-Mirror the raw `polygon_contract_events_v3` logical Parquet types so derived columns join cleanly against raw columns and against each other.
+Mirror the raw `polygon_contract_events_v4` logical Parquet types so derived columns join cleanly against raw columns and against each other.
 
 | Dictionary type | Parquet encoding | PyArrow type | Notes |
 |---|---|---|---|
