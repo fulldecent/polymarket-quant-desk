@@ -131,6 +131,11 @@ from .errors import (
     SchemaMismatchError,
     V3Error,
 )
+from .fee_charged import (
+    FEE_REFUNDED_TABLES,
+    reject_poison_table,
+    reject_poison_value,
+)
 from .tables import (
     PARTITION_SIZE_10K,
     SCRAPE_START_BLOCK,
@@ -463,6 +468,7 @@ class HotStore:
 
         # Schema fingerprint check
         self._verify_schema()
+        self._reject_poisoned_fee_charged()
 
     def _verify_schema(self) -> None:
         """Ensure every table from schema.sql exists with the expected columns."""
@@ -487,6 +493,15 @@ class HotStore:
                 raise SchemaMismatchError(f"missing table: {tbl}")
 
         self._column_types = {tbl: dict(cols) for tbl, cols in actual.items()}
+
+    def _reject_poisoned_fee_charged(self) -> None:
+        """Refuse to open a hot DB whose fee_refunded rows are the bytes-as-VARCHAR encodings."""
+        conn = self._conn
+        if conn is None:
+            return
+        for tbl in FEE_REFUNDED_TABLES:
+            if tbl in self._column_types:
+                reject_poison_table(conn, tbl)
 
     def _arrow_type(self, table: str, column: str):
         """Arrow type matching the column's declared type in the hot DB."""
@@ -717,6 +732,12 @@ class HotStore:
                 for (contract, event), rows in rows_by_target.items():
                     if not rows:
                         continue
+                    if event == "fee_refunded":
+                        for row in rows:
+                            reject_poison_value(
+                                row.get("fee_charged"),
+                                where=f"{contract}/fee_refunded block {row.get('block_number')}",
+                            )
                     if stop_event and stop_event.is_set():
                         conn.execute("ROLLBACK")
                         raise OperationCancelled("persist cancelled during insert")

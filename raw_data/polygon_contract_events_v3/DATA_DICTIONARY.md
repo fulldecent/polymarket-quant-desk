@@ -339,7 +339,9 @@ Solidity event: `FeeRefunded(bytes32 indexed orderHash, address indexed to, uint
 | `refund` | `STRING` | uint256 decimal string — amount refunded to the trader, in raw token units |
 | `fee_charged` | `STRING` | uint256 decimal string — net fee retained by the protocol, in raw token units |
 
-Invariant: `refund + fee_charged = order_filled.fee` for the corresponding v1 fill.
+Invariant: `refund + fee_charged = order_filled.fee` for the corresponding v1 fill. Canonical form is `^(0|[1-9][0-9]*)$`.
+
+A producer bug stored the indexed `feeCharged` topic as 32 raw bytes in this VARCHAR. On disk that is either a 32-character NUL-padded UTF-8 string (Arrow persist of values whose big-endian bytes are valid UTF-8, e.g. 0, 8000, 156200) or a DuckDB `\x00…` escape string (row-by-row bind). `TRY_CAST(fee_charged AS HUGEINT)` is NULL. Any scrape that ran that decoder through the v1 fee-module window (~81,270,000–86,120,000) has unusable `fee_refunded` rows: delete the hot DB, do not sink those rows, do not run `fills_v1` on those partitions. Rescarpe unsunk blocks after the decoder emits decimals.
 
 ### NegRiskAdapter
 
