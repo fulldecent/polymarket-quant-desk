@@ -1664,13 +1664,9 @@ def main() -> None:
                         f"  THROTTLED  w:{wid}  HTTP {http_status}  "
                         f"[{from_b:,}-{to_b:,}]"
                     )
-                    # dRPC (and some others) return HTTP 500 for a range that is
-                    # too heavy, not a rate limit. Shrink the span so we do not
-                    # retry the same window forever, and still drop workers /
-                    # add sleep so a 16-wide burst does not livelock.
-                    if http_status in {500, 502} and chunk_span > 1:
-                        planner.record_rejection(blocks=chunk_span)
-                        optimizer.record_rejection()
+                    # 500/502 is overload, not a discovered block-span limit.
+                    # Recording it on the planner closed the span bracket at
+                    # 11 and left the run fetching 10 blocks for hours.
                     optimizer.record_throttled(http_status)
                     _return_chunk(pending_ranges, chunk)
                     _print_message(

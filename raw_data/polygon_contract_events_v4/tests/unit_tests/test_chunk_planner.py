@@ -173,6 +173,21 @@ def test_probing_stays_below_a_refused_span():
     assert planner.next_span(10_000) < 200_000, "never ask again for a size already refused"
 
 
+def test_refusing_one_block_past_proven_span_freezes_there():
+    """HTTP 500 on an 11-block dRPC chunk was recorded as a span refusal after
+    10-block successes. The bracket 10-ok / 11-refused has midpoint 10, so
+    every later request stayed at 10 blocks. Callers must not feed overload
+    500s into record_rejection."""
+    planner = ChunkPlanner()
+    planner.record_success(blocks=10, logs=0)
+
+    charged = planner.record_rejection(blocks=11)
+
+    assert charged == "blocks"
+    assert planner.span_refused == 11
+    assert planner.next_span(10_000) == 10
+
+
 def test_planner_never_returns_a_span_below_one():
     planner = ChunkPlanner()
     planner.record_success(blocks=1, logs=1_000_000)
