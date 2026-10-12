@@ -54,7 +54,9 @@ ENVIRONMENT (all required, set in .env)
                                          ``polygon_contract_events_v4.db`` there
     SCRATCH_DIR                          DuckDB spill; safe to wipe between runs
     POLYGON_CONTRACT_EVENTS_V4_DIR       cold-tier root directory
-    POLYGON_RPC_URL                      Polygon JSON-RPC endpoint
+    POLYGON_RPC_URL                      one or more Polygon JSON-RPC endpoints,
+                                         separated by commas or whitespace. Each
+                                         URL is an independent scrape lane.
 """
 
 from __future__ import annotations
@@ -72,6 +74,7 @@ import time
 import urllib.parse
 from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -189,11 +192,33 @@ _stop_event = threading.Event()
 # Environment loading
 # ---------------------------------------------------------------------------
 
-def _load_environment() -> dict[str, str]:
+def _parse_rpc_urls(raw: str) -> list[str]:
+    """Split ``POLYGON_RPC_URL`` on commas and whitespace. Order-preserving unique.
+
+    JSON-RPC URLs do not contain unencoded commas or spaces, so either delimiter is safe.
+    Duplicate entries (the same URL twice) collapse to one lane.
+    """
+    urls: list[str] = []
+    seen: set[str] = set()
+    for token in raw.replace(",", " ").split():
+        url = token.strip()
+        if len(url) >= 2 and url[0] == url[-1] and url[0] in {'"', "'"}:
+            url = url[1:-1].strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+    return urls
+
+
+def _looks_like_rpc_url(url: str) -> bool:
+    return url.startswith(("http://", "https://"))
+
+
+def _load_environment() -> dict[str, Any]:
     """Read every required env var from the root ``.env`` and validate it.
 
-    Exits the process with a clear message on any missing or invalid value. The returned dict has
-    the env-var name as key and the raw string value (already validated as non-empty) as value.
+    Exits the process with a clear message on any missing or invalid value.
     """
     project_root = Path(__file__).resolve().parent.parent.parent
 
@@ -230,10 +255,22 @@ def _load_environment() -> dict[str, str]:
 
     scratch_dir = require_directory_env("SCRATCH_DIR")
 
+    rpc_urls = _parse_rpc_urls(os.environ["POLYGON_RPC_URL"])
+    if not rpc_urls:
+        sys.exit(
+            "POLYGON_RPC_URL is empty. Set one or more http(s) URLs in .env, "
+            "separated by commas or whitespace."
+        )
+    bad = [url for url in rpc_urls if not _looks_like_rpc_url(url)]
+    if bad:
+        sys.exit(
+            "POLYGON_RPC_URL entries must be http(s) URLs; got: " + ", ".join(bad)
+        )
+
     return {
         "db_path": db_path,
         "cold_root": cold_root,
-        "rpc_url": os.environ["POLYGON_RPC_URL"],
+        "rpc_urls": rpc_urls,
         "scratch_dir": scratch_dir,
     }
 
@@ -378,6 +415,61 @@ def _tuning_suffix(optimizer: EpochOptimizer, planner: ChunkPlanner) -> str:
     return f"  threads {optimizer.params.workers}  max blks/req {max_blks:,}"
 
 
+_SCRAPE_FAILED_GLYPH = Text("✗", style="red")
+
+
+class _ScrapeGlyphColumn(SpinnerColumn):
+    """Spinner while a key is working; a red ✗ once that key is dead."""
+
+    def render(self, task: Task) -> Text:
+        if task.fields.get("failed"):
+            return _SCRAPE_FAILED_GLYPH
+        return super().render(task)
+
+
+def _unique_endpoint_labels(urls: list[str]) -> list[str]:
+    """Masked ``host key`` labels, with `` (2)`` suffixes if two URLs mask the same way."""
+    labels = [_describe_rpc_endpoint(url) for url in urls]
+    counts: dict[str, int] = {}
+    for label in labels:
+        counts[label] = counts.get(label, 0) + 1
+    seen: dict[str, int] = {}
+    unique: list[str] = []
+    for label in labels:
+        if counts[label] == 1:
+            unique.append(label)
+            continue
+        seen[label] = seen.get(label, 0) + 1
+        unique.append(f"{label} ({seen[label]})")
+    return unique
+
+
+def _lane_footer_text(lane: "_RpcLane", *, run_seconds: float) -> str:
+    """Sticky-footer copy for one RPC lane: spinning scrape line, or failed line."""
+    if lane.fatal_reason is not None:
+        return f"Failed {lane.label}  {lane.fatal_reason}"
+    rate = lane.blocks_done / run_seconds if run_seconds > 0 else 0.0
+    return (
+        f"Scraping {lane.label}  {rate:,.0f} blk/s"
+        f"{_tuning_suffix(lane.optimizer, lane.planner)}"
+    )
+
+
+def _fetch_fatal_is_process_wide(result: dict[str, Any]) -> bool:
+    """Decode bugs and missing headers are data integrity; HTTP 401 is one key."""
+    msg = str(result.get("error_message") or "")
+    return msg.startswith("decode failure") or msg.startswith("missing header")
+
+
+def _all_rpc_lanes_fatal(lanes: list["_RpcLane"]) -> bool:
+    return bool(lanes) and all(not lane.live for lane in lanes)
+
+
+def _all_lanes_fatal_message(lanes: list["_RpcLane"]) -> str:
+    parts = [f"{lane.label}: {lane.fatal_reason}" for lane in lanes]
+    return "all RPC endpoints failed: " + "; ".join(parts)
+
+
 # Footer rows, top to bottom. The overall run bar sits at the very bottom.
 _BAR_ORDER = ("partition", "main")
 
@@ -387,6 +479,9 @@ class RichRunStatus:
 
     A row is added when an activity starts and removed when it finishes, so a completed step
     never lingers on screen. Log lines printed through ``console`` scroll above the footer.
+
+    RPC lanes are an exception: each endpoint keeps a row for the whole scrape. A live lane
+    spins; a failed lane shows a red ✗ and stays put so the operator can see which key died.
     """
 
     def __init__(self) -> None:
@@ -395,18 +490,29 @@ class RichRunStatus:
             TextColumn("{task.description}"),
             console=console,
         )
+        self._scrape = Progress(
+            _ScrapeGlyphColumn(),
+            TextColumn("{task.description}"),
+            console=console,
+        )
         self._bars: dict[str, Progress] = {}
         self._live = Live(console=console, refresh_per_second=8, transient=True)
         self._lock = threading.Lock()
+        self._started = False
         self._spinner_tasks: dict[str, TaskID] = {}
+        self._scrape_tasks: dict[str, TaskID] = {}
         self._bar_tasks: dict[str, TaskID] = {}
         self._bar_descriptions: dict[str, str] = {}
 
     def start(self) -> None:
+        self._started = True
         self._live.start()
+        with self._lock:
+            self._refresh()
 
     def stop(self) -> None:
         self._live.stop()
+        self._started = False
 
     def spinner(self, key: str, description: str) -> None:
         """Show an indeterminate row for ``key``, replacing any earlier text for it."""
@@ -416,6 +522,26 @@ class RichRunStatus:
                 task_id = self._spinners.add_task(description, total=None)
                 self._spinner_tasks[key] = task_id
             self._spinners.update(task_id, description=description)
+            self._refresh()
+
+    def scrape(self, key: str, description: str, *, failed: bool = False) -> None:
+        """Show one RPC-lane row. Failed rows keep a stopped ✗ instead of a spinner."""
+        with self._lock:
+            task_id = self._scrape_tasks.get(key)
+            if task_id is None:
+                task_id = self._scrape.add_task(
+                    description, total=None, failed=failed
+                )
+                self._scrape_tasks[key] = task_id
+            else:
+                task = next(t for t in self._scrape.tasks if t.id == task_id)
+                if task.fields.get("failed") and not failed:
+                    # A dead key stays dead; do not resume its spinner.
+                    pass
+                else:
+                    self._scrape.update(
+                        task_id, description=description, failed=failed
+                    )
             self._refresh()
 
     def bar(self, key: str, description: str, completed: int, total: int) -> None:
@@ -471,11 +597,15 @@ class RichRunStatus:
         )
 
     def _refresh(self) -> None:
+        if not self._started:
+            return
         rows: list[Progress] = []
         if self._spinners.tasks:
             rows.append(self._spinners)
+        if self._scrape.tasks:
+            rows.append(self._scrape)
         rows.extend(self._bars[key] for key in _BAR_ORDER if key in self._bars)
-        self._live.update(Group(*rows))
+        self._live.update(Group(*rows) if rows else "")
 
 
 status_ui = RichRunStatus()
@@ -778,6 +908,45 @@ def _return_chunk(ranges: list[tuple[int, int]], chunk: tuple[int, int]) -> None
         ranges.insert(0, chunk)
 
 
+def _make_rpc_client(url: str) -> RpcClient:
+    return RpcClient(
+        url,
+        config=RpcClientConfig(
+            call_timeout_sec=RPC_CALL_TIMEOUT_SEC,
+            block_number_timeout_sec=RPC_BLOCK_NUMBER_TIMEOUT_SEC,
+            max_retries=RPC_MAX_RETRIES,
+            retry_backoff_base_sec=RPC_BACKOFF_BASE_SEC,
+        ),
+        stop_event=_stop_event,
+    )
+
+
+@dataclass
+class _RpcLane:
+    """One JSON-RPC endpoint: its own planner, optimizer, workers, and footer line."""
+
+    index: int
+    url: str
+    label: str
+    client: RpcClient
+    planner: ChunkPlanner = field(default_factory=ChunkPlanner)
+    optimizer: EpochOptimizer = field(default_factory=EpochOptimizer)
+    pool: ThreadPoolExecutor | None = None
+    futures: dict[Future[dict], tuple[int, int]] = field(default_factory=dict)
+    fatal_reason: str | None = None
+    probe_in_flight: tuple[int, int] | None = None
+    draining_epoch: bool = False
+    blocks_done: int = 0
+
+    @property
+    def live(self) -> bool:
+        return self.fatal_reason is None
+
+    @property
+    def spinner_key(self) -> str:
+        return f"scrape:{self.index}"
+
+
 # ---------------------------------------------------------------------------
 # Sink orchestration
 # ---------------------------------------------------------------------------
@@ -972,6 +1141,7 @@ def _print_banner(
     cold_root: str,
     scratch_dir: str,
     log_path: Path,
+    rpc_labels: list[str],
     sunk_frontier: int,
     loaded_frontier: int,
     chain_head: int,
@@ -991,8 +1161,11 @@ def _print_banner(
         f"raw:                  {cold_root}",
         f"scratch:              {scratch_dir}",
         f"log:                  {log_path}",
-        "",
+        f"rpc endpoints:        {len(rpc_labels)}",
     ]
+    for label in rpc_labels:
+        banner_lines.append(f"rpc:                  {label}")
+    banner_lines.append("")
     if sunk_frontier <= SCRAPE_START_BLOCK - 1:
         banner_lines.append("sunk frontier:        none")
     else:
@@ -1144,30 +1317,70 @@ def main() -> None:
     status_ui.spinner("head", "Querying chain head")
     status_ui.spinner("startup", "Opening hot database")
 
-    rpc_client = RpcClient(
-        env["rpc_url"],
-        config=RpcClientConfig(
-            call_timeout_sec=RPC_CALL_TIMEOUT_SEC,
-            block_number_timeout_sec=RPC_BLOCK_NUMBER_TIMEOUT_SEC,
-            max_retries=RPC_MAX_RETRIES,
-            retry_backoff_base_sec=RPC_BACKOFF_BASE_SEC,
-        ),
-        stop_event=_stop_event,
-    )
+    rpc_urls: list[str] = env["rpc_urls"]
+    rpc_labels = _unique_endpoint_labels(rpc_urls)
+    lanes: list[_RpcLane] = [
+        _RpcLane(
+            index=i,
+            url=url,
+            label=rpc_labels[i],
+            client=_make_rpc_client(url),
+        )
+        for i, url in enumerate(rpc_urls)
+    ]
+
+    def _fail_lane(lane: _RpcLane, reason: str) -> bool:
+        """Mark one endpoint dead. Returns True if every endpoint is now dead."""
+        if lane.fatal_reason is None:
+            lane.fatal_reason = reason
+            _print_message(f"FATAL {lane.label}: {reason}")
+            status_ui.scrape(
+                lane.spinner_key,
+                _lane_footer_text(lane, run_seconds=time.monotonic() - run_start),
+                failed=True,
+            )
+        return _all_rpc_lanes_fatal(lanes)
 
     def _query_chain_head(*, label: str = "Querying chain head") -> int:
-        def _on_retry(attempt: int, attempts: int, status: str, wait: float) -> None:
-            _print_message(
-                f"  chain head {attempt}/{attempts}  {status}  retry in {wait:.0f}s"
-            )
-            status_ui.spinner("head", f"{label} {attempt + 1}/{attempts}")
+        last_errors: list[str] = []
+        for lane in lanes:
+            if not lane.live:
+                continue
 
-        status_ui.spinner("head", f"{label} 1/{CHAIN_HEAD_ATTEMPTS}")
-        return fetch_block_number_with_retries(
-            rpc_client.get_block_number,
-            attempts=CHAIN_HEAD_ATTEMPTS,
-            on_retry=_on_retry,
-            is_stop=_stop_event.is_set,
+            def _on_retry(
+                attempt: int,
+                attempts: int,
+                status: str,
+                wait: float,
+                *,
+                _lane: _RpcLane = lane,
+            ) -> None:
+                _print_message(
+                    f"  chain head {attempt}/{attempts}  {_lane.label}  "
+                    f"{status}  retry in {wait:.0f}s"
+                )
+                status_ui.spinner(
+                    "head", f"{label} {_lane.label} {attempt + 1}/{attempts}"
+                )
+
+            status_ui.spinner(
+                "head", f"{label} {lane.label} 1/{CHAIN_HEAD_ATTEMPTS}"
+            )
+            try:
+                return fetch_block_number_with_retries(
+                    lane.client.get_block_number,
+                    attempts=CHAIN_HEAD_ATTEMPTS,
+                    on_retry=_on_retry,
+                    is_stop=_stop_event.is_set,
+                )
+            except OperationCancelled:
+                raise
+            except Exception as e:  # noqa: BLE001
+                reason = str(e)
+                last_errors.append(f"{lane.label}: {reason}")
+                _fail_lane(lane, reason)
+        raise RuntimeError(
+            "; ".join(last_errors) if last_errors else "no live RPC endpoints"
         )
 
     head_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="startup-head")
@@ -1175,8 +1388,6 @@ def main() -> None:
 
     store: HotStore | None = None
     sink: _SinkOrchestrator | None = None
-    rpc_pool: ThreadPoolExecutor | None = None
-    rpc_futures: dict[Future[dict], tuple[int, int]] = {}
 
     fatal_reason: str | None = None
     system_exit_requested = False
@@ -1346,6 +1557,8 @@ def main() -> None:
         # the scrape. Any failure is fatal.
         try:
             chain_head = head_future.result()
+        except OperationCancelled:
+            raise KeyboardInterrupt
         except Exception as e:  # noqa: BLE001
             sys.exit(
                 f"FATAL: could not read chain head "
@@ -1377,6 +1590,7 @@ def main() -> None:
             cold_root=env["cold_root"],
             scratch_dir=env["scratch_dir"],
             log_path=log_path,
+            rpc_labels=[lane.label for lane in lanes],
             sunk_frontier=sunk_frontier,
             loaded_frontier=loaded_frontier,
             chain_head=chain_head,
@@ -1406,37 +1620,33 @@ def main() -> None:
             )
             return
 
-        # --- Set up the optimizer and work queue --------------------
-        optimizer = EpochOptimizer()
-        planner = ChunkPlanner()
-        endpoint_label = _describe_rpc_endpoint(env["rpc_url"])
+        # --- Set up per-endpoint planners and the shared work queue -
         # Ranges still to scrape, ascending. Chunks are carved off the front as workers free up,
-        # so each request is sized for the density where it actually lands.
+        # so each request is sized for the density where it actually lands. Each RPC URL has its
+        # own planner, optimizer and worker pool; they pull disjoint chunks from this queue.
         pending_ranges: list[tuple[int, int]] = list(gaps)
         chunk_failures: dict[tuple[int, int], int] = {}
-        draining_epoch = False
-        probe_in_flight: tuple[int, int] | None = None
 
-        # Sized to the safety cap; the optimizer decides how many of these threads are ever busy.
-        rpc_pool = ThreadPoolExecutor(
-            max_workers=MAX_WORKERS,
-            thread_name_prefix="rpc",
-        )
+        def _in_flight() -> bool:
+            return any(lane.futures for lane in lanes)
 
-        def _submit_one(chunk: tuple[int, int]) -> bool:
-            """Submit one chunk. Returns False on call-count limit."""
+        def _any_draining() -> bool:
+            return any(lane.live and lane.draining_epoch for lane in lanes)
+
+        def _submit_one(lane: _RpcLane, chunk: tuple[int, int]) -> bool:
+            """Submit one chunk on ``lane``. Returns False on call-count limit."""
             nonlocal calls_made
-            if _stop_event.is_set():
+            if _stop_event.is_set() or not lane.live or lane.pool is None:
                 return False
             if args.max_calls is not None and calls_made >= args.max_calls:
                 return False
-            fut = rpc_pool.submit(
+            fut = lane.pool.submit(
                 _fetch_range,
                 from_block=chunk[0], to_block=chunk[1],
-                rpc_client=rpc_client,
-                sleep_after_response_sec=optimizer.params.sleep_after_response_sec,
+                rpc_client=lane.client,
+                sleep_after_response_sec=lane.optimizer.params.sleep_after_response_sec,
             )
-            rpc_futures[fut] = chunk
+            lane.futures[fut] = chunk
             calls_made += 1
             return True
 
@@ -1456,53 +1666,89 @@ def main() -> None:
             status_ui.bar(
                 "main", "Total progress", min(blocks_done, total_target), total_target
             )
-            if rpc_futures:
-                run_seconds = time.monotonic() - run_start
-                rate = blocks_done / run_seconds if run_seconds > 0 else 0.0
-                status_ui.spinner(
-                    "scrape",
-                    f"Scraping {endpoint_label}  {rate:,.0f} blk/s"
-                    f"{_tuning_suffix(optimizer, planner)}",
+            run_seconds = time.monotonic() - run_start
+            for lane in lanes:
+                status_ui.scrape(
+                    lane.spinner_key,
+                    _lane_footer_text(lane, run_seconds=run_seconds),
+                    failed=lane.fatal_reason is not None,
                 )
-            else:
-                status_ui.clear("scrape")
 
         def _top_up_in_flight() -> None:
-            """Fill the in-flight set up to the optimizer's worker count.
+            """Fill each live lane up to its optimizer's worker count.
 
-            Submits nothing while the epoch is draining, so the drain can actually finish.
+            Round-robins so a slow key does not keep every early block. Submits nothing on a
+            lane that is draining an epoch, so that drain can actually finish.
             """
-            nonlocal probe_in_flight
-            if draining_epoch:
+            if _stop_event.is_set():
                 return
-            while pending_ranges and len(rpc_futures) < optimizer.params.workers:
-                budget = optimizer.params.result_budget
-                # Only one request at a time may try a span beyond proven ground, so a refusal
-                # costs one request instead of every request currently in flight.
-                probing = not probe_in_flight and planner.would_probe(budget)
-                span = planner.next_span(budget, probe=probing)
-                chunk = _take_chunk(pending_ranges, span)
-                if not _submit_one(chunk):
-                    _return_chunk(pending_ranges, chunk)
-                    return
-                if probing:
-                    probe_in_flight = chunk
+            live = [
+                lane
+                for lane in lanes
+                if lane.live and not lane.draining_epoch and lane.pool is not None
+            ]
+            if not live:
+                return
+            progressed = True
+            while pending_ranges and progressed:
+                progressed = False
+                for lane in live:
+                    if not pending_ranges:
+                        return
+                    if len(lane.futures) >= lane.optimizer.params.workers:
+                        continue
+                    budget = lane.optimizer.params.result_budget
+                    # Only one request at a time per lane may try a span beyond proven
+                    # ground, so a refusal costs one request instead of every request
+                    # currently in flight on that key.
+                    probing = (
+                        lane.probe_in_flight is None and lane.planner.would_probe(budget)
+                    )
+                    span = lane.planner.next_span(budget, probe=probing)
+                    chunk = _take_chunk(pending_ranges, span)
+                    if not _submit_one(lane, chunk):
+                        _return_chunk(pending_ranges, chunk)
+                        return
+                    if probing:
+                        lane.probe_in_flight = chunk
+                    progressed = True
 
-        optimizer.start_epoch()
+        for lane in lanes:
+            if lane.live:
+                lane.pool = ThreadPoolExecutor(
+                    max_workers=MAX_WORKERS,
+                    thread_name_prefix=f"rpc{lane.index}",
+                )
+                lane.optimizer.start_epoch()
+                status_ui.scrape(
+                    lane.spinner_key,
+                    _lane_footer_text(lane, run_seconds=0.0),
+                )
+            else:
+                status_ui.scrape(
+                    lane.spinner_key,
+                    _lane_footer_text(lane, run_seconds=0.0),
+                    failed=True,
+                )
+
         _top_up_in_flight()
-        if not rpc_futures:
-            fatal_reason = (
-                "No work could be submitted at startup (call-count limit hit "
-                "before scraping began?)."
-            )
+        if not _in_flight():
+            if _all_rpc_lanes_fatal(lanes):
+                fatal_reason = _all_lanes_fatal_message(lanes)
+            else:
+                fatal_reason = (
+                    "No work could be submitted at startup (call-count limit hit "
+                    "before scraping began?)."
+                )
             _print_message(f"FATAL: {fatal_reason}")
             return
 
         # --- Main loop ----------------------------------------------
         while not _stop_event.is_set() and sink.fatal_error is None:
-            if rpc_futures:
+            all_futs = [fut for lane in lanes for fut in lane.futures]
+            if all_futs:
                 done, _ = concurrent.futures.wait(
-                    rpc_futures,
+                    all_futs,
                     timeout=POLL_TIMEOUT_SEC,
                     return_when=concurrent.futures.FIRST_COMPLETED,
                 )
@@ -1520,12 +1766,14 @@ def main() -> None:
 
             _refresh_bars()
 
+            process_fatal = False
             for fut in done:
-                chunk = rpc_futures.pop(fut)
+                lane = next(ln for ln in lanes if fut in ln.futures)
+                chunk = lane.futures.pop(fut)
                 from_b, to_b = chunk
                 chunk_span = to_b - from_b + 1
-                if probe_in_flight == chunk:
-                    probe_in_flight = None
+                if lane.probe_in_flight == chunk:
+                    lane.probe_in_flight = None
                 try:
                     result = fut.result()
                 except BaseException as e:  # noqa: BLE001
@@ -1538,6 +1786,7 @@ def main() -> None:
                     )
                     _print_message(f"FATAL: {fatal_reason}")
                     _stop_event.set()
+                    process_fatal = True
                     break
 
                 status = result["status"]
@@ -1569,6 +1818,7 @@ def main() -> None:
                         fatal_reason = f"duplicate event in [{from_b:,}-{to_b:,}]: {e}"
                         _print_message(f"FATAL: {fatal_reason}")
                         _stop_event.set()
+                        process_fatal = True
                         break
                     except (ValueError, V4Error) as e:
                         # If we are already shutting down, the DuckDB transaction was almost
@@ -1584,20 +1834,26 @@ def main() -> None:
                         )
                         _print_message(f"FATAL: {fatal_reason}")
                         _stop_event.set()
+                        process_fatal = True
                         break
 
                     events_inserted += persist_result.rows_inserted
                     blocks_done += chunk_span
-                    optimizer.record_blocks(chunk_span)
-                    planner.record_success(blocks=chunk_span, logs=raw_log_count)
-                    if optimizer.record_ok(
+                    lane.blocks_done += chunk_span
+                    lane.optimizer.record_blocks(chunk_span)
+                    lane.planner.record_success(blocks=chunk_span, logs=raw_log_count)
+                    if lane.optimizer.record_ok(
                         blocks=chunk_span, logs=raw_log_count, elapsed_sec=elapsed_s
                     ):
                         _print_message(
-                            f"Scraping {endpoint_label} updating speed"
-                            f"{_tuning_suffix(optimizer, planner)}"
+                            f"Scraping {lane.label} updating speed"
+                            f"{_tuning_suffix(lane.optimizer, lane.planner)}"
                         )
-                        _log_event("ramp", optimizer.params.describe())
+                        _log_event(
+                            "ramp",
+                            lane.optimizer.params.describe(),
+                            endpoint=lane.label,
+                        )
                     _refresh_bars()
                     sf = store.get_sunk_frontier()
 
@@ -1626,11 +1882,11 @@ def main() -> None:
                 elif status == "split":
                     elapsed_s = float(result["elapsed_sec"])
                     wid = int(result["wid"])
-                    charged = planner.record_rejection(blocks=chunk_span)
-                    optimizer.record_rejection()
+                    charged = lane.planner.record_rejection(blocks=chunk_span)
+                    lane.optimizer.record_rejection()
                     _print_message(
-                        f"  REFUSED  w:{wid}  blks:{chunk_span:,}  "
-                        f"[{from_b:,}-{to_b:,}]  too many {charged}; {planner.describe()}"
+                        f"  REFUSED  {lane.label}  w:{wid}  blks:{chunk_span:,}  "
+                        f"[{from_b:,}-{to_b:,}]  too many {charged}; {lane.planner.describe()}"
                     )
                     if chunk_span <= 1:
                         # A single block cannot be split further. Leave it out of
@@ -1646,50 +1902,67 @@ def main() -> None:
                     elapsed_s = float(result["elapsed_sec"])
                     wid = int(result["wid"])
                     _print_message(
-                        f"  TMOUT  w:{wid}  blks:{chunk_span:,}  "
+                        f"  TMOUT  {lane.label}  w:{wid}  blks:{chunk_span:,}  "
                         f"[{from_b:,}-{to_b:,}]  {elapsed_s:.1f}s"
                     )
                     _return_chunk(pending_ranges, chunk)
-                    optimizer.record_timeout()
+                    lane.optimizer.record_timeout()
                     _print_message(
-                        f"Scraping {endpoint_label} backing off"
-                        f"{_tuning_suffix(optimizer, planner)}"
+                        f"Scraping {lane.label} backing off"
+                        f"{_tuning_suffix(lane.optimizer, lane.planner)}"
                     )
-                    _log_event("backoff", optimizer.params.describe())
+                    _log_event(
+                        "backoff",
+                        lane.optimizer.params.describe(),
+                        endpoint=lane.label,
+                    )
 
                 elif status == "throttled":
                     http_status = result.get("http_status")
                     wid = int(result["wid"])
                     _print_message(
-                        f"  THROTTLED  w:{wid}  HTTP {http_status}  "
+                        f"  THROTTLED  {lane.label}  w:{wid}  HTTP {http_status}  "
                         f"[{from_b:,}-{to_b:,}]"
                     )
                     # 500/502 is overload, not a discovered block-span limit.
                     # Recording it on the planner closed the span bracket at
                     # 11 and left the run fetching 10 blocks for hours.
-                    optimizer.record_throttled(http_status)
+                    lane.optimizer.record_throttled(http_status)
                     _return_chunk(pending_ranges, chunk)
                     _print_message(
-                        f"Scraping {endpoint_label} backing off"
-                        f"{_tuning_suffix(optimizer, planner)}"
+                        f"Scraping {lane.label} backing off"
+                        f"{_tuning_suffix(lane.optimizer, lane.planner)}"
                     )
-                    _log_event("backoff", optimizer.params.describe())
+                    _log_event(
+                        "backoff",
+                        lane.optimizer.params.describe(),
+                        endpoint=lane.label,
+                    )
 
                 elif status == "fatal":
-                    fatal_reason = (
-                        f"fatal error on [{from_b:,}-{to_b:,}]: "
-                        f"{result.get('error_message', '')}"
-                    )
-                    _print_message(f"FATAL: {fatal_reason}")
-                    _stop_event.set()
-                    break
+                    err = str(result.get("error_message", ""))
+                    if _fetch_fatal_is_process_wide(result):
+                        fatal_reason = (
+                            f"fatal error on [{from_b:,}-{to_b:,}]: {err}"
+                        )
+                        _print_message(f"FATAL: {fatal_reason}")
+                        _stop_event.set()
+                        process_fatal = True
+                        break
+                    _return_chunk(pending_ranges, chunk)
+                    if _fail_lane(lane, err):
+                        fatal_reason = _all_lanes_fatal_message(lanes)
+                        _print_message(f"FATAL: {fatal_reason}")
+                        _stop_event.set()
+                        process_fatal = True
+                        break
 
                 elif status == "error":
                     err_msg = str(result.get("error_message", ""))
                     wid = int(result["wid"])
                     elapsed_s = float(result["elapsed_sec"])
                     _print_message(
-                        f"  ERROR  w:{wid}  blks:{chunk_span:,}  "
+                        f"  ERROR  {lane.label}  w:{wid}  blks:{chunk_span:,}  "
                         f"[{from_b:,}-{to_b:,}]  {elapsed_s:.1f}s  err: {err_msg}"
                     )
                     chunk_failures[chunk] = chunk_failures.get(chunk, 0) + 1
@@ -1710,19 +1983,29 @@ def main() -> None:
                     )
                     _print_message(f"FATAL: {fatal_reason}")
                     _stop_event.set()
+                    process_fatal = True
                     break
+
+            if process_fatal:
+                break
 
             # --- Epoch boundary -------------------------------------
             # Stop submitting at the deadline, let in-flight work drain, then score the epoch: the
-            # drain belongs inside the measurement it was caused by.
-            if not draining_epoch and optimizer.should_end_epoch():
-                draining_epoch = True
-            if draining_epoch and not rpc_futures:
-                report = optimizer.end_epoch()
-                _print_message(f"  epoch: {report.describe()}")
-                _print_message(f"  next:  {report.next_params.describe()}  {planner.describe()}")
-                draining_epoch = False
-                optimizer.start_epoch()
+            # drain belongs inside the measurement it was caused by. Each key has its own clock.
+            for lane in lanes:
+                if not lane.live:
+                    continue
+                if not lane.draining_epoch and lane.optimizer.should_end_epoch():
+                    lane.draining_epoch = True
+                if lane.draining_epoch and not lane.futures:
+                    report = lane.optimizer.end_epoch()
+                    _print_message(f"  epoch  {lane.label}: {report.describe()}")
+                    _print_message(
+                        f"  next   {lane.label}: {report.next_params.describe()}  "
+                        f"{lane.planner.describe()}"
+                    )
+                    lane.draining_epoch = False
+                    lane.optimizer.start_epoch()
 
             # Top up in-flight work and run sink bookkeeping again.
             _top_up_in_flight()
@@ -1733,7 +2016,7 @@ def main() -> None:
                 _stop_event.set()
                 break
 
-            if pending_ranges and not rpc_futures and not draining_epoch:
+            if pending_ranges and not _in_flight() and not _any_draining():
                 # Nothing could be submitted, so the call budget is spent.
                 if args.max_calls is not None:
                     _print_message(
@@ -1743,15 +2026,21 @@ def main() -> None:
 
             # If the queue is empty and nothing is in flight, check the chain head and either
             # rebuild the queue or stop.
-            if not pending_ranges and not rpc_futures and not draining_epoch:
+            if not pending_ranges and not _in_flight() and not _any_draining():
                 status_ui.spinner("head", "Rechecking chain head")
                 try:
                     new_head = _query_chain_head(label="Rechecking chain head")
-                except (RPCError, RuntimeError, OperationCancelled) as e:
-                    fatal_reason = (
-                        f"failed to recheck chain head "
-                        f"({CHAIN_HEAD_ATTEMPTS}/{CHAIN_HEAD_ATTEMPTS}): {e}"
-                    )
+                except OperationCancelled:
+                    _stop_event.set()
+                    break
+                except (RPCError, RuntimeError) as e:
+                    if _all_rpc_lanes_fatal(lanes):
+                        fatal_reason = _all_lanes_fatal_message(lanes)
+                    else:
+                        fatal_reason = (
+                            f"failed to recheck chain head "
+                            f"({CHAIN_HEAD_ATTEMPTS}/{CHAIN_HEAD_ATTEMPTS}): {e}"
+                        )
                     _print_message(f"FATAL: {fatal_reason}")
                     _stop_event.set()
                     break
@@ -1797,8 +2086,10 @@ def main() -> None:
                 total_target = max(blocks_done + new_gap_blocks, 1)
                 status_ui.clear("drain")
                 _top_up_in_flight()
-                if not rpc_futures:
-                    if args.max_calls is not None and calls_made >= args.max_calls:
+                if not _in_flight():
+                    if _all_rpc_lanes_fatal(lanes):
+                        fatal_reason = _all_lanes_fatal_message(lanes)
+                    elif args.max_calls is not None and calls_made >= args.max_calls:
                         fatal_reason = (
                             f"--max-calls limit ({args.max_calls}) reached "
                             f"while {new_gap_blocks:,} blocks still behind."
@@ -1839,11 +2130,12 @@ def main() -> None:
         # 0. Stop the startup head-check executor if it is still alive.
         head_executor.shutdown(wait=False, cancel_futures=True)
 
-        # 1. Cancel anything we can in the RPC pool.
-        if rpc_pool is not None:
-            for f in list(rpc_futures):
-                f.cancel()
-            rpc_pool.shutdown(wait=False, cancel_futures=True)
+        # 1. Cancel anything we can in each RPC pool.
+        for lane in lanes:
+            for fut in list(lane.futures):
+                fut.cancel()
+            if lane.pool is not None:
+                lane.pool.shutdown(wait=False, cancel_futures=True)
 
         # 2. Let the sink pool finish what it has started, then commit every result that lands in
         #    frontier order. We do NOT submit new sink work past this point; any incomplete
@@ -1872,10 +2164,12 @@ def main() -> None:
                 pass
             else:
                 final_chain_head: int | None = None
-                try:
-                    final_chain_head = rpc_client.get_block_number()
-                except Exception:
-                    final_chain_head = None
+                for lane in list(lanes):
+                    try:
+                        final_chain_head = lane.client.get_block_number()
+                        break
+                    except Exception:
+                        continue
 
                 head_for_output = final_chain_head if final_chain_head is not None else chain_head
                 elapsed = time.monotonic() - run_start
@@ -1901,11 +2195,12 @@ def main() -> None:
             except Exception:  # noqa: BLE001
                 pass
 
-        # 6. Close the RPC client (per-thread connections — main thread only).
-        try:
-            rpc_client.close()
-        except Exception:  # noqa: BLE001
-            pass
+        # 6. Close each RPC client (per-thread connections — main thread only).
+        for lane in lanes:
+            try:
+                lane.client.close()
+            except Exception:  # noqa: BLE001
+                pass
 
         # 7. Close the run log last so shutdown and the summary are recorded.
         global _run_logger

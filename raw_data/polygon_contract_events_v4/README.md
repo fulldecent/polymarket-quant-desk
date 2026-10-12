@@ -14,6 +14,11 @@ python raw_data/polygon_contract_events_v4/main.py
 Run it again whenever you want fresh data. It resumes from the sunk frontier, so an interrupted
 run costs you nothing beyond the partition it was working on.
 
+`POLYGON_RPC_URL` accepts one or more HTTPS JSON-RPC URLs, separated by commas or whitespace.
+Each URL is an independent scrape lane with its own planner, worker pool, and sticky-footer line.
+A dead key (HTTP 401, chain-head exhaustion) shows a red ✗ and the others keep going. The process
+exits only when every URL has failed.
+
 These options exist, and none of them is needed for a normal run:
 
 | Option | Default | What it does |
@@ -42,8 +47,9 @@ So the scraper measures instead of assuming:
   hill-climbed on blocks per second.
 
 HTTP 429 and 5xx responses are treated as back-pressure: concurrency drops and a pause is
-introduced between requests. Permanent errors such as a bad API key stop the run immediately
-rather than burning through the backlog.
+introduced between requests. Permanent errors such as a bad API key fail that URL's lane rather
+than burning through the backlog; remaining keys keep scraping. Decode bugs, persist failures,
+and sink failures still stop the whole run.
 
 Each run writes a timestamped log to `logs/`, including every parameter change and epoch score.
 
