@@ -45,6 +45,12 @@ Skipping the DuckDB-level UNIQUE constraint avoids index-maintenance cost on the
 
 This is specified in `../DATA_DICTIONARY.md`.
 
+`cleanup_temp_dirs_after_frontier` runs at scraper startup **before** manifest roll-forward. It
+deletes incomplete event folders above the frontier (parquet without metadata, mixed targets,
+leftover temps) so `write_partition_files` can redo that 10K from hot. A complete unpublished 10K
+is left in place for roll-forward to publish `_SUCCESS`. Folders at or below the frontier are
+never deleted.
+
 ## Concurrency model
 
 The library is designed for one orchestrator (main thread) plus one or more sink workers (background threads in an executor). The orchestrator owns the `HotStore`; the workers never touch it.

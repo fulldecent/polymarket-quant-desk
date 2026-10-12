@@ -1417,9 +1417,9 @@ def main() -> None:
             sys.exit(f"Could not open hot DB at {env['db_path']}: {e}")
 
         # --- Read manifest frontier --------------------------------
-        # Temp files under already-sunk partitions are not second-guessed: a published manifest
-        # means that partition is final. An interrupted write is dropped when the partition it
-        # belongs to is inspected.
+        # A published manifest means that partition is final. Incomplete event folders above the
+        # frontier are unpublished; cleanup below removes them before roll-forward, which
+        # fail-fasts on a two-file violation.
         status_ui.spinner("startup", "Reading manifest frontier")
 
         def _frontier_progress(*, op, phase, rows_done=None, rows_total=None,
@@ -1438,6 +1438,33 @@ def main() -> None:
             sys.exit(f"FATAL: manifest frontier read failed: {e}")
 
         _print_message(f"Manifest frontier read complete: frontier={manifest_frontier:,}.")
+
+        # --- Cleanup unpublished leftovers above the frontier -------
+        # Must run before roll-forward. Incomplete 10K folders (parquet without metadata, mixed
+        # targets) are unpublished junk; complete two-file 10Ks stay so roll-forward can publish
+        # _SUCCESS.
+        status_ui.spinner("startup", "Cleaning temporary files at the frontier")
+
+        def _cleanup_progress(*, op, phase, rows_done=None, rows_total=None,
+                              elapsed_ms=None, message="", partition=None):
+            if partition is not None:
+                status_ui.spinner(
+                    "startup",
+                    f"Cleaning temporary files for partition {mask_partition(partition)}",
+                )
+
+        try:
+            cleaned_manifest = cleanup_temp_dirs_after_frontier(
+                env["cold_root"],
+                progress_cb=_cleanup_progress,
+            )
+        except V4Error as e:
+            sys.exit(f"FATAL: post-frontier cleanup failed: {e}")
+
+        _print_message(
+            "Post-frontier cleanup complete: "
+            f"removed={cleaned_manifest:,} path(s)."
+        )
 
         # --- Roll manifest frontier forward -------------------------
         status_ui.spinner("startup", "Touching up sunk partitions")
@@ -1463,30 +1490,6 @@ def main() -> None:
         _print_message(
             "Manifest roll-forward complete: "
             f"published={published_manifests:,} partition(s)."
-        )
-
-        # --- Cleanup after frontier ---------------------------------
-        status_ui.spinner("startup", "Cleaning temporary files at the frontier")
-
-        def _cleanup_progress(*, op, phase, rows_done=None, rows_total=None,
-                              elapsed_ms=None, message="", partition=None):
-            if partition is not None:
-                status_ui.spinner(
-                    "startup",
-                    f"Cleaning temporary files for partition {mask_partition(partition)}",
-                )
-
-        try:
-            cleaned_manifest = cleanup_temp_dirs_after_frontier(
-                env["cold_root"],
-                progress_cb=_cleanup_progress,
-            )
-        except V4Error as e:
-            sys.exit(f"FATAL: post-frontier cleanup failed: {e}")
-
-        _print_message(
-            "Post-frontier cleanup complete: "
-            f"removed={cleaned_manifest:,} path(s)."
         )
 
         manifest_frontier = get_manifest_frontier(env["cold_root"])

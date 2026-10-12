@@ -39,14 +39,19 @@ Orchestration contract — the writer is a pure cold-tier producer:
     * This function can run on any thread (typically a worker in a
       ``concurrent.futures.ThreadPoolExecutor``) without coordinating
       with the orchestrator beyond standard Future / queue handoff.
-    * Crash recovery is simple: if this function crashes or its
-      return value is lost, the orchestrator never calls
-      ``commit_sink`` for that partition. The hot DB is unchanged.
-      Restart, re-issue the partition to a worker, redo the work.
-      For the corner case where the function succeeded but the
-      orchestrator died before the commit, ``HotStore.reconcile_with_cold_tier``
-      at next startup will mark the partition as sunk based on the
-      Parquet files on disk.
+    * Crash recovery: if this function returns unsuccessfully, or the
+      process dies before it returns, the orchestrator never calls
+      ``commit_sink`` for that partition. The hot DB still holds the
+      rows. Restart runs ``cleanup_temp_dirs_after_frontier`` (incomplete
+      unpublished 10K folders are unpublished junk) then re-issues the
+      partition. A caught phase-2 or phase-3 failure also unlinks every
+      ``data.parquet`` and ``metadata.json`` this call created.
+      If the function succeeded and the orchestrator died after
+      ``publish_manifest`` but before ``commit_sink``,
+      ``HotStore.reconcile_with_cold_tier`` at next startup marks the
+      partition sunk from the manifest. If it died after a complete
+      write but before ``publish_manifest``, roll-forward publishes
+      ``_SUCCESS`` because every expected target already has both files.
 
 Frontier ordering contract:
 
@@ -81,11 +86,14 @@ Sink workflow (one call to ``write_partition_files``):
      ``DuplicateRowError`` — a fatal logic error.
   4. After every temp file is written, rename them all into place
      via ``os.replace`` (atomic per file).
-  5. Close the read-only connection. Return the
+  5. Write ``metadata.json`` next to each renamed parquet.
+  6. Close the read-only connection. Return the
      ``PartitionWriteResult``.
 
-  On any phase-2-or-earlier failure, every temp file written by this
-  call is removed. The cold tier is unchanged on failure.
+  On any failure, every temp file written by this call is removed, and
+  every ``data.parquet`` / ``metadata.json`` this call created is unlinked.
+  The hot DB is unchanged. Incomplete folders above the frontier that
+  survive a hard kill are removed at next startup.
 
 Why the COPY runs on a per-call read-only connection (not on the
 orchestrator's ``HotStore`` connection):
@@ -384,9 +392,7 @@ def roll_forward_manifests_to_exhaustion(
         raise ValueError(f"cold_root does not exist or is not a directory: {cold_root}")
 
     written = 0
-    frontier = get_sunk_frontier(cold_root)
-    pstart = partition_start(SCRAPE_START_BLOCK) if frontier < SCRAPE_START_BLOCK else frontier + 1
-    pstart = (pstart // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
+    pstart = _first_unsunk_partition_start(cold_root)
 
     while True:
         if stop_event and stop_event.is_set():
@@ -421,41 +427,182 @@ def roll_forward_manifests_to_exhaustion(
     return written
 
 
+def _first_unsunk_partition_start(cold_root: str) -> int:
+    """Return the 10K-aligned start of the first partition after the manifest frontier."""
+    frontier = get_sunk_frontier(cold_root)
+    if frontier < SCRAPE_START_BLOCK:
+        return partition_start(SCRAPE_START_BLOCK)
+    pstart = frontier + 1
+    return (pstart // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
+
+
+def _parse_10k_folder_name(name: str) -> int | None:
+    """Return the 10K start from ``10K=N`` or ``10K=N.tmp``, else None."""
+    stem = name[:-4] if name.endswith(".tmp") else name
+    if not stem.startswith(f"{PARTITION_10K_LABEL}="):
+        return None
+    try:
+        val = int(stem.split("=", 1)[1])
+    except ValueError:
+        return None
+    if val % PARTITION_SIZE_10K != 0:
+        return None
+    return val
+
+
+def _discover_unpublished_partition_starts(
+    cold_path: Path, first_unsunk: int
+) -> set[int]:
+    """Find every event-tree ``10K=N`` at or above the first unsunk partition."""
+    found: set[int] = set()
+    pattern = f"{PARTITION_1M_LABEL}=*/{PARTITION_10K_LABEL}=*"
+    for contract, event in all_targets():
+        base = cold_path / contract / event
+        if not base.is_dir():
+            continue
+        for ten_k in base.glob(pattern):
+            if not ten_k.is_dir():
+                continue
+            parsed = _parse_10k_folder_name(ten_k.name)
+            if parsed is not None and parsed >= first_unsunk:
+                found.add(parsed)
+    return found
+
+
+def _folder_is_complete_two_file(folder: Path) -> bool:
+    """True iff ``folder`` exists and holds exactly data.parquet + metadata.json."""
+    if not folder.is_dir():
+        return False
+    names: list[str] = []
+    for entry in folder.iterdir():
+        if entry.is_file() and entry.name.startswith("data.parquet.tmp-"):
+            return False
+        names.append(entry.name)
+    return (
+        set(names) == {"data.parquet", "metadata.json"}
+        and (folder / "data.parquet").is_file()
+        and (folder / "metadata.json").is_file()
+    )
+
+
+def _unpublished_partition_is_complete(cold_path: Path, pstart: int) -> bool:
+    """True iff every expected target has a complete two-file folder and no extras."""
+    expected = _expected_targets_for_partition(pstart)
+    rel = partition_dir(pstart)
+    expected_set = set(expected)
+    for contract, event in expected:
+        if not _folder_is_complete_two_file(cold_path / contract / event / rel):
+            return False
+    for contract, event in all_targets():
+        if (contract, event) in expected_set:
+            continue
+        extra = cold_path / contract / event / rel
+        if extra.exists():
+            return False
+    return True
+
+
+def _remove_unpublished_path(path: Path) -> None:
+    if not path.exists():
+        return
+    try:
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    except OSError as e:
+        raise V4Error(f"could not remove unpublished path {path}: {e}") from e
+
+
+def _cleanup_unsunk_manifest_folder(cold_path: Path, pstart: int) -> int:
+    """Remove unpublished manifest folders for ``pstart``.
+
+    A ``_SUCCESS`` here would mean the partition is sunk; refuse rather than
+    delete it.
+    """
+    removed = 0
+    manifest_rel = partition_dir(pstart)
+    manifest_tmp = cold_path / "manifests" / f"{manifest_rel}.tmp"
+    manifest_final = cold_path / "manifests" / manifest_rel
+    if (manifest_final / "_SUCCESS").is_file():
+        raise V4Error(
+            f"refusing to delete manifested partition 10K={pstart}: {manifest_final}"
+        )
+    for path in (manifest_tmp, manifest_final):
+        if path.exists():
+            _remove_unpublished_path(path)
+            removed += 1
+    return removed
+
+
+def _wipe_unpublished_partition_event_folders(cold_path: Path, pstart: int) -> int:
+    """Delete every event folder for an unpublished 10K.
+
+    Callers must only pass a partition with no manifest ``_SUCCESS``.
+    """
+    success = _manifest_dir(cold_path, pstart) / "_SUCCESS"
+    if success.is_file():
+        raise V4Error(
+            f"refusing to delete event folders for manifested partition "
+            f"10K={pstart}: {success}"
+        )
+    removed = 0
+    rel = partition_dir(pstart)
+    tmp_rel = rel.replace(f"10K={pstart}", f"10K={pstart}.tmp")
+    for contract, event in all_targets():
+        folder = cold_path / contract / event / rel
+        if folder.exists():
+            _remove_unpublished_path(folder)
+            removed += 1
+        tmp = cold_path / contract / event / tmp_rel
+        if tmp.exists():
+            _remove_unpublished_path(tmp)
+            removed += 1
+    return removed
+
+
 def cleanup_temp_dirs_after_frontier(
     cold_root: str,
     *,
     progress_cb: ProgressCallback | None = None,
 ) -> int:
-    """Delete temp directories for the first unsunk partition.
+    """Remove unpublished leftovers above the manifest frontier.
 
-    Defensive behavior: also removes the final manifest folder for the first
-    unsunk partition if it exists.
+    Temp ``10K=N.tmp`` directories and unsunk manifest folders are removed.
+    Event folders for an unpublished 10K are removed unless every expected
+    target already has exactly ``data.parquet`` and ``metadata.json`` (crash
+    after a complete write, before ``publish_manifest``). Incomplete
+    unpublished 10Ks — parquet without metadata, mixed targets, extras —
+    are wiped as a unit so the next ``write_partition_files`` can redo them
+    from hot. Folders at or below the frontier are not inspected.
     """
     cold_path = Path(cold_root)
     if not cold_path.is_dir():
         raise ValueError(f"cold_root does not exist or is not a directory: {cold_root}")
 
-    frontier = get_sunk_frontier(cold_root)
-    pstart = partition_start(SCRAPE_START_BLOCK) if frontier < SCRAPE_START_BLOCK else frontier + 1
-    pstart = (pstart // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
+    first = _first_unsunk_partition_start(cold_root)
+    unpublished = _discover_unpublished_partition_starts(cold_path, first)
+    unpublished.add(first)
 
-    removed = _cleanup_tmp_partition_dirs(cold_path, pstart)
-    manifest_rel = partition_dir(pstart)
-    manifest_tmp = cold_path / "manifests" / f"{manifest_rel}.tmp"
-    manifest_final = cold_path / "manifests" / manifest_rel
-
-    for path in (manifest_tmp, manifest_final):
-        if path.exists():
-            shutil.rmtree(path, ignore_errors=True)
-            removed += 1
+    removed = 0
+    for pstart in sorted(unpublished):
+        if (_manifest_dir(cold_path, pstart) / "_SUCCESS").is_file():
+            raise V4Error(
+                "unpublished cleanup found _SUCCESS above the manifest frontier "
+                f"at 10K={pstart}"
+            )
+        removed += _cleanup_tmp_partition_dirs(cold_path, pstart)
+        removed += _cleanup_unsunk_manifest_folder(cold_path, pstart)
+        if not _unpublished_partition_is_complete(cold_path, pstart):
+            removed += _wipe_unpublished_partition_event_folders(cold_path, pstart)
 
     if progress_cb:
         progress_cb(
             op="manifest",
             phase="cleanup",
             rows_done=removed,
-            partition=pstart,
-            message=f"cleaned temp dirs for 10K={pstart}",
+            partition=first,
+            message=f"cleaned unpublished leftovers at 10K={first}",
         )
     return removed
 
@@ -553,6 +700,31 @@ def get_sunk_frontier(cold_root: str) -> int:
     frontier, _count = read_manifest_frontier(cold_root)
     return frontier
 
+
+def _rollback_this_call_partition_files(
+    pending_renames: list[tuple[Path, Path]],
+) -> None:
+    """Unlink parquet, metadata, and leftover temps this call created.
+
+    These files are unpublished: ``write_partition_files`` has not returned,
+    and the orchestrator has not published ``_SUCCESS``.
+    """
+    for tmp_path, dst_path in pending_renames:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            dst_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        meta = dst_path.parent / "metadata.json"
+        try:
+            meta.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def write_partition_files(
     db_path: str,
     cold_root: str,
@@ -582,11 +754,12 @@ def write_partition_files(
          matches the raw (pre-dedup) count; raise ``DuplicateRowError``
          on mismatch.
       4. Rename every temp file to ``data.parquet`` via ``os.replace``.
-      5. Close the read-only connection.
+      5. Write ``metadata.json`` next to each renamed parquet.
+      6. Close the read-only connection.
 
-    On any failure before step 4 completes, every temp file written by
-    this call is removed. The hot DB and the cold tier are both
-    unchanged on failure (modulo temp files this call cleaned up).
+    On any failure, every temp file written by this call is removed, and
+    every ``data.parquet`` / ``metadata.json`` this call created is unlinked.
+    The hot DB is unchanged.
 
     Args:
         db_path: Absolute path to the hot ``.db`` file. The function
@@ -633,7 +806,10 @@ def write_partition_files(
         * The function's read-only DuckDB connection is closed.
 
     Postconditions on failure:
-        * No new ``data.parquet`` files exist.
+        * No ``data.parquet`` or ``metadata.json`` files created by this
+          call remain (they are unlinked on a caught phase-2 or phase-3
+          error). A hard kill can leave unpublished folders above the
+          frontier; startup cleanup removes those.
         * Any temp files written by this call have been removed.
         * The hot DB is unchanged.
 
@@ -861,6 +1037,7 @@ def write_partition_files(
         for tmp_path, dst_path in pending_renames:
             os.replace(tmp_path, dst_path)
     except Exception as e:
+        _rollback_this_call_partition_files(pending_renames)
         if opened_locally:
             con.close()
         raise V4Error(
@@ -873,13 +1050,14 @@ def write_partition_files(
     # Phase 3: write metadata.json for each renamed parquet file.
     # This must happen after the atomic renames so the parquet path used for
     # row-count and content-hash is the final, immutable cold-tier path.
-    for _tmp_path, dst_path in pending_renames:
-        try:
+    try:
+        for _tmp_path, dst_path in pending_renames:
             _create_metadata_json_for_single_parquet(dst_path)
-        except Exception as e:
-            raise V4Error(
-                f"metadata.json write failed for {dst_path} partition {partition_start}: {e}"
-            ) from e
+    except Exception as e:
+        _rollback_this_call_partition_files(pending_renames)
+        raise V4Error(
+            f"metadata.json write failed for partition {partition_start}: {e}"
+        ) from e
     elapsed_ms = (time.monotonic() - t0) * 1000
     return PartitionWriteResult(
         partition_start=partition_start,

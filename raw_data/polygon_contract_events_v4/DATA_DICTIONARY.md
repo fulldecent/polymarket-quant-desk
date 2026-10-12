@@ -69,6 +69,10 @@ The producer makes exactly the following guarantees regarding file visibility an
 
 The folder existing with the lexicographically highest pattern `manifests/1M={N}/10K={N}/` is called the "frontier". For the avoidance of doubt, no guarantees are made regarding the existance, completeness or immutability of files in ``{contract}/{event}/1M={N}/10K={N}/`` folders which are lexicographically higher than that.
 
+Those higher folders are unpublished. Any `{contract}/{event}/1M={N}/10K={N}/` folder that exists
+contains exactly `data.parquet` and `metadata.json`. A 10K above the frontier may already have
+every expected two-file event folder; that 10K has no `manifests/1M={N}/10K={N}/_SUCCESS`.
+
 ## Known limitations
 
 - Some conditions prepared before block 33,605,403 exist on-chain but are not in this dataset — exactly 84 orphaned conditions are known and tolerated (see [test_token_registered_conditions_have_preparation](tests/data_validation/test_token_registered_conditions_have_preparation.py)).
