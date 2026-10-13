@@ -393,6 +393,15 @@ class EpochOptimizer:
             self._active = self._propose()
             return self._report(measured, score, duration, True, "baseline")
 
+        # A clean epoch that credited no blocks stores 0.0. Any later positive score beats it,
+        # and the percent below divides by that baseline.
+        if self._incumbent_score == 0.0 and score > 0.0:
+            self._incumbent = measured
+            self._incumbent_score = score
+            self._rejects_since_accept = 0
+            self._active = self._propose()
+            return self._report(measured, score, duration, True, "kept, baseline was 0")
+
         if score > self._incumbent_score * (1.0 + MIN_GAIN):
             gain = score / self._incumbent_score - 1.0
             self._incumbent = measured

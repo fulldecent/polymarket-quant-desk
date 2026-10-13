@@ -414,6 +414,40 @@ def test_spoiled_epoch_is_re_measured_rather_than_scored():
     assert run_epoch(opt, clock, blocks=100).reason == "baseline"
 
 
+def test_a_zero_block_baseline_accepts_the_next_positive_epoch_without_dividing():
+    """A clean epoch of zero blocks stores score 0.0. The next positive score must be kept.
+
+    The percent-gain branch divides by the incumbent. That division killed a live scrape when a
+    lane's first scored window moved no blocks and the next one did.
+    """
+    opt, clock = make_optimizer()
+    finish_ramp(opt)
+
+    baseline = run_epoch(opt, clock, blocks=0)
+
+    assert baseline.reason == "baseline"
+    assert baseline.score == 0.0
+
+    report = run_epoch(opt, clock, blocks=100)
+
+    assert report.accepted
+    assert report.reason == "kept, baseline was 0"
+    assert report.score == pytest.approx(5.0)
+    assert opt._incumbent_score == pytest.approx(5.0)
+
+
+def test_two_zero_block_epochs_stay_on_the_reject_path():
+    opt, clock = make_optimizer()
+    finish_ramp(opt)
+    run_epoch(opt, clock, blocks=0)
+
+    report = run_epoch(opt, clock, blocks=0)
+
+    assert not report.accepted
+    assert report.reason == "reverted"
+    assert opt._incumbent_score == 0.0
+
+
 # ---------------------------------------------------------------------------
 # Bounds and epoch sizing
 # ---------------------------------------------------------------------------
