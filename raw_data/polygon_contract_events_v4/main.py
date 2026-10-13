@@ -631,18 +631,20 @@ class RichRunStatus:
         total: int,
         *,
         clock: bool = False,
+        timers: bool = True,
     ) -> None:
         """Update the ``key`` bar.
 
         A changed description means a new unit of work (the next partition), so the row's
         elapsed time and ETA restart from zero rather than carrying the previous one's clock.
-        ``clock`` prints the fraction as ``HH:MM`` instead of raw counts.
+        ``clock`` prints the fraction as ``HH:MM`` instead of raw counts. ``timers`` adds
+        the elapsed and remaining columns. The day row leaves them off.
         """
         with self._lock:
             progress = self._bars.get(key)
             bounded_total = max(total, 1)
             if progress is None:
-                progress = self._make_bar()
+                progress = self._make_bar(timers=timers)
                 self._bars[key] = progress
                 self._bar_tasks[key] = progress.add_task(
                     description,
@@ -680,16 +682,17 @@ class RichRunStatus:
             self._bar_descriptions.pop(key, None)
             self._refresh()
 
-    def _make_bar(self) -> Progress:
-        return Progress(
+    def _make_bar(self, *, timers: bool = True) -> Progress:
+        columns: list[ProgressColumn] = [
             SpinnerColumn(),
             TextColumn("{task.description}"),
             BarColumn(complete_style=_COLOR_DONE, finished_style=_COLOR_DONE, style=_COLOR_TODO),
             _DoneOfTotalColumn(),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-            console=console,
-        )
+        ]
+        if timers:
+            columns.append(TimeElapsedColumn())
+            columns.append(TimeRemainingColumn())
+        return Progress(*columns, console=console)
 
     def _row_groups(self) -> list[Progress]:
         """Footer rows top to bottom. The day bar sits immediately above total progress."""
@@ -1795,14 +1798,14 @@ def main() -> None:
         def _show_partition_bar(
             description: str, done: int, total: int, *, clock: bool = False
         ) -> None:
-            status_ui.bar("partition", description, done, total, clock=clock)
+            status_ui.bar("partition", description, done, total, clock=clock, timers=False)
 
         def _sink_progress_cb(*, op, phase, rows_done=None, rows_total=None,
                               elapsed_ms=None, message="", partition=None):
             # Takes over the day row while files for that day are copied.
             if op == "sink" and phase == "copy" and partition is not None:
                 _show_partition_bar(
-                    f"Sinking {day_label(partition)}",
+                    f"{day_label(partition)} sinking",
                     rows_done or 0,
                     rows_total or 1,
                 )
@@ -1921,7 +1924,9 @@ def main() -> None:
                     done, total = _day_bar_progress(
                         day_key, day_tip_ts.get(day_key), closed=last is not None
                     )
-                    _show_partition_bar(day_label(day_key), done, total, clock=True)
+                    _show_partition_bar(
+                        f"{day_label(day_key)} scraping", done, total, clock=True
+                    )
             status_ui.bar(
                 "main", "Total progress", min(blocks_done, total_target), total_target
             )
