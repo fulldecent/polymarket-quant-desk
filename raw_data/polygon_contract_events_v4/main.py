@@ -109,10 +109,12 @@ from lib.env import require_directory_env  # noqa: E402
 from lib.git_utils import assert_git_clean  # noqa: E402
 from lib.run_logging import format_duration  # noqa: E402
 from lib.ymd_partition import (  # noqa: E402
+    SECONDS_PER_DAY,
     day_key_from_timestamp,
     day_label,
     first_block_on_or_after,
     midnights_crossed,
+    utc_midnight,
 )
 
 from _internal.chunk_planner import ChunkPlanner
@@ -329,19 +331,22 @@ def _fmt_range(from_block: int, to_block: int) -> str:
     return f"{from_block:,}\u2013{to_block:,}"
 
 
-def _blocks_loaded_between(store: HotStore, start: int, end: int) -> int:
-    """Count unsunk loaded blocks that overlap ``[start, end]``."""
-    loaded = 0
-    for from_b, to_b, _ in store.list_loaded_ranges(include_sunk=False):
-        if to_b < start:
-            continue
-        if from_b > end:
-            break
-        overlap_start = max(from_b, start)
-        overlap_end = min(to_b, end)
-        if overlap_start <= overlap_end:
-            loaded += overlap_end - overlap_start + 1
-    return loaded
+def _day_bar_progress(day_key: int, tip_ts: int | None, *, closed: bool) -> tuple[int, int]:
+    """Seconds of ``day_key`` already reached, out of the 86,400 in a UTC day.
+
+    A closed day is the whole day. An open day uses the latest header time on
+    that day. The length does not depend on seeing the next midnight.
+    """
+    if closed:
+        return SECONDS_PER_DAY, SECONDS_PER_DAY
+    if tip_ts is None:
+        return 0, SECONDS_PER_DAY
+    done = int(tip_ts) - utc_midnight(day_key)
+    if done < 0:
+        done = 0
+    elif done > SECONDS_PER_DAY:
+        done = SECONDS_PER_DAY
+    return done, SECONDS_PER_DAY
 
 
 def _day_cuts_for_chunk(
@@ -654,15 +659,20 @@ class RichRunStatus:
             console=console,
         )
 
-    def _refresh(self) -> None:
-        if not self._started:
-            return
+    def _row_groups(self) -> list[Progress]:
+        """Footer rows top to bottom. The day bar sits immediately above total progress."""
         rows: list[Progress] = []
         if self._spinners.tasks:
             rows.append(self._spinners)
         if self._scrape.tasks:
             rows.append(self._scrape)
         rows.extend(self._bars[key] for key in _BAR_ORDER if key in self._bars)
+        return rows
+
+    def _refresh(self) -> None:
+        if not self._started:
+            return
+        rows = self._row_groups()
         self._live.update(Group(*rows) if rows else "")
 
 
@@ -950,6 +960,7 @@ def _fetch_range(
         "rows_by_target": rows_by_target,
         "raw_log_count": raw_log_count,
         "day_cuts": day_cuts,
+        "tip_timestamp": ts_by_block[to_block],
     }
 
 
@@ -1744,24 +1755,12 @@ def main() -> None:
             _print_message(f"Reconciled {newly_sunk:,} day(s) from existing cold-tier files.")
 
         # --- Sink orchestrator --------------------------------------
-        # Spinner and bar for key "partition" live in different stores. clear() drops both,
-        # so a mode switch clears first and then sets only one.
-        part_mode: str | None = None
-        spin_day: int | None = None
-        spin_t0 = 0.0
-
-        def _show_partition_spinner(description: str) -> None:
-            nonlocal part_mode
-            if part_mode != "spin":
-                status_ui.clear("partition")
-                part_mode = "spin"
-            status_ui.spinner("partition", description)
+        # The day row is a bar, same as total progress, so the two sit together
+        # at the bottom of the footer. A spinner would render up with the other
+        # spinners, away from the total.
+        day_tip_ts: dict[int, int] = {}
 
         def _show_partition_bar(description: str, done: int, total: int) -> None:
-            nonlocal part_mode
-            if part_mode != "bar":
-                status_ui.clear("partition")
-                part_mode = "bar"
             status_ui.bar("partition", description, done, total)
 
         def _sink_progress_cb(*, op, phase, rows_done=None, rows_total=None,
@@ -1876,33 +1875,19 @@ def main() -> None:
         def _refresh_bars() -> None:
             """Repaint the footer from current progress.
 
-            An open day has no known length, so the row is a spinner. Once the
-            next midnight has been seen, the closed span is a bar. A sink in
-            flight owns the row and is not overwritten here.
+            The open day is a fraction of 86,400 seconds, from the latest header
+            time on that day. A sink in flight owns the day row.
             """
-            nonlocal part_mode, spin_day, spin_t0
             if sink.in_flight == 0:
                 span = store.current_day_span()
                 if span is None:
                     status_ui.clear("partition")
-                    part_mode = None
                 else:
-                    day_key, first, last = span
-                    if last is None:
-                        loaded = _blocks_loaded_between(store, first, 2**32 - 1)
-                        if spin_day != day_key or part_mode != "spin":
-                            spin_day = day_key
-                            spin_t0 = time.monotonic()
-                        elapsed_s = max(0.0, time.monotonic() - spin_t0)
-                        _show_partition_spinner(
-                            f"{day_label(day_key)}  blks: {loaded:,}  {elapsed_s:.0f}s"
-                        )
-                    else:
-                        _show_partition_bar(
-                            day_label(day_key),
-                            _blocks_loaded_between(store, first, last),
-                            last - first + 1,
-                        )
+                    day_key, _first, last = span
+                    done, total = _day_bar_progress(
+                        day_key, day_tip_ts.get(day_key), closed=last is not None
+                    )
+                    _show_partition_bar(day_label(day_key), done, total)
             status_ui.bar(
                 "main", "Total progress", min(blocks_done, total_target), total_target
             )
@@ -2084,6 +2069,11 @@ def main() -> None:
                         break
 
                     events_inserted += persist_result.rows_inserted
+                    tip_ts = result.get("tip_timestamp")
+                    if tip_ts is not None:
+                        tip_day = day_key_from_timestamp(int(tip_ts))
+                        if day_tip_ts.get(tip_day, -1) < int(tip_ts):
+                            day_tip_ts[tip_day] = int(tip_ts)
                     blocks_done += chunk_span
                     lane.blocks_done += chunk_span
                     lane.optimizer.record_blocks(chunk_span)
