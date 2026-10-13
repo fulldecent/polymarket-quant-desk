@@ -91,3 +91,43 @@ def test_no_block_is_lost_or_duplicated_while_working_through_fragmented_gaps():
 
     assert blocks_covered([], taken=handed_out) == expected
     assert sum(t - f + 1 for f, t in handed_out) == len(expected), "a block was scraped twice"
+
+
+def _lane(**overrides):
+    lane = scraper._RpcLane(
+        index=0,
+        url="https://example.invalid",
+        label="example",
+        client=None,
+    )
+    lane.pool = object()
+    for key, value in overrides.items():
+        setattr(lane, key, value)
+    return lane
+
+
+def test_a_parked_lane_does_not_accept_work_until_the_cooldown_ends(monkeypatch):
+    lane = _lane()
+    monkeypatch.setattr(scraper.time, "monotonic", lambda: 100.0)
+
+    scraper._park_lane_after_failure(lane)
+
+    assert lane.cooldown_until == 101.0
+    assert scraper._lane_accepts_work(lane, now=100.5) is False
+    assert scraper._lane_accepts_work(lane, now=101.0) is True
+
+
+def test_a_long_throttle_sleep_is_the_cooldown(monkeypatch):
+    lane = _lane()
+    lane.optimizer._active = lane.optimizer.params.__class__(
+        workers=1,
+        result_budget=1,
+        sleep_after_response_sec=5.0,
+    )
+    monkeypatch.setattr(scraper.time, "monotonic", lambda: 100.0)
+
+    scraper._park_lane_after_failure(lane)
+
+    assert lane.cooldown_until == 105.0
+    assert scraper._lanes_cooling_down([lane], 104.0) == [lane]
+    assert scraper._lanes_cooling_down([lane], 105.0) == []

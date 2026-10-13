@@ -173,6 +173,13 @@ POLL_TIMEOUT_SEC: float = 0.5
 Kept well under a second so progress never looks stalled.
 """
 
+MIN_LANE_COOLDOWN_SEC: float = 1.0
+"""After a lane returns a failed chunk, keep it from taking new work for at least this long.
+
+The chunk goes back to the front of the queue. The lane that failed it is idle, so the next
+fill would hand the same chunk straight back. A throttled public endpoint then keeps a frontier
+hole forever while healthier lanes scrape past it."""
+
 FORCE_EXIT_AFTER_INTERRUPTS: int = 2
 """Second CTRL-C bypasses orderly shutdown and ``os._exit``s."""
 
@@ -990,6 +997,7 @@ class _RpcLane:
     probe_in_flight: tuple[int, int] | None = None
     draining_epoch: bool = False
     blocks_done: int = 0
+    cooldown_until: float = 0.0
 
     @property
     def live(self) -> bool:
@@ -998,6 +1006,29 @@ class _RpcLane:
     @property
     def spinner_key(self) -> str:
         return f"scrape:{self.index}"
+
+
+def _park_lane_after_failure(lane: _RpcLane) -> None:
+    """Hold ``lane`` out of scheduling after it puts a chunk back on the queue."""
+    wait = max(lane.optimizer.params.sleep_after_response_sec, MIN_LANE_COOLDOWN_SEC)
+    lane.cooldown_until = time.monotonic() + wait
+
+
+def _lane_accepts_work(lane: _RpcLane, *, now: float) -> bool:
+    return (
+        lane.live
+        and not lane.draining_epoch
+        and lane.pool is not None
+        and now >= lane.cooldown_until
+    )
+
+
+def _lanes_cooling_down(lanes: list[_RpcLane], now: float) -> list[_RpcLane]:
+    return [
+        lane
+        for lane in lanes
+        if lane.live and lane.pool is not None and now < lane.cooldown_until
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1821,11 +1852,8 @@ def main() -> None:
             """
             if _stop_event.is_set():
                 return
-            live = [
-                lane
-                for lane in lanes
-                if lane.live and not lane.draining_epoch and lane.pool is not None
-            ]
+            now = time.monotonic()
+            live = [lane for lane in lanes if _lane_accepts_work(lane, now=now)]
             if not live:
                 return
             progressed = True
@@ -2040,6 +2068,7 @@ def main() -> None:
                     )
                     _return_chunk(pending_ranges, chunk)
                     lane.optimizer.record_timeout()
+                    _park_lane_after_failure(lane)
                     _print_message(
                         f"Scraping {lane.label} backing off"
                         f"{_tuning_suffix(lane.optimizer, lane.planner)}"
@@ -2062,6 +2091,7 @@ def main() -> None:
                     # 11 and left the run fetching 10 blocks for hours.
                     lane.optimizer.record_throttled(http_status)
                     _return_chunk(pending_ranges, chunk)
+                    _park_lane_after_failure(lane)
                     _print_message(
                         f"Scraping {lane.label} backing off"
                         f"{_tuning_suffix(lane.optimizer, lane.planner)}"
@@ -2101,6 +2131,7 @@ def main() -> None:
                     chunk_failures[chunk] = chunk_failures.get(chunk, 0) + 1
                     if chunk_failures[chunk] < MAX_CHUNK_RETRIES:
                         _return_chunk(pending_ranges, chunk)
+                        _park_lane_after_failure(lane)
                     else:
                         _print_message(
                             f"  Giving up on [{from_b:,}-{to_b:,}] "
@@ -2150,7 +2181,20 @@ def main() -> None:
                 break
 
             if pending_ranges and not _in_flight() and not _any_draining():
-                # Nothing could be submitted, so the call budget is spent.
+                # A parked lane is waiting so another endpoint can take the chunk
+                # it returned. Stopping here would exit while that work is still queued.
+                now = time.monotonic()
+                cooling = _lanes_cooling_down(lanes, now)
+                call_budget_spent = (
+                    args.max_calls is not None and calls_made >= args.max_calls
+                )
+                if cooling and not call_budget_spent:
+                    wait = min(
+                        POLL_TIMEOUT_SEC,
+                        max(0.0, min(lane.cooldown_until for lane in cooling) - now),
+                    )
+                    time.sleep(wait)
+                    continue
                 if args.max_calls is not None:
                     _print_message(
                         f"  Reached --max-calls limit ({args.max_calls}). Stopping."
