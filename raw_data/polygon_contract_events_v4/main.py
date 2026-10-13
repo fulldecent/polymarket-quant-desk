@@ -489,7 +489,10 @@ def _describe_rpc_endpoint(url: str) -> str:
 
 
 def _tuning_suffix(optimizer: EpochOptimizer, planner: ChunkPlanner) -> str:
-    """``  threads ##  max blks/req ##`` for the scrape sticky line and speed updates."""
+    """``  threads ##  max blks/req ##`` for scrolling speed and backoff lines.
+
+    The sticky per-RPC line does not use this. It leads with ``N× `` instead.
+    """
     max_blks = planner.next_span(optimizer.params.result_budget)
     return f"  threads {optimizer.params.workers}  max blks/req {max_blks:,}"
 
@@ -524,13 +527,19 @@ def _unique_endpoint_labels(urls: list[str]) -> list[str]:
 
 
 def _lane_footer_text(lane: "_RpcLane", *, run_seconds: float) -> str:
-    """Sticky-footer copy for one RPC lane: spinning scrape line, or failed line."""
+    """Sticky-footer copy for one RPC lane.
+
+    The live worker count leads the text (``3× Scraping ...``). A dead lane
+    keeps the same prefix. ``max blks/req`` stays; ``threads N`` does not.
+    """
+    prefix = f"{lane.optimizer.params.workers}× "
     if lane.fatal_reason is not None:
-        return f"Failed {lane.label}  {lane.fatal_reason}"
+        return f"{prefix}Failed {lane.label}  {lane.fatal_reason}"
     rate = lane.blocks_done / run_seconds if run_seconds > 0 else 0.0
+    max_blks = lane.planner.next_span(lane.optimizer.params.result_budget)
     return (
-        f"Scraping {lane.label}  {rate:,.0f} blk/s"
-        f"{_tuning_suffix(lane.optimizer, lane.planner)}"
+        f"{prefix}Scraping {lane.label}  {rate:,.0f} blk/s"
+        f"  max blks/req {max_blks:,}"
     )
 
 

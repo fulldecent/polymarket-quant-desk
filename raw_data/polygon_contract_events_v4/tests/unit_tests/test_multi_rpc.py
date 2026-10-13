@@ -1,6 +1,7 @@
 """Several POLYGON_RPC_URL values become independent scrape lanes."""
 
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -114,14 +115,15 @@ def test_one_dead_key_does_not_make_the_run_fatal():
 def test_footer_line_spins_while_working_and_says_failed_when_dead():
     lane = _lane(label="lb.drpc.live AmP...UMv")
     lane.blocks_done = 1_000
+    lane.optimizer._active = replace(lane.optimizer.params, workers=3)
     working = scraper._lane_footer_text(lane, run_seconds=10.0)
-    assert working.startswith("Scraping lb.drpc.live AmP...UMv  100 blk/s")
-    assert "threads" in working
+    assert working.startswith("3× Scraping lb.drpc.live AmP...UMv  100 blk/s")
+    assert "threads" not in working
     assert "max blks/req" in working
 
     lane.fatal_reason = "HTTP 401 from the RPC provider"
     failed = scraper._lane_footer_text(lane, run_seconds=10.0)
-    assert failed == "Failed lb.drpc.live AmP...UMv  HTTP 401 from the RPC provider"
+    assert failed == "3× Failed lb.drpc.live AmP...UMv  HTTP 401 from the RPC provider"
 
 
 def test_failed_scrape_row_uses_the_stopped_glyph_and_stays_failed():
