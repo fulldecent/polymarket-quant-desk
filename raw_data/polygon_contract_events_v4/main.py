@@ -68,6 +68,7 @@ import concurrent.futures
 import json
 import math
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -181,7 +182,15 @@ fill would hand the same chunk straight back. A throttled public endpoint then k
 hole forever while healthier lanes scrape past it."""
 
 FORCE_EXIT_AFTER_INTERRUPTS: int = 2
-"""Second CTRL-C bypasses orderly shutdown and ``os._exit``s."""
+"""Second CTRL-C or SIGTERM exits immediately."""
+
+SHUTDOWN_BUDGET_SEC: float = 5.0
+"""How long one SIGINT or SIGTERM waits before the process exits anyway.
+
+The hot DuckDB file stays locked until this process is gone. A sink write or a
+query can keep the main thread inside DuckDB, where a Python signal handler does
+not run, and pool threads are not daemons, so ``sys.exit`` would leave them
+holding the lock. The next start then fails with ``Could not set lock``."""
 
 MAX_CHUNK_RETRIES: int = 3
 """How many times to retry one ``(from_block, to_block)`` chunk on a transport-level error before
@@ -1348,13 +1357,69 @@ def _print_summary(
 # Main
 # ---------------------------------------------------------------------------
 
+def _shutdown_action(
+    *,
+    signals_seen: int,
+    now: float,
+    deadline: float | None,
+    budget: float,
+) -> tuple[float | None, bool]:
+    """Decide whether a shutdown signal must force the process out.
+
+    The first signal starts ``budget``. A later signal, or the budget ending,
+    returns force-exit. ``deadline`` is seconds from ``time.monotonic``.
+    """
+    if signals_seen >= FORCE_EXIT_AFTER_INTERRUPTS:
+        return deadline, True
+    if signals_seen <= 0:
+        return deadline, False
+    if deadline is None:
+        deadline = now + budget
+    return deadline, now >= deadline
+
+
+def _start_shutdown_watchdog() -> None:
+    """Exit within ``SHUTDOWN_BUDGET_SEC`` even if the main thread is inside DuckDB.
+
+    Python only runs ``signal.signal`` handlers when the main thread is in
+    Python code. ``signal.set_wakeup_fd`` is written from the C handler, so
+    this thread sees the signal anyway.
+    """
+    read_fd, write_fd = os.pipe()
+    os.set_blocking(write_fd, False)
+    signal.set_wakeup_fd(write_fd)
+
+    def _watch() -> None:
+        signals_seen = 0
+        deadline: float | None = None
+        while True:
+            readable, _, _ = select.select([read_fd], [], [], 0.2)
+            if readable:
+                try:
+                    signals_seen += len(os.read(read_fd, 256))
+                except OSError:
+                    pass
+            deadline, force = _shutdown_action(
+                signals_seen=signals_seen,
+                now=time.monotonic(),
+                deadline=deadline,
+                budget=SHUTDOWN_BUDGET_SEC,
+            )
+            if force:
+                os._exit(1)
+
+    threading.Thread(target=_watch, name="shutdown-watchdog", daemon=True).start()
+
+
 def main() -> None:
     # ----- Signal handling. Install BEFORE anything else so even a CTRL-C during env loading is
     # honored. ---------------------------------------------------------
     interrupt_count = [0]
+    interrupt_requested = [False]
 
     def _on_sigint(_sig, _frame):
         interrupt_count[0] += 1
+        interrupt_requested[0] = True
         _stop_event.set()
         if interrupt_count[0] >= FORCE_EXIT_AFTER_INTERRUPTS:
             # User said "really, stop". Bypass orderly shutdown — every file in flight has either
@@ -1367,6 +1432,7 @@ def main() -> None:
 
     signal.signal(signal.SIGINT, _on_sigint)
     signal.signal(signal.SIGTERM, _on_sigint)
+    _start_shutdown_watchdog()
 
     # ----- Parse args ------------------------------------------------
     parser = argparse.ArgumentParser(
@@ -2333,6 +2399,50 @@ def main() -> None:
         _print_message(_tb.format_exc())
 
     finally:
+        # One SIGINT or SIGTERM must drop the DuckDB file lock. Waiting for the
+        # sink, then for a chain-head RPC, leaves the file locked while the
+        # operator tries to start again. Pool threads are not daemons, so
+        # ``sys.exit`` would not release it either.
+        if interrupt_requested[0]:
+            _print_message("  Stopped. Closing the hot database.")
+            try:
+                head_executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:  # noqa: BLE001
+                pass
+            for lane in lanes:
+                for fut in list(lane.futures):
+                    fut.cancel()
+                if lane.pool is not None:
+                    lane.pool.shutdown(wait=False, cancel_futures=True)
+            if sink is not None:
+                try:
+                    sink.shutdown(wait=False)
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                status_ui.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            if store is not None:
+                try:
+                    store.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            for lane in lanes:
+                try:
+                    lane.client.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            global _run_logger
+            if _run_logger is not None:
+                try:
+                    _run_logger.log("finished", message="main interrupted")
+                    _run_logger.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                _run_logger = None
+            os._exit(0)
+
         # --- Orderly shutdown ---------------------------------------
         # 0. Stop the startup head-check executor if it is still alive.
         head_executor.shutdown(wait=False, cancel_futures=True)
@@ -2410,7 +2520,6 @@ def main() -> None:
                 pass
 
         # 7. Close the run log last so shutdown and the summary are recorded.
-        global _run_logger
         if _run_logger is not None:
             _run_logger.log("finished", message="main finished")
             _run_logger.close()

@@ -543,8 +543,11 @@ class HotStore:
         returns, ``close()`` has no in-memory state to flush.
         """
         if self._conn is not None:
+            conn = self._conn
+            self._conn = None
+            self._closed = True
             try:
-                self._conn.close()
+                conn.close()
             except Exception:
                 pass
             self._conn = None
