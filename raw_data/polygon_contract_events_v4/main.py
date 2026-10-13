@@ -1202,6 +1202,10 @@ class _SinkOrchestrator:
                 f"  bytes: {mb:.1f} MiB"
                 f"  {write_result.elapsed_ms / 1000:.1f}s"
             )
+            # This commit moved the frontier. The following day may already be
+            # closed and loaded, so no later persist will see it as newly ready.
+            for day_key in self._store.list_days_ready_to_sink():
+                self.submit(day_key)
         return n_committed
 
     def shutdown(self, wait: bool) -> None:
