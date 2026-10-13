@@ -434,15 +434,31 @@ class JSONLRunLogger:
             pass
 
 
+def _format_day_clock(seconds: int) -> str:
+    """``HH:MM`` for a day bar. 86,400 seconds is ``24:00``."""
+    minutes = max(0, int(seconds)) // 60
+    hours, mins = divmod(minutes, 60)
+    return f"{hours:02d}:{mins:02d}"
+
+
 class _DoneOfTotalColumn(ProgressColumn):
-    """``done/total``, each number coloured like the bar segment it stands for."""
+    """``done/total`` after the bar.
+
+    A day task (``clock=True``) shows ``12:34/24:00``. Every other bar shows counts.
+    """
 
     def render(self, task: Task) -> Text:
         total = int(task.total) if task.total is not None else 0
+        if task.fields.get("clock"):
+            done_text = _format_day_clock(int(task.completed))
+            total_text = _format_day_clock(total)
+        else:
+            done_text = f"{int(task.completed):,}"
+            total_text = f"{total:,}"
         return Text.assemble(
-            (f"{int(task.completed):,}", _COLOR_DONE),
+            (done_text, _COLOR_DONE),
             "/",
-            (f"{total:,}", _COLOR_TODO),
+            (total_text, _COLOR_TODO),
         )
 
 
@@ -607,34 +623,50 @@ class RichRunStatus:
                     )
             self._refresh()
 
-    def bar(self, key: str, description: str, completed: int, total: int) -> None:
+    def bar(
+        self,
+        key: str,
+        description: str,
+        completed: int,
+        total: int,
+        *,
+        clock: bool = False,
+    ) -> None:
         """Update the ``key`` bar.
 
         A changed description means a new unit of work (the next partition), so the row's
         elapsed time and ETA restart from zero rather than carrying the previous one's clock.
+        ``clock`` prints the fraction as ``HH:MM`` instead of raw counts.
         """
         with self._lock:
             progress = self._bars.get(key)
+            bounded_total = max(total, 1)
             if progress is None:
                 progress = self._make_bar()
                 self._bars[key] = progress
-                self._bar_tasks[key] = progress.add_task(description, total=max(total, 1))
-                self._bar_descriptions[key] = description
-            task_id = self._bar_tasks[key]
-            if self._bar_descriptions[key] != description:
-                progress.reset(
-                    task_id,
-                    description=description,
+                self._bar_tasks[key] = progress.add_task(
+                    description,
+                    total=bounded_total,
                     completed=completed,
-                    total=max(total, 1),
+                    clock=clock,
                 )
                 self._bar_descriptions[key] = description
             else:
+                task_id = self._bar_tasks[key]
+                if self._bar_descriptions[key] != description:
+                    progress.reset(
+                        task_id,
+                        description=description,
+                        completed=completed,
+                        total=bounded_total,
+                    )
+                    self._bar_descriptions[key] = description
                 progress.update(
                     task_id,
                     description=description,
                     completed=completed,
-                    total=max(total, 1),
+                    total=bounded_total,
+                    clock=clock,
                 )
             self._refresh()
 
@@ -1760,8 +1792,10 @@ def main() -> None:
         # spinners, away from the total.
         day_tip_ts: dict[int, int] = {}
 
-        def _show_partition_bar(description: str, done: int, total: int) -> None:
-            status_ui.bar("partition", description, done, total)
+        def _show_partition_bar(
+            description: str, done: int, total: int, *, clock: bool = False
+        ) -> None:
+            status_ui.bar("partition", description, done, total, clock=clock)
 
         def _sink_progress_cb(*, op, phase, rows_done=None, rows_total=None,
                               elapsed_ms=None, message="", partition=None):
@@ -1887,7 +1921,7 @@ def main() -> None:
                     done, total = _day_bar_progress(
                         day_key, day_tip_ts.get(day_key), closed=last is not None
                     )
-                    _show_partition_bar(day_label(day_key), done, total)
+                    _show_partition_bar(day_label(day_key), done, total, clock=True)
             status_ui.bar(
                 "main", "Total progress", min(blocks_done, total_target), total_target
             )
