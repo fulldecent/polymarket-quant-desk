@@ -543,6 +543,17 @@ def _lane_footer_text(lane: "_RpcLane", *, run_seconds: float) -> str:
     )
 
 
+def _http_error_text(exc: HTTPError) -> str:
+    """Operator text for one HTTP failure.
+
+    A monthly quota names itself. Every other status stays the generic
+    ``HTTP {code} from the RPC provider`` line.
+    """
+    if exc.provider_message:
+        return str(exc)
+    return f"HTTP {exc.status_code} from the RPC provider"
+
+
 def _fetch_fatal_is_process_wide(result: dict[str, Any]) -> bool:
     """Decode bugs and missing headers are data integrity; HTTP 401 is one key."""
     msg = str(result.get("error_message") or "")
@@ -882,21 +893,21 @@ def _fetch_range(
     except OperationCancelled:
         return {"status": "cancelled", "wid": wid, "elapsed_sec": time.monotonic() - t0}
     except HTTPError as e:
-        _interruptible_sleep(sleep_after_response_sec)
-        if e.is_retryable:
-            # Survived the client's own retries, so the provider is genuinely overloaded.
+        if not e.is_retryable:
+            # 401/404, and a monthly quota, never clear on a retry.
             return {
-                "status": "throttled",
+                "status": "fatal",
                 "wid": wid,
                 "elapsed_sec": time.monotonic() - t0,
-                "http_status": e.status_code,
+                "error_message": _http_error_text(e),
             }
-        # 401/404 and friends never fix themselves; retrying just burns the backlog.
+        _interruptible_sleep(sleep_after_response_sec)
+        # Survived the client's own retries, so the provider is genuinely overloaded.
         return {
-            "status": "fatal",
+            "status": "throttled",
             "wid": wid,
             "elapsed_sec": time.monotonic() - t0,
-            "error_message": f"HTTP {e.status_code} from the RPC provider",
+            "http_status": e.status_code,
         }
     except (RPCError, RuntimeError) as e:
         _interruptible_sleep(sleep_after_response_sec)
@@ -947,19 +958,19 @@ def _fetch_range(
     except OperationCancelled:
         return {"status": "cancelled", "wid": wid, "elapsed_sec": time.monotonic() - t0}
     except HTTPError as e:
-        _interruptible_sleep(sleep_after_response_sec)
-        if e.is_retryable:
+        if not e.is_retryable:
             return {
-                "status": "throttled",
+                "status": "fatal",
                 "wid": wid,
                 "elapsed_sec": time.monotonic() - t0,
-                "http_status": e.status_code,
+                "error_message": f"header fetch: {_http_error_text(e)}",
             }
+        _interruptible_sleep(sleep_after_response_sec)
         return {
-            "status": "fatal",
+            "status": "throttled",
             "wid": wid,
             "elapsed_sec": time.monotonic() - t0,
-            "error_message": f"header fetch: HTTP {e.status_code} from the RPC provider",
+            "http_status": e.status_code,
         }
     except (ValueError, V4Error) as e:
         return {

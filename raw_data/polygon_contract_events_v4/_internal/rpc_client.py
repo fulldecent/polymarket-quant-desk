@@ -71,7 +71,8 @@ _TOO_MANY_RESULTS_KEYWORDS = (
 
 # HTTP status codes that warrant retry. Everything else is treated as
 # permanent failure. 403 is in the set because some providers return it
-# as a WAF / rate-limit after 429 bursts.
+# as a WAF / rate-limit after 429 bursts. A JSON body that names a monthly
+# request-unit quota is not retried; see ``_is_monthly_quota_message``.
 _RETRYABLE_HTTP_STATUSES = frozenset({403, 408, 425, 429, 500, 502, 503, 504})
 
 
@@ -117,14 +118,21 @@ class RPCTimeout(RPCError):
 class HTTPError(RPCError):
     """HTTP-level error from the provider.
 
-    ``is_retryable`` is computed from ``status_code``: True for 403,
-    408, 425, 429, 500, 502, 503, 504; False otherwise.
+    ``is_retryable`` is True for 403, 408, 425, 429, 500, 502, 503, 504,
+    unless the body says the monthly request-unit quota is exhausted.
+    That quota does not clear on a retry.
     """
 
-    def __init__(self, status_code: int) -> None:
+    def __init__(self, status_code: int, *, provider_message: str | None = None) -> None:
         self.status_code = status_code
-        self.is_retryable = status_code in _RETRYABLE_HTTP_STATUSES
-        super().__init__(f"HTTP {status_code}")
+        self.provider_message = provider_message
+        quota = _is_monthly_quota_message(provider_message)
+        self.is_retryable = status_code in _RETRYABLE_HTTP_STATUSES and not quota
+        if quota:
+            text = f"HTTP {status_code}, monthly request-unit quota exhausted"
+        else:
+            text = f"HTTP {status_code}"
+        super().__init__(text)
 
 
 class JSONRPCError(RPCError):
@@ -185,6 +193,39 @@ def is_rate_limit_message(message: str) -> bool:
     """True when a provider error is an RPS / request-rate rejection."""
     msg = message.lower()
     return any(keyword in msg for keyword in _RATE_LIMIT_KEYWORDS)
+
+
+def _provider_error_message(body: bytes) -> str | None:
+    """JSON-RPC ``error.message`` from an HTTP error body, if one is present."""
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    error = data.get("error")
+    if not isinstance(error, dict):
+        return None
+    message = error.get("message")
+    if isinstance(message, str) and message.strip():
+        return message.strip()
+    return None
+
+
+def _is_monthly_quota_message(message: str | None) -> bool:
+    """True for Chainstack's monthly request-unit quota refusal.
+
+    Their docs describe that refusal as HTTP 429. The Polygon endpoints
+    return it as HTTP 403 with this sentence in the JSON-RPC body.
+    """
+    if not message:
+        return False
+    text = message.lower()
+    return "monthly quota" in text and "request unit" in text
+
+
+def _http_error_from_response(status_code: int, body: bytes) -> HTTPError:
+    return HTTPError(status_code, provider_message=_provider_error_message(body))
 
 
 # ---------------------------------------------------------------------------
@@ -534,8 +575,8 @@ class RpcClient:
                 if status_code >= 400:
                     # Both retryable and non-retryable codes go through
                     # HTTPError; the retry logic below decides based on
-                    # ``is_retryable``.
-                    raise HTTPError(status_code)
+                    # ``is_retryable``. A quota body is not retryable.
+                    raise _http_error_from_response(status_code, body)
 
                 data = json.loads(body)
                 if "error" in data:
@@ -621,7 +662,7 @@ class RpcClient:
                 if response.getheader("Content-Encoding", "").lower() == "gzip":
                     body = gzip.decompress(body)
                 if status_code >= 400:
-                    raise HTTPError(status_code)
+                    raise _http_error_from_response(status_code, body)
                 data = json.loads(body)
                 if not isinstance(data, list):
                     raise RuntimeError(
