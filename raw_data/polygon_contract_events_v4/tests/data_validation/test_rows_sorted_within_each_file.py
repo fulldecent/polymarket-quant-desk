@@ -6,7 +6,7 @@ The data dictionary's Physical sort order section states: "Each partition
 is sorted internally by ``block_number, transaction_index, log_index``."
 This test enforces that.
 
-Scope: every `*/*/1M=*/10K=*/data.parquet` file on disk.
+Scope: every `*/*/year=*/month=*/day=*/data.parquet` file on disk.
 
 Implementation: a row is in order if the tuple at row ``i`` is
 lexicographically less than or equal to the tuple at row ``i+1``. We

@@ -14,17 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from helpers import RAW, complete_1m_ranges_for_paths
-
-
-def _available_10ks(path: Path) -> set[int]:
-    if not path.exists():
-        return set()
-    return {
-        int(d.name.split("=")[1])
-        for d in path.iterdir()
-        if d.is_dir() and d.name.startswith("10K=")
-    }
+from helpers import complete_1m_ranges_for_paths, event_day_parquet
 
 
 def _mismatched_txs(con, of_path: Path, fc_path: Path) -> int:
@@ -63,17 +53,11 @@ def _run(con, exchange: str) -> int:
     ranges = sorted(set(ranges_all[:3] + ranges_all[-3:]))
     bad_total = 0
 
-    for r in ranges:
-        of_base = Path(RAW) / exchange / "order_filled" / f"1M={r}"
-        fc_base = Path(RAW) / exchange / "fee_charged" / f"1M={r}"
-        common = sorted(_available_10ks(of_base) & _available_10ks(fc_base))
-        sampled = sorted(set(common[:2] + common[-2:]))
-
-        for k in sampled:
-            of_p = of_base / f"10K={k}" / "data.parquet"
-            fc_p = fc_base / f"10K={k}" / "data.parquet"
-            if of_p.exists() and fc_p.exists():
-                bad_total += _mismatched_txs(con, of_p, fc_p)
+    for day_key in ranges:
+        of_p = event_day_parquet(exchange, "order_filled", day_key)
+        fc_p = event_day_parquet(exchange, "fee_charged", day_key)
+        if of_p.exists() and fc_p.exists():
+            bad_total += _mismatched_txs(con, of_p, fc_p)
 
     return bad_total
 
@@ -82,7 +66,7 @@ def test_ctfv2_fee_per_tx(con):
     """CTFExchangeV2: SUM(order_filled.fee) == SUM(fee_charged.amount) per transaction."""
     result = _run(con, "CTFExchangeV2")
     if result == -1:
-        pytest.skip("no 1M ranges complete in both CTFExchangeV2/order_filled and CTFExchangeV2/fee_charged")
+        pytest.skip("no UTC days present in both CTFExchangeV2/order_filled and CTFExchangeV2/fee_charged")
     assert result == 0, (
         f"{result} CTFExchangeV2 transaction(s) have mismatched "
         "order_filled.fee vs fee_charged.amount"
@@ -93,7 +77,10 @@ def test_negriskv2_fee_per_tx(con):
     """NegRiskCtfExchangeV2: SUM(order_filled.fee) == SUM(fee_charged.amount) per transaction."""
     result = _run(con, "NegRiskCtfExchangeV2")
     if result == -1:
-        pytest.skip("no 1M ranges complete in both NegRiskCtfExchangeV2/order_filled and NegRiskCtfExchangeV2/fee_charged")
+        pytest.skip(
+            "no UTC days present in both NegRiskCtfExchangeV2/order_filled "
+            "and NegRiskCtfExchangeV2/fee_charged"
+        )
     assert result == 0, (
         f"{result} NegRiskCtfExchangeV2 transaction(s) have mismatched "
         "order_filled.fee vs fee_charged.amount"

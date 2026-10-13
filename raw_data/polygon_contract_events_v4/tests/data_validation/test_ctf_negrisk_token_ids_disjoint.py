@@ -5,14 +5,14 @@ from the set traded on NegRiskCtfExchange.
 Binary markets use CTFExchange; NegRisk markets use NegRiskCtfExchange.  A
 token_id appearing on both exchanges would indicate a data or contract anomaly.
 """
-from helpers import RAW, ZERO_ASSET_ID_SQL
+from helpers import ZERO_ASSET_ID_SQL, event_day_parquet
 
 
 def test_ctf_negrisk_token_ids_disjoint(con, ranges):
     range_globs = []
     for contract in ("CTFExchange", "NegRiskCtfExchange"):
         for v in ranges:
-            path = f"{RAW}/{contract}/order_filled/1M={v}/**/*.parquet"
+            path = str(event_day_parquet(contract, "order_filled", v))
             range_globs.append((contract, path))
 
     ctf_paths = [p for c, p in range_globs if c == "CTFExchange"]

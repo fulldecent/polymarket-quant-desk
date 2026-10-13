@@ -49,8 +49,8 @@ OUTPUT
 ------
 Partitioned parquet at:
 
-    {FILLS_V2_DIR}/1M={N}/10K={K}/data.parquet
-    {FILLS_V2_DIR}/1M={N}/10K={K}/metadata.json
+    {FILLS_V2_DIR}/year=YYYY/month=MM/day=DD/data.parquet
+    {FILLS_V2_DIR}/year=YYYY/month=MM/day=DD/metadata.json
 
 See DATA_DICTIONARY.md for the full schema and invariant documentation.
 
@@ -66,7 +66,7 @@ USAGE
     python derived_data/fills_v2/main.py [options]
 
     --dry-run       print the work plan without writing any data
-    --sample N      process only the first N incomplete partitions
+    --sample N      process only the first N incomplete days
 """
 
 import argparse
@@ -88,18 +88,11 @@ sys.path.insert(0, str(_project_root))
 from lib.env import require_directory_env, require_env  # noqa: E402
 from lib.git_utils import assert_git_clean  # noqa: E402
 from lib.metadata_utils import create_parquet_metadata_json, parquet_content_hash  # noqa: E402
-from lib.partition_utils import (  # noqa: E402
-    PARTITION_10K_LABEL,
-    PARTITION_1M_LABEL,
-    enumerate_partitions,
-    partition_dir,
-    partition_end,
-)
+from lib.derived_frontier import scan_frontier_ymd_folders  # noqa: E402
 from lib.run_logging import (  # noqa: E402
     PhaseWork,
     RunOutput,
     configure_duckdb_progress,
-    print_partition_sunk,
     print_paths,
     print_run_summary,
     print_work_plan,
@@ -110,9 +103,17 @@ from lib.atomic_publish import (  # noqa: E402
     publish_atomically,
     cleanup_temp,
 )
-from lib.derived_frontier import scan_frontier_1M_10K_folders
+from lib.ymd_partition import (  # noqa: E402
+    assert_contiguous_day_keys,
+    day_block_span,
+    day_dir,
+    day_key_from_hive_dir,
+    day_key_parts,
+    day_label,
+    iter_manifest_day_keys,
+)
 
-from raw_data.polygon_contract_events_v4 import get_sunk_frontier, SCRAPE_START_BLOCK  # noqa: E402
+from raw_data.polygon_contract_events_v4 import SCRAPE_START_BLOCK  # noqa: E402
 
 # ============================================================================
 # constants
@@ -195,15 +196,25 @@ _SIZE_UNITS = {
 # input discovery
 # ============================================================================
 
-def _partition_file(table: str, k_val: int) -> Path:
-    """Path to one table's data.parquet for the 10K partition starting at k_val."""
-    return Path(RAW) / table / partition_dir(k_val) / "data.parquet"
+def _partition_file(table: str, day_key: int) -> Path:
+    """Path to one table's data.parquet for this UTC day."""
+    return Path(RAW) / table / day_dir(day_key) / "data.parquet"
 
 
-def _existing(table: str, k_val: int) -> str | None:
-    """Return the data.parquet path for this table+partition if it exists, else None."""
-    p = _partition_file(table, k_val)
+def _existing(table: str, day_key: int) -> str | None:
+    """Return the data.parquet path for this table and day if it exists, else None."""
+    p = _partition_file(table, day_key)
     return str(p) if p.exists() else None
+
+
+def _manifest_days() -> list[int]:
+    keys = iter_manifest_day_keys(RAW)
+    assert_contiguous_day_keys(keys)
+    return keys
+
+
+def _print_day_sunk(out: RunOutput, day_key: int, rows: int, elapsed: float) -> None:
+    out.print(f"  -> day {day_label(day_key)}  rows {rows:,}  {elapsed:.1f}s")
 
 
 def _format_seconds(seconds: float) -> str:
@@ -273,7 +284,7 @@ def _log_balances_snapshot(
     con: duckdb.DuckDBPyConnection,
     log: logging.Logger,
     *,
-    k_val: int,
+    day_key: int,
 ) -> None:
     """Log current balance-store cardinality and rough memory envelope."""
     stats = con.execute("""
@@ -286,8 +297,8 @@ def _log_balances_snapshot(
     """).fetchone()
     duckdb_memory_bytes = _duckdb_memory_usage_bytes(con)
     log.info(
-        "telemetry 10K=%s balances: keys=%s accounts=%s conditions=%s payload~%s duckdb_memory=%s",
-        k_val,
+        "telemetry day=%s balances: keys=%s accounts=%s conditions=%s payload~%s duckdb_memory=%s",
+        day_label(day_key),
         f"{int(stats[0]):,}",
         f"{int(stats[1]):,}",
         f"{int(stats[2]):,}",
@@ -300,12 +311,12 @@ def _log_resolved_eviction_snapshot(
     con: duckdb.DuckDBPyConnection,
     log: logging.Logger,
     *,
-    k_val: int,
+    day_key: int,
 ) -> None:
     """Log how much in-memory state would be evictable by resolved-condition policy."""
     if not _table_exists(con, "condition_resolution"):
         return
-    up_to_block = partition_end(k_val)
+    up_to_block = day_block_span(RAW, day_key)[1]
     stats = con.execute(
         """
         SELECT
@@ -318,8 +329,8 @@ def _log_resolved_eviction_snapshot(
         [up_to_block],
     ).fetchone()
     log.info(
-        "telemetry 10K=%s resolved-eviction: evictable_keys=%s evictable_conditions=%s (resolved_block<=%s)",
-        k_val,
+        "telemetry day=%s resolved-eviction: evictable_keys=%s evictable_conditions=%s (resolved_block<=%s)",
+        day_label(day_key),
         f"{int(stats[0]):,}",
         f"{int(stats[1]):,}",
         up_to_block,
@@ -379,7 +390,7 @@ def _legs_select(exch: dict, path: str) -> str:
     """
 
 
-def _refund_select(k_val: int) -> str | None:
+def _refund_select(day_key: int) -> str | None:
     """A SELECT of v1 USDC net fees keyed by (block_number, transaction_index, order_hash).
 
     Returns None when neither FeeModule has data in this partition.
@@ -388,7 +399,7 @@ def _refund_select(k_val: int) -> str | None:
     """
     parts = []
     for module in ("FeeModuleCTF", "FeeModuleNegRisk"):
-        path = _existing(f"{module}/fee_refunded", k_val)
+        path = _existing(f"{module}/fee_refunded", day_key)
         if path:
             parts.append(
                 f"SELECT block_number, transaction_index, order_hash, CAST(fee_charged AS HUGEINT) AS fee_charged "
@@ -399,7 +410,7 @@ def _refund_select(k_val: int) -> str | None:
     return " UNION ALL ".join(parts)
 
 
-def _build_partition_sql(k_val: int, leg_paths: list[tuple[dict, str]]) -> str:
+def _build_partition_sql(day_key: int, leg_paths: list[tuple[dict, str]]) -> str:
     """Assemble the full per-partition query that yields the final, ordered rows.
 
     Stages:
@@ -414,7 +425,7 @@ def _build_partition_sql(k_val: int, leg_paths: list[tuple[dict, str]]) -> str:
       final       add net_yes_position_after running balance and project columns
     """
     legs_union = " UNION ALL ".join(_legs_select(exch, path) for exch, path in leg_paths)
-    refund_sql = _refund_select(k_val)
+    refund_sql = _refund_select(day_key)
     refund_cte = refund_sql if refund_sql else "SELECT NULL::UINTEGER block_number, NULL::UINTEGER transaction_index, NULL::BLOB order_hash, NULL::HUGEINT fee_charged WHERE FALSE"
 
     return f"""
@@ -644,9 +655,17 @@ def _build_unified_token_cache(
 
     Returns the number of rows in ``token_cache``.
     """
-    # Load token_id_map with first-seen block (lowest partition containing the token).
-    # token_id_map partitioning is 1M/10K like fills_v2; minimum block in partition = 10K * lower.
-    tok_glob = f"{TOKEN_MAP}/**/*.parquet"
+    # first_seen_block is the min_block of the UTC day that first materialized the token.
+    day_keys = _manifest_days()
+    span_rows = []
+    for key in day_keys:
+        year, month, day = day_key_parts(key)
+        min_block, _max_block = day_block_span(RAW, key)
+        span_rows.append(f"({year}, {month}, {day}, {int(min_block)})")
+    if not span_rows:
+        raise RuntimeError("no manifested raw days; cannot assign token first_seen_block")
+    span_sql = ", ".join(span_rows)
+    tok_glob = f"{TOKEN_MAP}/year=*/month=*/day=*/data.parquet"
     run_sql(con, """
         CREATE OR REPLACE TEMP TABLE token_cache (
             token_id BLOB,
@@ -661,27 +680,47 @@ def _build_unified_token_cache(
         if work is not None:
             work.phase("tokens")
         run_sql(con, f"""
-            INSERT INTO token_cache
-            WITH tok_raw AS (
-                SELECT token_id, condition_id, market_id, "10K" AS partition_10k
-                FROM read_parquet('{tok_glob}', hive_partitioning=1)
-            )
+            CREATE OR REPLACE TEMP TABLE tok_raw AS
             SELECT
                 token_id,
                 condition_id,
                 market_id,
-                CAST(MIN(partition_10k) AS UINTEGER) AS first_seen_block,
-                CAST(NULL AS UINTEGER) AS resolved_block,
-                CAST(NULL AS UINTEGER) AS resolved_log_index
-            FROM tok_raw
-            GROUP BY token_id, condition_id, market_id
+                CAST(year AS INTEGER) AS year,
+                CAST(month AS INTEGER) AS month,
+                CAST(day AS INTEGER) AS day
+            FROM read_parquet('{_sql_quote(tok_glob)}', hive_partitioning=1)
         """, work=work)
     except duckdb.IOException:
         raise RuntimeError(
             "token_id_map_v2 has no parquet files; fills_v2 requires a complete token map. "
             "Run token_id_map_v2 first and ensure TOKEN_ID_MAP_V2_DIR is populated."
         )
-    
+    missing = con.execute(f"""
+        SELECT COUNT(*)
+        FROM tok_raw t
+        ANTI JOIN (
+            SELECT * FROM (VALUES {span_sql}) AS s(year, month, day, min_block)
+        ) s USING (year, month, day)
+    """).fetchone()[0]
+    if missing:
+        raise RuntimeError(
+            f"{missing:,} token_id_map rows sit on a UTC day with no raw block span"
+        )
+    run_sql(con, f"""
+        INSERT INTO token_cache
+        SELECT
+            t.token_id,
+            t.condition_id,
+            t.market_id,
+            CAST(MIN(s.min_block) AS UINTEGER) AS first_seen_block,
+            CAST(NULL AS UINTEGER) AS resolved_block,
+            CAST(NULL AS UINTEGER) AS resolved_log_index
+        FROM tok_raw t
+        JOIN (SELECT * FROM (VALUES {span_sql}) AS s(year, month, day, min_block)) s
+          USING (year, month, day)
+        GROUP BY t.token_id, t.condition_id, t.market_id
+    """, work=work)
+
     n = con.execute("SELECT COUNT(*) FROM token_cache").fetchone()[0]
     if n == 0:
         raise RuntimeError(
@@ -689,12 +728,18 @@ def _build_unified_token_cache(
             "Run token_id_map_v2 first and ensure TOKEN_ID_MAP_V2_DIR is populated."
         )
     log.info(f"loaded {n:,} tokens into unified cache (first_seen_block assigned)")
-    
-    # Load condition resolutions up to frontier and merge into cache.
-    res_glob = f"{RAW}/ConditionalTokens/condition_resolution/**/*.parquet"
-    try:
+
+    res_paths = [
+        _partition_file("ConditionalTokens/condition_resolution", key).as_posix()
+        for key in day_keys
+        if _partition_file("ConditionalTokens/condition_resolution", key).exists()
+    ]
+    if not res_paths:
+        log.info("condition_resolution not found in raw data; tokens will not have resolution bounds")
+    else:
         if work is not None:
             work.phase("resolutions")
+        res_list = "[" + ", ".join("'" + _sql_quote(p) + "'" for p in res_paths) + "]"
         run_sql(con, f"""
             WITH ordered AS (
                 SELECT
@@ -705,7 +750,7 @@ def _build_unified_token_cache(
                         PARTITION BY condition_id
                         ORDER BY block_number, log_index
                     ) AS rn
-                FROM read_parquet('{res_glob}')
+                FROM read_parquet({res_list})
                 WHERE block_number <= ?
             ),
             resolutions AS (
@@ -723,8 +768,6 @@ def _build_unified_token_cache(
             FROM resolutions r
             WHERE tc.condition_id = r.condition_id
         """, [frontier], work=work)
-    except duckdb.IOException:
-        log.info("condition_resolution not found in raw data; tokens will not have resolution bounds")
     
     resolved_count = con.execute("SELECT COUNT(*) FROM token_cache WHERE resolved_block IS NOT NULL").fetchone()[0]
     log.info(f"merged {resolved_count:,} resolved conditions into token cache")
@@ -736,9 +779,9 @@ def _balances_sidecar_dir() -> Path:
     return Path(OUT_DIR) / BALANCES_SUBDIR
 
 
-def _balances_partition_path(k_val: int) -> Path:
-    """Path to the immutable per-partition balances sidecar file."""
-    return _balances_sidecar_dir() / partition_dir(k_val) / "balances.parquet"
+def _balances_partition_path(day_key: int) -> Path:
+    """Path to the immutable per-day balances sidecar file."""
+    return _balances_sidecar_dir() / day_dir(day_key) / "balances.parquet"
 
 
 def _ensure_balances_sidecar(con: duckdb.DuckDBPyConnection, log: logging.Logger) -> None:
@@ -785,22 +828,23 @@ def _ensure_balances_sidecar(con: duckdb.DuckDBPyConnection, log: logging.Logger
     raw_rows = con.execute(f"SELECT COUNT(*) FROM read_parquet('{glob}')").fetchone()[0]
 
     def _load_balances_batched_incremental() -> None:
-        # Fallback path: process newest 1M groups first. Each group does an
+        # Fallback path: process newest years first. Each year does an
         # intra-batch latest-per-key collapse then anti-joins against already
-        # loaded keys. This is much faster than per-file merging while using
-        # substantially less memory than a global one-shot window.
-        def _m_from_sidecar_path(path: Path) -> int:
-            match = re.search(r"1M=([0-9]+)", path.as_posix())
+        # loaded keys.
+        def _year_from_sidecar_path(path: Path) -> int:
+            match = re.search(r"year=([0-9]+)", path.as_posix())
             if not match:
-                raise RuntimeError(f"invalid sidecar path without 1M partition label: {path}")
+                raise RuntimeError(f"invalid sidecar path without year label: {path}")
             return int(match.group(1))
 
-        m_dirs = [d for d in sidecar_root.glob("1M=*") if d.is_dir()]
-        m_dirs.sort(key=_m_from_sidecar_path, reverse=True)
-        total_groups = len(m_dirs)
+        year_dirs = [d for d in sidecar_root.glob("year=*") if d.is_dir()]
+        year_dirs.sort(key=_year_from_sidecar_path, reverse=True)
+        total_groups = len(year_dirs)
 
-        for idx, m_dir in enumerate(m_dirs, start=1):
-            batch_glob = _sql_quote((m_dir / "10K=*" / "balances.parquet").as_posix())
+        for idx, year_dir in enumerate(year_dirs, start=1):
+            batch_glob = _sql_quote(
+                (year_dir / "month=*" / "day=*" / "balances.parquet").as_posix()
+            )
             con.execute(f"""
                 INSERT INTO balances
                 SELECT b.account, b.condition_id, b.bal
@@ -812,7 +856,7 @@ def _ensure_balances_sidecar(con: duckdb.DuckDBPyConnection, log: logging.Logger
                             ending_balance,
                             ROW_NUMBER() OVER (
                                 PARTITION BY account, condition_id
-                                ORDER BY "10K" DESC
+                                ORDER BY year DESC, month DESC, day DESC
                             ) AS rn
                         FROM read_parquet('{batch_glob}', hive_partitioning = 1)
                     )
@@ -838,8 +882,7 @@ def _ensure_balances_sidecar(con: duckdb.DuckDBPyConnection, log: logging.Logger
         )
         _load_balances_batched_incremental()
     else:
-        # Fast path: let DuckDB resolve latest-per-key directly using hive
-        # partition metadata (10K) instead of per-file Python loops.
+        # Fast path: latest snapshot per key from the year/month/day hive columns.
         try:
             con.execute(f"""
                 INSERT INTO balances
@@ -850,7 +893,7 @@ def _ensure_balances_sidecar(con: duckdb.DuckDBPyConnection, log: logging.Logger
                         ending_balance,
                         ROW_NUMBER() OVER (
                             PARTITION BY account, condition_id
-                            ORDER BY "10K" DESC
+                            ORDER BY year DESC, month DESC, day DESC
                         ) AS rn
                     FROM read_parquet('{glob}', hive_partitioning = 1)
                 )
@@ -887,51 +930,44 @@ def _ensure_balances_sidecar(con: duckdb.DuckDBPyConnection, log: logging.Logger
 
 
 def _bootstrap_balances_sidecar(con: duckdb.DuckDBPyConnection, log: logging.Logger) -> None:
-    """Rebuild the entire balances sidecar from landed fills partitions.
+    """Rebuild the entire balances sidecar from landed fills days.
 
     This is the only place that ever reads historical fills data.parquet files
     to derive balances. It runs only when the sidecar is missing. The result
-    is a set of immutable per-partition sidecar files under _balances/.
+    is a set of immutable per-day sidecar files under _balances/.
     """
-    from lib.partition_utils import enumerate_partitions as _enum_parts
-
-    # Find all landed fills partitions by scanning the output directory
-    landed: list[tuple[int, int]] = []
-    for m_dir in Path(OUT_DIR).glob("1M=*"):
-        if not m_dir.is_dir():
+    landed: list[int] = []
+    for day_dir_path in Path(OUT_DIR).glob("year=*/month=*/day=*"):
+        if not day_dir_path.is_dir():
             continue
-        for k_dir in m_dir.glob("10K=*"):
-            if (k_dir / "data.parquet").exists() and (k_dir / "metadata.json").exists():
-                k_val = int(k_dir.name.split("=")[1])
-                m_val = int(m_dir.name.split("=")[1])
-                landed.append((m_val, k_val))
-    landed.sort(key=lambda x: (x[0], x[1]))
+        if day_dir_path.name.endswith(".tmp"):
+            continue
+        if (day_dir_path / "data.parquet").exists() and (day_dir_path / "metadata.json").exists():
+            landed.append(day_key_from_hive_dir(day_dir_path))
+    landed.sort()
 
     if not landed:
-        log.info("no landed fills partitions; sidecar will be empty")
+        log.info("no landed fills days; sidecar will be empty")
         return
 
-    log.info(f"bootstrap will process {len(landed)} landed fills partitions")
+    log.info(f"bootstrap will process {len(landed)} landed fills days")
 
-    # Process each landed partition in order, writing its sidecar entry
-    for idx, (m_val, k_val) in enumerate(landed, 1):
+    for idx, day_key in enumerate(landed, 1):
         if _stop_event.is_set():
             log.info("bootstrap interrupted by user")
             raise RuntimeError("bootstrap interrupted; sidecar is incomplete")
 
-        data_path = Path(OUT_DIR) / partition_dir(k_val) / "data.parquet"
+        data_path = Path(OUT_DIR) / day_dir(day_key) / "data.parquet"
         if not data_path.exists():
             continue
 
-        # Compute ending balance per (account, condition_id) for this partition
-        # (the row with the highest logical_fill_index for each key)
         con.execute(f"""
             CREATE OR REPLACE TEMP TABLE part_bal AS
             SELECT
                 account,
                 condition_id,
                 net_yes_position_after AS ending_balance
-            FROM read_parquet('{data_path.as_posix()}')
+            FROM read_parquet('{_sql_quote(data_path.as_posix())}')
             QUALIFY ROW_NUMBER() OVER (
                 PARTITION BY account, condition_id
                 ORDER BY logical_fill_index DESC
@@ -940,32 +976,35 @@ def _bootstrap_balances_sidecar(con: duckdb.DuckDBPyConnection, log: logging.Log
 
         row_count = con.execute("SELECT COUNT(*) FROM part_bal").fetchone()[0]
 
-        # Write immutable sidecar entry
-        sidecar_path = _balances_partition_path(k_val)
+        sidecar_path = _balances_partition_path(day_key)
         sidecar_path.parent.mkdir(parents=True, exist_ok=True)
         con.execute(f"""
             COPY (SELECT account, condition_id, ending_balance FROM part_bal)
-            TO '{sidecar_path.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
+            TO '{_sql_quote(sidecar_path.as_posix())}' (FORMAT PARQUET, COMPRESSION ZSTD)
         """)
 
-        log.info(f"bootstrap: wrote sidecar for 10K={k_val} ({row_count:,} keys) [{idx}/{len(landed)}]")
+        log.info(
+            f"bootstrap: wrote sidecar for {day_label(day_key)} "
+            f"({row_count:,} keys) [{idx}/{len(landed)}]"
+        )
 
     log.info("balances sidecar bootstrap complete")
 
 
-def _write_balances_sidecar_partition(con: duckdb.DuckDBPyConnection, k_val: int, log: logging.Logger) -> None:
-    """Write the immutable sidecar entry for the just-processed partition.
+def _write_balances_sidecar_partition(
+    con: duckdb.DuckDBPyConnection,
+    day_key: int,
+    max_block: int,
+    log: logging.Logger,
+) -> None:
+    """Write the immutable sidecar entry for the just-processed day.
 
-    Only the (account, condition_id) pairs touched by this partition are recorded,
+    Only the (account, condition_id) pairs touched by this day are recorded,
     with their ending net_yes_position_after after the last fill for that key.
     """
-    sidecar_path = _balances_partition_path(k_val)
+    sidecar_path = _balances_partition_path(day_key)
     sidecar_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # The balances table has been updated by _update_balances with this partition's deltas.
-    # We need the ending balance for exactly the keys that had activity in this partition.
-    # We can derive it from chunk_rows (which still exists) or from the updated balances.
-    # Using chunk_rows is precise: the last row per key in chunk_rows has the ending value.
     if _table_exists(con, "condition_resolution"):
         con.execute(f"""
             CREATE OR REPLACE TEMP TABLE touched AS
@@ -976,7 +1015,7 @@ def _write_balances_sidecar_partition(con: duckdb.DuckDBPyConnection, k_val: int
             FROM chunk_rows c
             LEFT JOIN condition_resolution r
               ON c.condition_id = r.condition_id
-             AND r.resolved_block <= {partition_end(k_val)}
+             AND r.resolved_block <= {int(max_block)}
             WHERE r.condition_id IS NULL
             QUALIFY ROW_NUMBER() OVER (
                 PARTITION BY c.account, c.condition_id
@@ -1001,7 +1040,7 @@ def _write_balances_sidecar_partition(con: duckdb.DuckDBPyConnection, k_val: int
         COPY (SELECT account, condition_id, ending_balance FROM touched)
         TO '{sidecar_path.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
     """)
-    log.info(f"wrote balances sidecar for 10K={k_val}")
+    log.info(f"wrote balances sidecar for {day_label(day_key)}")
 
 
 # ============================================================================
@@ -1010,8 +1049,9 @@ def _write_balances_sidecar_partition(con: duckdb.DuckDBPyConnection, k_val: int
 
 def process_chunk(
     con: duckdb.DuckDBPyConnection,
-    m_val: int,
-    k_val: int,
+    day_key: int,
+    min_block: int,
+    max_block: int,
     log: logging.Logger,
     *,
     partition_idx: int,
@@ -1021,18 +1061,21 @@ def process_chunk(
     profile_output_dir: Path | None,
     work: PhaseWork | None = None,
 ) -> int:
-    """Process one 10K partition: build legs, assign order/position, write atomically.
+    """Process one UTC day: build legs, assign order/position, write atomically.
 
-    Every partition ALWAYS produces an output (data.parquet + metadata.json), even
+    Every day ALWAYS produces an output (data.parquet + metadata.json), even
     with zero fills. Legs whose token_id is absent from token_id_map_v2 are dropped
     (token map is high-coverage but not complete). The producer still fails fast if
     any mapped token has index_set outside {1, 2} (the binary YES=1/NO=2 invariant).
     """
     t0 = time.perf_counter()
-    chunk_dir = Path(OUT_DIR) / partition_dir(k_val)
+    label = day_label(day_key)
+    chunk_dir = Path(OUT_DIR) / day_dir(day_key)
+    if chunk_dir.exists():
+        sys.exit(f"FATAL: refusing to overwrite immutable partition: {chunk_dir}")
     chunk_dir.parent.mkdir(parents=True, exist_ok=True)
 
-    leg_paths = [(exch, _existing(f"{exch['name']}/order_filled", k_val)) for exch in EXCHANGES]
+    leg_paths = [(exch, _existing(f"{exch['name']}/order_filled", day_key)) for exch in EXCHANGES]
     leg_paths = [(exch, path) for exch, path in leg_paths if path]
 
     dropped = 0
@@ -1042,13 +1085,13 @@ def process_chunk(
         work.phase("building")
     if leg_paths:
         t_build_start = time.perf_counter()
-        sql = _build_partition_sql(k_val, leg_paths)
+        sql = _build_partition_sql(day_key, leg_paths)
         profile_path: Path | None = None
         if profile_build_query:
             if profile_output_dir is None:
                 raise RuntimeError("profile_output_dir must be set when profile_build_query is enabled")
             profile_output_dir.mkdir(parents=True, exist_ok=True)
-            profile_path = profile_output_dir / f"build-10K={k_val}.json"
+            profile_path = profile_output_dir / f"build-{label}.json"
             con.execute("PRAGMA enable_profiling='json'")
             con.execute(f"PRAGMA profiling_output='{_sql_quote(profile_path.as_posix())}'")
 
@@ -1060,7 +1103,7 @@ def process_chunk(
 
         t_build = time.perf_counter() - t_build_start
         if profile_path is not None:
-            log.info(f"telemetry 10K={k_val} duckdb_build_profile={profile_path.as_posix()}")
+            log.info(f"telemetry day={label} duckdb_build_profile={profile_path.as_posix()}")
 
         # Fail fast: mapped tokens must resolve to a binary condition.
         bad = con.execute("""
@@ -1070,7 +1113,7 @@ def process_chunk(
         """).fetchone()
         if bad[0]:
             raise RuntimeError(
-                f"10K={k_val}: {bad[0]} fill legs have index_set outside {{1, 2}} "
+                f"{label}: {bad[0]} fill legs have index_set outside {{1, 2}} "
                 f"(non-binary condition; the YES=1/NO=2 model requires binary conditions)"
             )
     else:
@@ -1085,7 +1128,7 @@ def process_chunk(
     temp_loc = create_temp_location(parent_dir=chunk_dir.parent, final_name=chunk_dir.name, temp_suffix=".tmp")
     if work is not None:
         work.phase("hashing")
-    input_hashes = _partition_input_hashes(k_val)
+    input_hashes = _partition_input_hashes(day_key)
     try:
         out_parquet = temp_loc.path / "data.parquet"
         if work is not None:
@@ -1098,7 +1141,7 @@ def process_chunk(
         t_write = time.perf_counter() - t_write_start
 
         t_meta_start = time.perf_counter()
-        _write_metadata(con, temp_loc.path, m_val, k_val, input_hashes, log)
+        _write_metadata(con, temp_loc.path, day_key, min_block, max_block, input_hashes, log)
         t_meta = time.perf_counter() - t_meta_start
 
         t_publish_start = time.perf_counter()
@@ -1112,15 +1155,15 @@ def process_chunk(
         
         # Prune resolved balances: once a condition is resolved, no more fills can occur.
         # Delete the balances for that condition to shrink state continuously.
-        pruned_keys, pruned_conditions = _prune_resolved_balances(con, partition_end(k_val), log)
+        pruned_keys, pruned_conditions = _prune_resolved_balances(con, max_block, log)
         
         t_bal = time.perf_counter() - t_bal_start
 
         total_elapsed = time.perf_counter() - t0
-        log.info(f"10K={k_val}: wrote {row_count:,} fill legs")
+        log.info(f"{label}: wrote {row_count:,} fill legs")
         log.info(
-            "telemetry 10K=%s partition=%s/%s rows=%s touched_keys=%s touched_conditions=%s new_keys=%s pruned_keys=%s pruned_conditions=%s",
-            k_val,
+            "telemetry day=%s partition=%s/%s rows=%s touched_keys=%s touched_conditions=%s new_keys=%s pruned_keys=%s pruned_conditions=%s",
+            label,
             partition_idx,
             total_partitions,
             f"{row_count:,}",
@@ -1131,8 +1174,8 @@ def process_chunk(
             f"{pruned_conditions:,}",
         )
         log.info(
-            "telemetry 10K=%s timing build=%s write=%s metadata=%s publish=%s update_balances=%s total=%s",
-            k_val,
+            "telemetry day=%s timing build=%s write=%s metadata=%s publish=%s update_balances=%s total=%s",
+            label,
             _format_seconds(t_build),
             _format_seconds(t_write),
             _format_seconds(t_meta),
@@ -1243,31 +1286,46 @@ def _prune_resolved_balances(con: duckdb.DuckDBPyConnection, up_to_block: int, l
 # provenance
 # ============================================================================
 
-def _partition_input_hashes(k_val: int) -> dict[str, str]:
-    """SHA-256 of every raw input file read to build this partition (portable keys)."""
+def _partition_input_hashes(day_key: int) -> dict[str, str]:
+    """SHA-256 of every raw input file read to build this UTC day (portable keys)."""
     import os
 
     tables = [f"{e['name']}/order_filled" for e in EXCHANGES]
     tables += ["FeeModuleCTF/fee_refunded", "FeeModuleNegRisk/fee_refunded"]
     hashes: dict[str, str] = {}
     for table in tables:
-        path = _existing(table, k_val)
+        path = _existing(table, day_key)
         if path:
             rel = os.path.relpath(path, RAW)
             hashes[rel] = parquet_content_hash(Path(path))
     return hashes
 
 
-def _write_metadata(con, chunk_dir: Path, m_val: int, k_val: int, input_hashes: dict[str, str], log) -> None:
+def _write_metadata(
+    con,
+    chunk_dir: Path,
+    day_key: int,
+    min_block: int,
+    max_block: int,
+    input_hashes: dict[str, str],
+    log,
+) -> None:
     part = chunk_dir / "data.parquet"
     if not part.exists():
         raise RuntimeError(f"data.parquet not found at {part} after write; cannot create metadata")
+    year, month, day = day_key_parts(day_key)
     create_parquet_metadata_json(
         part,
         dataset="fills_v2",
         source_script="derived_data/fills_v2/main.py",
         input_hashes=input_hashes,
-        parameters={"1M": m_val, "10K": k_val, "min_block": k_val, "max_block": partition_end(k_val)},
+        parameters={
+            "year": year,
+            "month": month,
+            "day": day,
+            "min_block": min_block,
+            "max_block": max_block,
+        },
         row_count_connection=con,
         created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     )
@@ -1281,12 +1339,12 @@ def main() -> None:
     global _global_con
     parser = argparse.ArgumentParser(description="Materialize fills_v2")
     parser.add_argument("--dry-run", action="store_true", help="print work plan without writing")
-    parser.add_argument("--sample", type=int, default=0, help="process only first N partitions")
+    parser.add_argument("--sample", type=int, default=0, help="process only first N days")
     parser.add_argument(
         "--telemetry-every",
         type=int,
         default=10,
-        help="log full balances snapshot every N processed partitions (0 disables periodic snapshots)",
+        help="log full balances snapshot every N processed days (0 disables periodic snapshots)",
     )
     parser.add_argument(
         "--duckdb-profile-build",
@@ -1335,69 +1393,80 @@ def main() -> None:
 
     signal.signal(signal.SIGINT, _handle_sigint)
 
-    # Discover work by block range up to the upstream frontier (no source-folder
-    # discovery): a 10K range with no fills still produces a zero-row output.
-    # The effective frontier is the MIN of the cold dataset and token_id_map_v2;
-    # fills_v2 may only consume partitions where BOTH sources are complete.
-    cold_frontier = get_sunk_frontier(RAW)
-    token_map_latest = scan_frontier_1M_10K_folders(
-        base_path=TOKEN_MAP,
-        starting_partition=SCRAPE_START_BLOCK,
-        tmp_suffix=".tmp",
-        cb_progress=lambda _partition: None,
+    # Every contiguous manifested day is one output folder. A day with no fills
+    # still writes a zero-row file. token_id_map must already cover the last day.
+    raw_days = _manifest_days()
+    cold_frontier = day_block_span(RAW, raw_days[-1])[1] if raw_days else none_below
+    token_map_latest = (
+        scan_frontier_ymd_folders(
+            base_path=TOKEN_MAP,
+            starting_day_key=raw_days[0],
+            tmp_suffix=".tmp",
+            cb_progress=lambda _day_key: None,
+        )
+        if raw_days
+        else None
     )
     token_map_frontier = (
-        partition_end(token_map_latest)
+        day_block_span(RAW, token_map_latest)[1]
         if token_map_latest is not None
         else none_below
     )
-    if token_map_frontier < cold_frontier:
+    if raw_days and (token_map_latest is None or token_map_latest < raw_days[-1]):
         raise RuntimeError(
-            f"token_id_map_v2 frontier ({token_map_frontier:,}) is behind the cold frontier ({cold_frontier:,}); "
-            f"fills_v2 requires complete token coverage up to the cold frontier. "
-            f"Advance token_id_map_v2 first."
+            f"token_id_map_v2 frontier ({token_map_frontier:,}) is behind the cold frontier "
+            f"({cold_frontier:,}); fills_v2 requires complete token coverage up to the cold "
+            f"frontier. Advance token_id_map_v2 first."
         )
-    frontier = min(cold_frontier, token_map_frontier)
-    all_partitions = enumerate_partitions(SCRAPE_START_BLOCK, frontier)
-    todo = [
-        (m, k)
-        for (m, k) in all_partitions
-        if not (Path(OUT_DIR) / f"{PARTITION_1M_LABEL}={m}" / f"{PARTITION_10K_LABEL}={k}").exists()
-    ]
-    already_landed = len(all_partitions) - len(todo)
+    available = raw_days
+    frontier = cold_frontier
+    todo = [key for key in available if not (Path(OUT_DIR) / day_dir(key)).exists()]
+    already_landed = len(available) - len(todo)
     if args.sample:
         todo = todo[: args.sample]
 
-    latest_self = scan_frontier_1M_10K_folders(
-        base_path=OUT_DIR,
-        starting_partition=SCRAPE_START_BLOCK,
-        tmp_suffix=".tmp",
-        cb_progress=lambda _partition: None,
+    latest_self = (
+        scan_frontier_ymd_folders(
+            base_path=OUT_DIR,
+            starting_day_key=available[0],
+            tmp_suffix=".tmp",
+            cb_progress=lambda _day_key: None,
+        )
+        if available
+        else None
     )
-    self_frontier = partition_end(latest_self) if latest_self is not None else none_below
+    self_frontier = day_block_span(RAW, latest_self)[1] if latest_self is not None else none_below
 
     print_work_plan(
         out,
         frontier=frontier,
-        total=len(all_partitions),
+        total=len(available),
         already_landed=already_landed,
         todo=len(todo),
         sample=args.sample,
     )
     out.log_only(f"# main — start at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
-    out.log_only(f"cold frontier:        {cold_frontier:,}")
+    out.log_only(
+        f"cold frontier:        {cold_frontier:,}"
+        if cold_frontier > none_below
+        else "cold frontier:        none"
+    )
     out.log_only(
         f"token_id_map frontier: {token_map_frontier:,}"
         if token_map_frontier > none_below
         else "token_id_map frontier: none"
     )
-    out.log_only(f"upstream frontier:    {frontier:,}")
+    out.log_only(
+        f"upstream frontier:    {frontier:,}"
+        if frontier > none_below
+        else "upstream frontier:    none"
+    )
     out.log_only(
         f"self frontier:        {self_frontier:,}"
         if self_frontier > none_below
         else "self frontier:        none"
     )
-    out.log_only(f"partitions total:     {len(all_partitions):,}")
+    out.log_only(f"days total:           {len(available):,}")
     out.log_only(f"already landed:       {already_landed:,}")
     out.log_only(f"to process:           {len(todo):,}")
     if args.sample:
@@ -1405,11 +1474,9 @@ def main() -> None:
 
     if args.dry_run:
         if todo:
-            first_m, first_k = todo[0]
-            last_m, last_k = todo[-1]
-            out.print(f"dry-run: would process {len(todo):,} partitions")
-            out.print(f"  first: 1M={first_m} 10K={first_k}")
-            out.print(f"  last:  1M={last_m} 10K={last_k}")
+            out.print(f"dry-run: would process {len(todo):,} days")
+            out.print(f"  first: {day_label(todo[0])}")
+            out.print(f"  last:  {day_label(todo[-1])}")
         else:
             out.print("dry-run: nothing to do")
         return
@@ -1453,18 +1520,20 @@ def main() -> None:
         """)
         out.log_only("initialized running balance table")
 
-        for partition_idx, (m_val, k_val) in enumerate(todo, start=1):
+        for partition_idx, day_key in enumerate(todo, start=1):
             if _stop_event.is_set():
                 status = "interrupted"
                 out.log_only("interrupted by user")
                 break
-            work = PhaseWork(out.status, f"10K={k_val:,}")
+            work = PhaseWork(out.status, day_label(day_key))
             work.phase("building")
             t0 = time.monotonic()
+            min_block, max_block = day_block_span(RAW, day_key)
             row_count = process_chunk(
                 con,
-                m_val,
-                k_val,
+                day_key,
+                min_block,
+                max_block,
                 out.log,
                 partition_idx=partition_idx,
                 total_partitions=len(todo),
@@ -1473,7 +1542,7 @@ def main() -> None:
                 profile_output_dir=profile_output_dir,
                 work=work,
             )
-            print_partition_sunk(out, k_val, row_count, time.monotonic() - t0)
+            _print_day_sunk(out, day_key, row_count, time.monotonic() - t0)
             processed += 1
             rows_done += row_count
             out.status.total(processed, len(todo))
@@ -1482,7 +1551,7 @@ def main() -> None:
         status = "interrupted"
 
     if processed:
-        self_frontier = partition_end(todo[processed - 1][1])
+        self_frontier = day_block_span(RAW, todo[processed - 1])[1]
 
     print_run_summary(
         out,

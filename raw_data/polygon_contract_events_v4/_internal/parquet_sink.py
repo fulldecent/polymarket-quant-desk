@@ -2,13 +2,13 @@
 Cold-tier (Parquet) sink.
 
 Writes Parquet files under
-``{cold_root}/{contract}/{event}/1M=N/10K=N/data.parquet``, matching
+``{cold_root}/{contract}/{event}/year=YYYY/month=MM/day=DD/data.parquet``, matching
 ``DATA_DICTIONARY.md`` exactly:
 
   * Column types use the dictionary's Parquet type contract: ``BLOB`` (no
     logical type), ``STRING`` (UTF-8), ``INT(bitWidth=32, isSigned=false)``.
   * Column order matches ``tables.all_columns(contract, event)``.
-  * The partition-key columns ``1M`` and ``10K`` are NEVER written inside
+  * The partition-key columns ``year``, ``month``, and ``day`` are NEVER written inside
     the file.
   * Rows are sorted by ``(block_number, transaction_index, log_index)``.
   * ``(block_number, transaction_index, log_index)`` is unique within each file. This is
@@ -27,10 +27,10 @@ Orchestration contract — the writer is a pure cold-tier producer:
 
   This module does NOT touch the hot DB's bookkeeping. It does not
   import ``HotStore``. It opens its own read-only DuckDB connection
-  against the hot ``.db`` file, runs every COPY for one 10K partition,
+  against the hot ``.db`` file, runs every COPY for one UTC day,
   renames the temp files into place, and returns. The orchestrator
   (which owns the ``HotStore``) is responsible for the follow-up
-  ``HotStore.commit_sink(partition_start)`` call that flips the range
+  ``HotStore.commit_sink(day_key)`` call that flips the range
   to sunk and deletes the hot rows. Splitting the work this way means:
 
     * Every write against the hot DB happens on the orchestrator's
@@ -43,8 +43,8 @@ Orchestration contract — the writer is a pure cold-tier producer:
       process dies before it returns, the orchestrator never calls
       ``commit_sink`` for that partition. The hot DB still holds the
       rows. Restart runs ``cleanup_temp_dirs_after_frontier`` (incomplete
-      unpublished 10K folders are unpublished junk) then re-issues the
-      partition. A caught phase-2 or phase-3 failure also unlinks every
+      unpublished day folders are unpublished junk) then re-issues the
+      day. A caught phase-2 or phase-3 failure also unlinks every
       ``data.parquet`` and ``metadata.json`` this call created.
       If the function succeeded and the orchestrator died after
       ``publish_manifest`` but before ``commit_sink``,
@@ -55,20 +55,20 @@ Orchestration contract — the writer is a pure cold-tier producer:
 
 Frontier ordering contract:
 
-The cold tier must advance one 10K partition at a time, starting at
-``floor(SCRAPE_START_BLOCK / 10_000) * 10_000``. This module does NOT
-enforce that contract — the orchestrator does, by calling this
-function only for partitions in the right order, and the
-``HotStore.commit_sink`` call afterwards is the hard enforcement point
-(it raises ``PartitionFrontierError`` if the orchestrator passes a
-partition out of order). The writer trusts its caller.
+The cold tier must advance one UTC day at a time, starting at the
+UTC day of ``SCRAPE_START_BLOCK``. This module does NOT enforce that
+contract — the orchestrator does, by calling this function only for
+days in calendar order, and the ``HotStore.commit_sink`` call
+afterwards is the hard enforcement point (it raises
+``PartitionFrontierError`` if the orchestrator passes a day out of
+order). The writer trusts its caller.
 
 Sink workflow (one call to ``write_partition_files``):
 
   1. Open a read-only DuckDB connection on ``db_path``. (The
      orchestrator's connection is unaffected.)
   2. Determine the set of eligible ``(contract, event)`` targets via
-     ``tables.targets_active_at(partition_start + 9_999)``.
+     ``tables.targets_active_at(last_block)``.
   3. For each target, run one DuckDB COPY in its own short
      transaction:
 
@@ -76,7 +76,7 @@ Sink workflow (one call to ``write_partition_files``):
              SELECT DISTINCT ON (block_number, transaction_index, log_index)
                  <columns in canonical order>
              FROM <hot_table>
-             WHERE block_number BETWEEN P AND P+9999
+             WHERE block_number BETWEEN first_block AND last_block
              ORDER BY block_number, transaction_index, log_index
          ) TO '<cold>/.../data.parquet.tmp-<uuid>'
          (FORMAT PARQUET, COMPRESSION ZSTD);
@@ -98,7 +98,7 @@ Sink workflow (one call to ``write_partition_files``):
 Why the COPY runs on a per-call read-only connection (not on the
 orchestrator's ``HotStore`` connection):
 
-  * The COPY for one 10K partition can take minutes. If it ran on
+  * The COPY for one UTC day can take minutes. If it ran on
     the orchestrator's connection, the orchestrator would be blocked
     for that whole time, defeating the purpose of running the sink
     in the background.
@@ -122,12 +122,16 @@ import threading
 import duckdb
 
 from lib.metadata_utils import create_parquet_metadata_json
-from lib.partition_utils import (
-    PARTITION_10K_LABEL,
-    PARTITION_1M_LABEL,
-    partition_dir,
-    partition_end,
-    partition_start,
+from lib.ymd_partition import (
+    assert_contiguous_day_keys,
+    day_block_span,
+    day_dir,
+    day_key_from_hive_dir,
+    day_key_parts,
+    day_label,
+    iter_manifest_day_keys,
+    next_day_key,
+    utc_midnight,
 )
 from lib.atomic_publish import (
     create_temp_location,
@@ -140,7 +144,6 @@ from .fee_charged import sql_poison_predicate
 from .persistence import ProgressCallback
 from .tables import (
     SCRAPE_START_BLOCK,
-    PARTITION_SIZE_10K,
     all_columns,
     all_targets,
     table_name,
@@ -156,8 +159,8 @@ from .tables import (
 class PartitionWriteResult:
     """Result of one ``write_partition_files`` call."""
 
-    partition_start: int
-    """The 10K-aligned start block that was written."""
+    day_key: int
+    """UTC day key ``YYYYMMDD`` that was written."""
 
     files_written: int
     """Number of ``data.parquet`` files written, one per eligible
@@ -176,14 +179,22 @@ class PartitionWriteResult:
 # Public API
 # ---------------------------------------------------------------------------
 
-def _manifest_dir(cold_path: Path, partition_start: int) -> Path:
-    return cold_path / "manifests" / partition_dir(partition_start)
+def _manifest_dir(cold_path: Path, day_key: int) -> Path:
+    return cold_path / "manifests" / day_dir(day_key)
 
 
-def _expected_targets_for_partition(partition_start: int) -> list[tuple[str, str]]:
-    # Completeness matches write_partition_files: a contract deployed by
-    # partition end still gets files in this 10K (DATA_DICTIONARY.md).
-    return targets_active_at(partition_end(partition_start))
+def _expected_targets_for_day(last_block: int) -> list[tuple[str, str]]:
+    """Contracts deployed by the day's last block still get that day's files."""
+    return targets_active_at(last_block)
+
+
+def _day_last_block(cold_path: Path, day_key: int) -> int | None:
+    """``max_block`` from metadata already on disk, or None if no file exists."""
+    try:
+        _min_block, max_block = day_block_span(cold_path, day_key)
+    except ValueError:
+        return None
+    return max_block
 
 
 def _validate_manifest_partition_dir(manifest_partition_dir: Path) -> None:
@@ -283,12 +294,12 @@ def _validate_or_prepare_partition_data_dir(partition_dir: Path) -> bool:
     return True
 
 
-def _publish_manifest_success_atomically(cold_path: Path, partition_start: int) -> None:
+def _publish_manifest_success_atomically(cold_path: Path, day_key: int) -> None:
     """Publish a manifest _SUCCESS folder atomically, using shared publish primitives.
     
     Raises V4Error if the final location already exists (immutability protection).
     """
-    final_dir = _manifest_dir(cold_path, partition_start)
+    final_dir = _manifest_dir(cold_path, day_key)
     manifests_parent = final_dir.parent
     final_name = final_dir.name
 
@@ -313,99 +324,102 @@ def _publish_manifest_success_atomically(cold_path: Path, partition_start: int) 
     publish_atomically(temp_location)
 
 
-def _cleanup_tmp_partition_dirs(cold_path: Path, partition_start: int) -> int:
-    """Clean up temp partition directories for a specific partition.
-    
-    Removes all .tmp directories matching the partition pattern across all
-    contract/event combinations. Uses shared cleanup primitives.
-    """
+def _day_tmp_rel(day_key: int) -> str:
+    """``year=YYYY/month=MM/day=DD.tmp`` beside the final day folder."""
+    rel = day_dir(day_key)
+    leaf = Path(rel).name
+    return str(Path(rel).with_name(leaf + ".tmp"))
+
+
+def _cleanup_tmp_partition_dirs(cold_path: Path, day_key: int) -> int:
+    """Remove ``day=DD.tmp`` directories for one day across every target."""
     removed = 0
-    k_tmp_dir = f"10K={partition_start}.tmp"
+    tmp_rel = _day_tmp_rel(day_key)
     for contract, event in all_targets():
-        tmp_dir = (
-            cold_path
-            / contract
-            / event
-            / partition_dir(partition_start).replace(f"10K={partition_start}", k_tmp_dir)
-        )
+        tmp_dir = cold_path / contract / event / tmp_rel
         if tmp_dir.exists():
             shutil.rmtree(tmp_dir, ignore_errors=True)
             removed += 1
     return removed
 
 
-def publish_manifest(cold_root: str, partition_start: int) -> bool:
-    """Declare one partition sunk by publishing its manifest ``_SUCCESS``.
+def publish_manifest(cold_root: str, day_key: int) -> bool:
+    """Declare one UTC day sunk by publishing its manifest ``_SUCCESS``.
 
-    A partition is sunk when, and only when, this marker exists: it is what every reader and
-    every derived dataset uses as the frontier. Call it as part of committing a partition, in
-    frontier order, before anything treats that partition as final.
-
-    Returns True if the partition is now declared sunk (published here, or already published on
-    an earlier run), False if its Parquet files are not all present yet.
+    A day is sunk when, and only when, this marker exists. The day must be
+    the next calendar day after the last manifest (or the first manifest).
+    Returns False when its Parquet files are not all present yet.
     """
     cold_path = Path(cold_root)
     if not cold_path.is_dir():
         raise ValueError(f"cold_root does not exist or is not a directory: {cold_root}")
 
-    manifest_dir = _manifest_dir(cold_path, partition_start)
+    day_key = int(day_key)
+    manifest_dir = _manifest_dir(cold_path, day_key)
     if manifest_dir.exists():
-        # Republishing would trip the immutability guard; a crash between publishing and
-        # committing must be able to resume.
         _validate_manifest_partition_dir(manifest_dir)
         return True
 
-    first_partition = (SCRAPE_START_BLOCK // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
-    previous = partition_start - PARTITION_SIZE_10K
-    if partition_start > first_partition and not (
-        _manifest_dir(cold_path, previous) / "_SUCCESS"
-    ).is_file():
+    keys = iter_manifest_day_keys(cold_path)
+    if keys and day_key != next_day_key(keys[-1]):
         raise V4Error(
-            f"refusing to declare 10K={partition_start} sunk while 10K={previous} has no "
-            "manifest: the frontier advances one partition at a time"
+            f"refusing to declare {day_label(day_key)} sunk before "
+            f"{day_label(next_day_key(keys[-1]))} has a manifest"
         )
 
-    rel_path = partition_dir(partition_start)
-    for contract, event in _expected_targets_for_partition(partition_start):
-        if not _validate_or_prepare_partition_data_dir(cold_path / contract / event / rel_path):
+    last_block = _day_last_block(cold_path, day_key)
+    if last_block is None:
+        return False
+    rel_path = day_dir(day_key)
+    for contract, event in _expected_targets_for_day(last_block):
+        if not _validate_or_prepare_partition_data_dir(
+            cold_path / contract / event / rel_path
+        ):
             return False
 
-    _publish_manifest_success_atomically(cold_path, partition_start)
-    _cleanup_tmp_partition_dirs(cold_path, partition_start)
+    _publish_manifest_success_atomically(cold_path, day_key)
+    _cleanup_tmp_partition_dirs(cold_path, day_key)
     return True
 
 
 def roll_forward_manifests_to_exhaustion(
     cold_root: str,
     *,
+    first_day_key: int | None = None,
     progress_cb: ProgressCallback | None = None,
     stop_event: threading.Event | None = None,
 ) -> int:
-    """Publish manifest ``_SUCCESS`` folders for every consecutive publishable partition.
+    """Publish ``_SUCCESS`` for every consecutive day whose files are complete.
 
-    Starts from the partition immediately after the current manifest frontier and
-    proceeds to exhaustion: it keeps publishing consecutive partitions until the
-    first partition that is not yet publishable.
+    With manifests already on disk, the next day is the calendar successor.
+    With none, ``first_day_key`` is the day of ``SCRAPE_START_BLOCK``. Without
+    either, there is nothing to publish.
     """
     cold_path = Path(cold_root)
     if not cold_path.is_dir():
         raise ValueError(f"cold_root does not exist or is not a directory: {cold_root}")
 
-    written = 0
-    pstart = _first_unsunk_partition_start(cold_root)
+    keys = iter_manifest_day_keys(cold_path)
+    if keys:
+        day_key = next_day_key(keys[-1])
+    elif first_day_key is not None:
+        day_key = int(first_day_key)
+    else:
+        return 0
 
+    written = 0
     while True:
         if stop_event and stop_event.is_set():
             raise OperationCancelled("manifest roll-forward interrupted")
 
-        if not publish_manifest(cold_root, pstart):
+        if not publish_manifest(cold_root, day_key):
             if progress_cb:
                 progress_cb(
                     op="manifest",
                     phase="stop",
                     rows_done=written,
-                    partition=pstart,
-                    message=f"stopped before 10K={pstart} (incomplete)",
+                    partition=day_key,
+                    message=f"stopped before {day_label(day_key)} (incomplete)",
                 )
             break
 
@@ -415,57 +429,24 @@ def roll_forward_manifests_to_exhaustion(
                 op="manifest",
                 phase="publish",
                 rows_done=written,
-                partition=pstart,
-                message=(
-                    f"published manifests/{partition_dir(pstart)} "
-                    f"for blocks [{pstart}, {partition_end(pstart)}]"
-                ),
+                partition=day_key,
+                message=f"published manifests/{day_dir(day_key)}",
             )
-
-        pstart += PARTITION_SIZE_10K
+        day_key = next_day_key(day_key)
 
     return written
 
 
-def _first_unsunk_partition_start(cold_root: str) -> int:
-    """Return the 10K-aligned start of the first partition after the manifest frontier."""
-    frontier = get_sunk_frontier(cold_root)
-    if frontier < SCRAPE_START_BLOCK:
-        return partition_start(SCRAPE_START_BLOCK)
-    pstart = frontier + 1
-    return (pstart // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
-
-
-def _parse_10k_folder_name(name: str) -> int | None:
-    """Return the 10K start from ``10K=N`` or ``10K=N.tmp``, else None."""
-    stem = name[:-4] if name.endswith(".tmp") else name
-    if not stem.startswith(f"{PARTITION_10K_LABEL}="):
-        return None
-    try:
-        val = int(stem.split("=", 1)[1])
-    except ValueError:
-        return None
-    if val % PARTITION_SIZE_10K != 0:
-        return None
-    return val
-
-
-def _discover_unpublished_partition_starts(
-    cold_path: Path, first_unsunk: int
-) -> set[int]:
-    """Find every event-tree ``10K=N`` at or above the first unsunk partition."""
+def _discover_day_keys(cold_path: Path) -> set[int]:
+    """Every event-tree ``year=/month=/day=`` folder, including ``day=DD.tmp``."""
     found: set[int] = set()
-    pattern = f"{PARTITION_1M_LABEL}=*/{PARTITION_10K_LABEL}=*"
-    for contract, event in all_targets():
-        base = cold_path / contract / event
-        if not base.is_dir():
+    for folder in cold_path.glob("*/*/year=*/month=*/day=*"):
+        if not folder.is_dir():
             continue
-        for ten_k in base.glob(pattern):
-            if not ten_k.is_dir():
-                continue
-            parsed = _parse_10k_folder_name(ten_k.name)
-            if parsed is not None and parsed >= first_unsunk:
-                found.add(parsed)
+        try:
+            found.add(day_key_from_hive_dir(folder))
+        except ValueError:
+            continue
     return found
 
 
@@ -485,10 +466,13 @@ def _folder_is_complete_two_file(folder: Path) -> bool:
     )
 
 
-def _unpublished_partition_is_complete(cold_path: Path, pstart: int) -> bool:
-    """True iff every expected target has a complete two-file folder and no extras."""
-    expected = _expected_targets_for_partition(pstart)
-    rel = partition_dir(pstart)
+def _unpublished_day_is_complete(cold_path: Path, day_key: int) -> bool:
+    """True iff every target deployed by the day's last block has both files."""
+    last_block = _day_last_block(cold_path, day_key)
+    if last_block is None:
+        return False
+    expected = _expected_targets_for_day(last_block)
+    rel = day_dir(day_key)
     expected_set = set(expected)
     for contract, event in expected:
         if not _folder_is_complete_two_file(cold_path / contract / event / rel):
@@ -514,19 +498,15 @@ def _remove_unpublished_path(path: Path) -> None:
         raise V4Error(f"could not remove unpublished path {path}: {e}") from e
 
 
-def _cleanup_unsunk_manifest_folder(cold_path: Path, pstart: int) -> int:
-    """Remove unpublished manifest folders for ``pstart``.
-
-    A ``_SUCCESS`` here would mean the partition is sunk; refuse rather than
-    delete it.
-    """
+def _cleanup_unsunk_manifest_folder(cold_path: Path, day_key: int) -> int:
+    """Remove an unpublished manifest folder. A ``_SUCCESS`` is refused."""
     removed = 0
-    manifest_rel = partition_dir(pstart)
-    manifest_tmp = cold_path / "manifests" / f"{manifest_rel}.tmp"
+    manifest_rel = day_dir(day_key)
     manifest_final = cold_path / "manifests" / manifest_rel
+    manifest_tmp = cold_path / "manifests" / _day_tmp_rel(day_key)
     if (manifest_final / "_SUCCESS").is_file():
         raise V4Error(
-            f"refusing to delete manifested partition 10K={pstart}: {manifest_final}"
+            f"refusing to delete manifested day {day_label(day_key)}: {manifest_final}"
         )
     for path in (manifest_tmp, manifest_final):
         if path.exists():
@@ -535,29 +515,25 @@ def _cleanup_unsunk_manifest_folder(cold_path: Path, pstart: int) -> int:
     return removed
 
 
-def _wipe_unpublished_partition_event_folders(cold_path: Path, pstart: int) -> int:
-    """Delete every event folder for an unpublished 10K.
-
-    Callers must only pass a partition with no manifest ``_SUCCESS``.
-    """
-    success = _manifest_dir(cold_path, pstart) / "_SUCCESS"
+def _wipe_unpublished_day_event_folders(cold_path: Path, day_key: int) -> int:
+    """Delete every event folder for an unpublished day."""
+    success = _manifest_dir(cold_path, day_key) / "_SUCCESS"
     if success.is_file():
         raise V4Error(
-            f"refusing to delete event folders for manifested partition "
-            f"10K={pstart}: {success}"
+            f"refusing to delete event folders for manifested day "
+            f"{day_label(day_key)}: {success}"
         )
     removed = 0
-    rel = partition_dir(pstart)
-    tmp_rel = rel.replace(f"10K={pstart}", f"10K={pstart}.tmp")
+    rel = day_dir(day_key)
+    tmp_rel = _day_tmp_rel(day_key)
     for contract, event in all_targets():
-        folder = cold_path / contract / event / rel
-        if folder.exists():
-            _remove_unpublished_path(folder)
-            removed += 1
-        tmp = cold_path / contract / event / tmp_rel
-        if tmp.exists():
-            _remove_unpublished_path(tmp)
-            removed += 1
+        for folder in (
+            cold_path / contract / event / rel,
+            cold_path / contract / event / tmp_rel,
+        ):
+            if folder.exists():
+                _remove_unpublished_path(folder)
+                removed += 1
     return removed
 
 
@@ -568,41 +544,37 @@ def cleanup_temp_dirs_after_frontier(
 ) -> int:
     """Remove unpublished leftovers above the manifest frontier.
 
-    Temp ``10K=N.tmp`` directories and unsunk manifest folders are removed.
-    Event folders for an unpublished 10K are removed unless every expected
-    target already has exactly ``data.parquet`` and ``metadata.json`` (crash
-    after a complete write, before ``publish_manifest``). Incomplete
-    unpublished 10Ks — parquet without metadata, mixed targets, extras —
-    are wiped as a unit so the next ``write_partition_files`` can redo them
-    from hot. Folders at or below the frontier are not inspected.
+    Incomplete day folders above the last manifested day are wiped so the
+    next write can redo them. A complete two-file day is left for
+    roll-forward. Days at or below the frontier are not inspected.
     """
     cold_path = Path(cold_root)
     if not cold_path.is_dir():
         raise ValueError(f"cold_root does not exist or is not a directory: {cold_root}")
 
-    first = _first_unsunk_partition_start(cold_root)
-    unpublished = _discover_unpublished_partition_starts(cold_path, first)
-    unpublished.add(first)
-
+    manifested = iter_manifest_day_keys(cold_path)
+    last = manifested[-1] if manifested else None
     removed = 0
-    for pstart in sorted(unpublished):
-        if (_manifest_dir(cold_path, pstart) / "_SUCCESS").is_file():
+    for day_key in sorted(_discover_day_keys(cold_path)):
+        if last is not None and day_key <= last:
+            continue
+        if (_manifest_dir(cold_path, day_key) / "_SUCCESS").is_file():
             raise V4Error(
                 "unpublished cleanup found _SUCCESS above the manifest frontier "
-                f"at 10K={pstart}"
+                f"at {day_label(day_key)}"
             )
-        removed += _cleanup_tmp_partition_dirs(cold_path, pstart)
-        removed += _cleanup_unsunk_manifest_folder(cold_path, pstart)
-        if not _unpublished_partition_is_complete(cold_path, pstart):
-            removed += _wipe_unpublished_partition_event_folders(cold_path, pstart)
+        removed += _cleanup_tmp_partition_dirs(cold_path, day_key)
+        removed += _cleanup_unsunk_manifest_folder(cold_path, day_key)
+        if not _unpublished_day_is_complete(cold_path, day_key):
+            removed += _wipe_unpublished_day_event_folders(cold_path, day_key)
 
     if progress_cb:
         progress_cb(
             op="manifest",
             phase="cleanup",
             rows_done=removed,
-            partition=first,
-            message=f"cleaned unpublished leftovers at 10K={first}",
+            partition=last,
+            message="cleaned unpublished day folders above the frontier",
         )
     return removed
 
@@ -610,94 +582,62 @@ def cleanup_temp_dirs_after_frontier(
 def read_manifest_frontier(
     cold_root: str,
     *,
+    first_day_key: int | None = None,
     progress_cb: ProgressCallback | None = None,
 ) -> tuple[int, int]:
-    """Read and validate manifest contiguity, returning (frontier, partition_count)."""
+    """Return ``(max_block, day_count)`` of the contiguous manifest run.
+
+    ``max_block`` comes from one ``metadata.json`` of the last day. No
+    manifests means ``SCRAPE_START_BLOCK - 1``. When ``first_day_key`` is
+    set, the lowest manifest must be that day.
+    """
     cold_path = Path(cold_root)
     if not cold_path.is_dir():
         raise ValueError(f"cold_root does not exist or is not a directory: {cold_root}")
 
-    manifests_root = cold_path / "manifests"
-    if not manifests_root.exists():
+    try:
+        keys = iter_manifest_day_keys(cold_path)
+    except ValueError as exc:
+        raise V4Error(str(exc)) from exc
+    if not keys:
         if progress_cb:
-            progress_cb(op="manifest", phase="read", rows_done=0, message="no manifests/ directory")
+            progress_cb(op="manifest", phase="read", rows_done=0, message="no manifest days")
         return SCRAPE_START_BLOCK - 1, 0
-    if not manifests_root.is_dir():
-        raise V4Error(f"manifests path exists but is not a directory: {manifests_root}")
+    if first_day_key is not None and keys[0] != int(first_day_key):
+        raise V4Error(
+            f"lowest manifest is {day_label(keys[0])}, "
+            f"expected {day_label(int(first_day_key))}"
+        )
+    try:
+        assert_contiguous_day_keys(keys)
+    except ValueError as exc:
+        raise V4Error(str(exc)) from exc
 
-    # TODO: Consider cutover to the shared strict frontier scanner in lib/
-    # (currently `scan_frontier_1M_10K_folders` in lib/derived_frontier.py).
-    # If/when we move this path over, rename that helper to a neutral name
-    # that is not derived-specific, then reuse it here for manifest frontier reads.
-    existing_partitions: list[int] = []
-    for partition_dir in manifests_root.glob("1M=*/10K=*"):
-        if not partition_dir.is_dir():
-            continue
-        if partition_dir.name.endswith(".tmp"):
-            continue
-        if not partition_dir.name.startswith(f"{PARTITION_10K_LABEL}="):
-            continue
-
-        try:
-            pval = int(partition_dir.name.split("=", 1)[1])
-        except ValueError as e:
-            raise V4Error(f"invalid manifest partition folder name: {partition_dir}") from e
-
-        if pval % PARTITION_SIZE_10K != 0:
-            raise V4Error(f"manifest partition is not 10K-aligned: {partition_dir}")
-
-        if pval < partition_start(SCRAPE_START_BLOCK):
-            raise V4Error(
-                f"manifest partition is before first allowed partition {partition_start(SCRAPE_START_BLOCK)}: "
-                f"{partition_dir}"
-            )
-
-        _validate_manifest_partition_dir(partition_dir)
-        existing_partitions.append(pval)
-
-    if not existing_partitions:
-        if progress_cb:
-            progress_cb(op="manifest", phase="read", rows_done=0, message="no manifest partitions")
-        return SCRAPE_START_BLOCK - 1, 0
-
-    existing_partitions = sorted(set(existing_partitions))
-    expected = partition_start(SCRAPE_START_BLOCK)
-    for idx, pstart in enumerate(existing_partitions, start=1):
-        if pstart != expected:
-            raise V4Error(
-                "non-contiguous manifest frontier: "
-                f"expected manifests for 10K={expected} before 10K={pstart}"
-            )
-        expected += PARTITION_SIZE_10K
+    for idx, day_key in enumerate(keys, start=1):
+        _validate_manifest_partition_dir(_manifest_dir(cold_path, day_key))
         if progress_cb:
             progress_cb(
                 op="manifest",
                 phase="read",
                 rows_done=idx,
-                rows_total=len(existing_partitions),
-                partition=pstart,
-                message=f"10K={pstart}",
+                rows_total=len(keys),
+                partition=day_key,
+                message=day_label(day_key),
             )
+    try:
+        _min_block, max_block = day_block_span(cold_path, keys[-1])
+    except ValueError as exc:
+        raise V4Error(str(exc)) from exc
+    return max_block, len(keys)
 
-    return partition_end(existing_partitions[-1]), len(existing_partitions)
 
-def get_sunk_frontier(cold_root: str) -> int:
-    """Return the sunk frontier inferred only from manifest ``_SUCCESS`` files.
+def get_sunk_frontier(cold_root: str, *, first_day_key: int | None = None) -> int:
+    """Highest sunk block, from contiguous ``manifests/year=/month=/day=/_SUCCESS``.
 
-    The frontier is the highest block ``N`` for which
-    ``manifests/1M={M}/10K={K}/_SUCCESS`` exists for every consecutive partition
-    starting at ``floor(SCRAPE_START_BLOCK / 10_000) * 10_000``.
-
-    Returns ``SCRAPE_START_BLOCK - 1`` if no manifest partition exists.
-
-    Args:
-        cold_root: Cold-tier root directory.
-
-    Raises:
-        ValueError: ``cold_root`` does not exist or is not a directory.
-        V4Error: manifest folders violate the v4 data dictionary contract.
+    The block number is ``max_block`` in that day's metadata. No manifests
+    returns ``SCRAPE_START_BLOCK - 1``.
     """
-    frontier, _count = read_manifest_frontier(cold_root)
+    frontier, _count = read_manifest_frontier(cold_root, first_day_key=first_day_key)
     return frontier
 
 
@@ -728,33 +668,37 @@ def _rollback_this_call_partition_files(
 def write_partition_files(
     db_path: str,
     cold_root: str,
-    partition_start: int,
+    day_key: int,
     *,
     duckdb_connect_config: dict[str, str] | None = None,
     progress_cb: ProgressCallback | None = None,
     stop_event: threading.Event | None = None,
 ) -> PartitionWriteResult:
-    """Write one 10K partition's complete set of Parquet files to the
-    cold tier.
+    """Write one UTC day's complete set of Parquet files to the cold tier.
 
     This is the cold-tier-producer half of the sink path. It opens its
     own read-only DuckDB connection on ``db_path``, runs every required
     COPY, renames the temp files into place, closes its connection, and
     returns. It does NOT touch the hot-DB bookkeeping; the orchestrator
-    must call ``HotStore.commit_sink(partition_start)`` after this
-    function returns successfully.
+    must call ``HotStore.commit_sink(day_key)`` after this function
+    returns successfully.
+
+    The block span comes from ``metadata.json`` already on disk, or from
+    ``utc_day_span`` in the hot DB when that day has not been written.
+    Eligible targets are ``tables.targets_active_at(last_block)``.
 
     Steps:
 
-      1. Open a read-only DuckDB connection on ``db_path``.
-      2. Determine the set of eligible ``(contract, event)`` targets
-         via ``tables.targets_active_at(partition_start + 9_999)``.
+      1. Open a read-only DuckDB connection on ``db_path`` unless every
+         expected file is already complete.
+      2. Resolve ``first_block`` and ``last_block``.
       3. For each target, run one DuckDB COPY (see module docstring for
          the exact SQL) to a sibling temp file. Verify the row count
          matches the raw (pre-dedup) count; raise ``DuplicateRowError``
-         on mismatch.
+         on mismatch. Every ``block_timestamp`` must fall on ``day_key``.
       4. Rename every temp file to ``data.parquet`` via ``os.replace``.
-      5. Write ``metadata.json`` next to each renamed parquet.
+      5. Write ``metadata.json`` next to each renamed parquet, with
+         ``year``, ``month``, ``day``, ``min_block``, and ``max_block``.
       6. Close the read-only connection.
 
     On any failure, every temp file written by this call is removed, and
@@ -763,12 +707,12 @@ def write_partition_files(
 
     Args:
         db_path: Absolute path to the hot ``.db`` file. The function
-            opens a fresh read-only connection on it; the orchestrator's
+            opens a fresh connection on it; the orchestrator's
             connection (if any) is unaffected.
         cold_root: Absolute path to the cold-tier root, the directory
             immediately containing per-contract subdirectories.
-        partition_start: Must be a multiple of 10_000 and ``>=
-            SCRAPE_START_BLOCK``.
+        day_key: UTC day ``YYYYMMDD``. Its ``first_block`` must be
+            ``>= SCRAPE_START_BLOCK``.
         progress_cb: Optional progress callback. Receives events for
             each ``(contract, event)`` COPY.
         stop_event: If set during the operation, raises
@@ -779,31 +723,34 @@ def write_partition_files(
         A ``PartitionWriteResult`` describing what was written.
 
     Raises:
-        ValueError: ``partition_start`` is not 10K-aligned or below
-            ``SCRAPE_START_BLOCK``, or ``cold_root`` does not exist, or
-            ``db_path`` does not exist.
+        ValueError: ``day_key`` is not a calendar day, the span starts
+            before ``SCRAPE_START_BLOCK``, the day is not a closed span,
+            ``cold_root`` does not exist, or ``db_path`` does not exist
+            when a write is required.
         DuplicateRowError: at least one ``(contract, event)`` cell
-            contains duplicate ``(block_number, transaction_index, log_index)`` rows
-            in the hot DB — a fatal logic error in the loading path.
+            contains duplicate ``(block_number, transaction_index,
+            log_index)`` rows in the hot DB — a fatal logic error in
+            the loading path.
         OperationCancelled: ``stop_event`` was set.
-        V4Error: any other DuckDB or filesystem failure.
+        V4Error: any other DuckDB or filesystem failure, including a
+            row whose timestamp is not on ``day_key``.
 
     Preconditions:
-        * Every required row for blocks in
-          ``[partition_start, partition_start + 9_999]`` has been
-          loaded via ``HotStore.persist`` and that call has returned
-          (i.e. its commit is durable). The orchestrator typically
-          ensures this by reading ``PersistResult.ready_partitions``
-          and only submitting partitions from there to this function.
+        * ``utc_day_span`` has a closed row for ``day_key``, unless
+          metadata for that day is already on disk.
+        * Every required row for blocks in ``[first_block, last_block]``
+          has been loaded via ``HotStore.persist`` and that call has
+          returned. The orchestrator submits days from
+          ``PersistResult.ready_partitions``.
 
     Postconditions on success:
         * For every eligible ``(contract, event)``, the file
-          ``{cold_root}/{contract}/{event}/1M=M/10K=K/data.parquet``
-          exists and matches the data dictionary's Parquet contract
-          exactly.
+          ``{cold_root}/{contract}/{event}/year=YYYY/month=MM/day=DD/data.parquet``
+          exists and matches the data dictionary's Parquet contract.
         * No partition-key columns inside any file.
-        * Rows in each file are sorted and deduplicated.
-        * The function's read-only DuckDB connection is closed.
+        * Rows in each file are sorted and deduplicated, and each
+          ``block_timestamp`` falls on that UTC day.
+        * The function's DuckDB connection is closed.
 
     Postconditions on failure:
         * No ``data.parquet`` or ``metadata.json`` files created by this
@@ -815,68 +762,76 @@ def write_partition_files(
 
     Note on caller responsibility:
         After this function returns successfully, the orchestrator
-        MUST call ``store.commit_sink(partition_start)`` (where
-        ``store`` is the ``HotStore`` instance owned by the
-        orchestrator). The frontier-ordering check lives inside
-        ``commit_sink``; calling partitions out of order is caught
-        there, not here.
+        MUST call ``store.commit_sink(day_key)``. The frontier-ordering
+        check lives inside ``commit_sink``; calling days out of order
+        is caught there, not here.
     """
-    if partition_start % PARTITION_SIZE_10K != 0:
-        raise ValueError(f"partition_start {partition_start} is not 10K-aligned")
-    # The first valid partition is ``floor(SCRAPE_START_BLOCK / 10K) * 10K``,
-    # which may be *below* ``SCRAPE_START_BLOCK`` itself (e.g.
-    # 33_600_000 < 33_605_403). The relevant invariant is that the
-    # partition's *end* block is at or above ``SCRAPE_START_BLOCK`` —
-    # otherwise the partition lies entirely in pre-scrape history and
-    # cannot contain any rows.
-    if partition_end(partition_start) < SCRAPE_START_BLOCK:
-        raise ValueError(
-            f"partition_start {partition_start} ends before "
-            f"SCRAPE_START_BLOCK {SCRAPE_START_BLOCK}"
-        )
+    day_key = int(day_key)
+    day_key_parts(day_key)
     cold_path = Path(cold_root)
     if not cold_path.is_dir():
         raise ValueError(f"cold_root does not exist or is not a directory: {cold_root}")
 
-    p_end = partition_end(partition_start)
-    rel_path = partition_dir(partition_start)
-    targets = targets_active_at(p_end)
-
-    complete_files: list[Path] = []
-    missing = 0
-    for contract, event in targets:
-        folder = cold_path / contract / event / rel_path
-        pq = folder / "data.parquet"
-        meta = folder / "metadata.json"
-        has_pq = pq.is_file()
-        has_meta = meta.is_file()
-        if has_pq and has_meta:
-            complete_files.append(pq)
-        elif has_pq or has_meta:
-            raise V4Error(
-                f"partial cold files for {contract}/{event} partition "
-                f"{partition_start}: expected data.parquet and metadata.json"
-            )
+    rel_path = day_dir(day_key)
+    known_span: tuple[int, int] | None
+    try:
+        known_span = day_block_span(cold_path, day_key)
+    except ValueError as exc:
+        # Missing metadata means the day has not been written. A span
+        # disagreement or a metadata file without min/max is corrupt.
+        if str(exc).startswith("no metadata.json"):
+            known_span = None
         else:
-            missing += 1
+            raise V4Error(str(exc)) from exc
 
-    if complete_files and missing:
-        raise V4Error(
-            f"partition {partition_start} is partially on disk "
-            f"({len(complete_files)} complete, {missing} missing targets)"
-        )
-    if complete_files and not missing:
-        # Crash recovery: the writer already landed every file. Do not
-        # touch them; the orchestrator still has to publish the manifest
-        # and commit_sink in frontier order.
-        return PartitionWriteResult(
-            partition_start=partition_start,
-            files_written=len(complete_files),
-            rows_total=0,
-            bytes_total=sum(p.stat().st_size for p in complete_files),
-            elapsed_ms=0.0,
-        )
+    def _classify(targets: list[tuple[str, str]]) -> tuple[list[Path], int]:
+        complete: list[Path] = []
+        absent = 0
+        for contract, event in targets:
+            folder = cold_path / contract / event / rel_path
+            pq = folder / "data.parquet"
+            meta = folder / "metadata.json"
+            has_pq = pq.is_file()
+            has_meta = meta.is_file()
+            if has_pq and has_meta:
+                complete.append(pq)
+            elif has_pq or has_meta:
+                raise V4Error(
+                    f"partial cold files for {contract}/{event} "
+                    f"{day_label(day_key)}: expected data.parquet and metadata.json"
+                )
+            else:
+                absent += 1
+        return complete, absent
 
+    if known_span is not None:
+        first_block, last_block = known_span
+        if first_block < SCRAPE_START_BLOCK:
+            raise ValueError(
+                f"{day_label(day_key)} starts at {first_block}, "
+                f"before SCRAPE_START_BLOCK {SCRAPE_START_BLOCK}"
+            )
+        targets = _expected_targets_for_day(last_block)
+        complete_files, missing = _classify(targets)
+        if complete_files and missing:
+            raise V4Error(
+                f"{day_label(day_key)} is partially on disk "
+                f"({len(complete_files)} complete, {missing} missing targets)"
+            )
+        if complete_files and not missing:
+            return PartitionWriteResult(
+                day_key=day_key,
+                files_written=len(complete_files),
+                rows_total=0,
+                bytes_total=sum(p.stat().st_size for p in complete_files),
+                elapsed_ms=0.0,
+            )
+    else:
+        first_block = 0
+        last_block = 0
+        targets = []
+
+    span_from_db = known_span is None
     if not Path(db_path).is_file():
         raise ValueError(f"db_path does not exist: {db_path}")
 
@@ -898,6 +853,46 @@ def write_partition_files(
         ) from e
 
     try:
+        if span_from_db:
+            row = con.execute(
+                "SELECT first_block, last_block FROM utc_day_span WHERE day_key = ?",
+                [day_key],
+            ).fetchone()
+            if row is None or row[1] is None:
+                raise ValueError(
+                    f"{day_label(day_key)} is not a closed span in the hot DB"
+                )
+            first_block = int(row[0])
+            last_block = int(row[1])
+            if first_block < SCRAPE_START_BLOCK:
+                raise ValueError(
+                    f"{day_label(day_key)} starts at {first_block}, "
+                    f"before SCRAPE_START_BLOCK {SCRAPE_START_BLOCK}"
+                )
+            if last_block < first_block:
+                raise ValueError(
+                    f"{day_label(day_key)} span [{first_block}, {last_block}] is empty"
+                )
+            targets = _expected_targets_for_day(last_block)
+            complete_files, missing = _classify(targets)
+            if complete_files and missing:
+                raise V4Error(
+                    f"{day_label(day_key)} is partially on disk "
+                    f"({len(complete_files)} complete, {missing} missing targets)"
+                )
+
+        year, month, dom = day_key_parts(day_key)
+        meta_parameters: dict[str, object] = {
+            "year": year,
+            "month": month,
+            "day": dom,
+            "min_block": first_block,
+            "max_block": last_block,
+        }
+        ts_lo = utc_midnight(day_key)
+        ts_hi = utc_midnight(next_day_key(day_key))
+        label = day_label(day_key)
+
         for contract, event in targets:
             if stop_event and stop_event.is_set():
                 raise OperationCancelled("write_partition_files interrupted")
@@ -909,7 +904,7 @@ def write_partition_files(
                     phase="copy",
                     rows_done=len(pending_renames),
                     rows_total=len(targets),
-                    partition=partition_start,
+                    partition=day_key,
                     message=f"{contract}/{event}",
                 )
 
@@ -921,42 +916,43 @@ def write_partition_files(
             dst_dir.mkdir(parents=True, exist_ok=True)
             dst = dst_dir / "data.parquet"
             # Immutability guard: the cold tier is append-only. A
-            # ``data.parquet`` at the destination means this partition
-            # has already been sunk for this (contract, event). Refuse
+            # ``data.parquet`` at the destination means this day has
+            # already been written for this (contract, event). Refuse
             # to write rather than risk clobbering it with an atomic
             # rename. The caller has a bug if we reach this point.
             if dst.exists():
                 raise V4Error(
                     f"refusing to overwrite immutable cold parquet at {dst}: "
-                    f"partition {partition_start} for {contract}/{event} already sunk"
+                    f"{label} for {contract}/{event} already written"
                 )
             tmp = dst_dir / f"data.parquet.tmp-{uuid.uuid4().hex}"
 
             # Count raw rows before dedup so we can detect duplicates.
             raw_row = con.execute(
                 f"SELECT COUNT(*) FROM {tbl} "
-                f"WHERE block_number BETWEEN {partition_start} AND {p_end}"
+                f"WHERE block_number BETWEEN {first_block} AND {last_block}"
             ).fetchone()
             if raw_row is None:
                 raise V4Error(
-                    f"could not count source rows for {contract}/{event} partition {partition_start}: empty result"
+                    f"could not count source rows for {contract}/{event} "
+                    f"{label}: empty result"
                 )
             raw_count = int(raw_row[0])
 
             if event == "fee_refunded" and raw_count > 0:
                 poison = con.execute(
                     f"SELECT COUNT(*) FROM {tbl} "
-                    f"WHERE block_number BETWEEN {partition_start} AND {p_end} "
+                    f"WHERE block_number BETWEEN {first_block} AND {last_block} "
                     f"AND ({sql_poison_predicate()})"
                 ).fetchone()
                 n_poison = int(poison[0]) if poison else 0
                 if n_poison:
                     raise V4Error(
-                        f"{contract}/{event} partition {partition_start}: "
+                        f"{contract}/{event} {label}: "
                         f"{n_poison} fee_charged value(s) are not uint256 decimals. "
                         "The decoder stored the indexed feeCharged topic as 32 raw bytes. "
-                        "Delete the hot DB and rescarpe unsunk blocks. "
-                        "Do not publish this partition."
+                        "Delete the hot DB and rescrape unsunk blocks. "
+                        "Do not publish this day."
                     )
 
             # COPY with DISTINCT ON deduplicates and sorts in one pass.
@@ -965,7 +961,7 @@ def write_partition_files(
                 f"    SELECT DISTINCT ON (block_number, transaction_index, log_index)\n"
                 f"        {col_list}\n"
                 f"    FROM {tbl}\n"
-                f"    WHERE block_number BETWEEN {partition_start} AND {p_end}\n"
+                f"    WHERE block_number BETWEEN {first_block} AND {last_block}\n"
                 f"    ORDER BY block_number, transaction_index, log_index\n"
                 f") TO '{tmp}' (FORMAT PARQUET, COMPRESSION ZSTD)"
             )
@@ -973,7 +969,7 @@ def write_partition_files(
                 con.execute(copy_sql)
             except Exception as e:
                 raise V4Error(
-                    f"COPY failed for {contract}/{event} partition {partition_start}: {e}"
+                    f"COPY failed for {contract}/{event} {label}: {e}"
                 ) from e
 
             # Verify: dedup must not change row count.
@@ -982,15 +978,28 @@ def write_partition_files(
             ).fetchone()
             if written_row is None:
                 raise V4Error(
-                    f"could not count written rows for {contract}/{event} partition {partition_start}: empty result"
+                    f"could not count written rows for {contract}/{event} "
+                    f"{label}: empty result"
                 )
             written_count = int(written_row[0])
             if written_count != raw_count:
                 tmp.unlink(missing_ok=True)
                 raise DuplicateRowError(
-                    f"{contract}/{event} partition {partition_start}: "
+                    f"{contract}/{event} {label}: "
                     f"{raw_count} raw rows but {written_count} after dedup — "
                     f"decoder logic error"
+                )
+
+            off_day = con.execute(
+                f"SELECT COUNT(*) FROM read_parquet('{tmp}') "
+                f"WHERE block_timestamp < {ts_lo} OR block_timestamp >= {ts_hi}"
+            ).fetchone()
+            n_off = int(off_day[0]) if off_day else 0
+            if n_off:
+                tmp.unlink(missing_ok=True)
+                raise V4Error(
+                    f"{contract}/{event} {label}: {n_off} row(s) have "
+                    f"block_timestamp outside that UTC day"
                 )
 
             file_bytes = tmp.stat().st_size
@@ -1004,11 +1013,11 @@ def write_partition_files(
                     phase="copy",
                     rows_done=len(pending_renames),
                     rows_total=len(targets),
-                    partition=partition_start,
+                    partition=day_key,
                     message=f"{contract}/{event}",
                 )
 
-    except (OperationCancelled, DuplicateRowError, V4Error):
+    except (OperationCancelled, DuplicateRowError, V4Error, ValueError):
         # Clean up any temp files written so far.
         for tmp_path, _ in pending_renames:
             try:
@@ -1027,7 +1036,7 @@ def write_partition_files(
         if opened_locally:
             con.close()
         raise V4Error(
-            f"write_partition_files failed for partition {partition_start}: {e}"
+            f"write_partition_files failed for {day_label(day_key)}: {e}"
         ) from e
 
     # Phase 2: atomic renames.  All COPY calls succeeded; rename each
@@ -1041,7 +1050,7 @@ def write_partition_files(
         if opened_locally:
             con.close()
         raise V4Error(
-            f"rename failed during write_partition_files partition {partition_start}: {e}"
+            f"rename failed during write_partition_files {day_label(day_key)}: {e}"
         ) from e
 
     if opened_locally:
@@ -1052,15 +1061,17 @@ def write_partition_files(
     # row-count and content-hash is the final, immutable cold-tier path.
     try:
         for _tmp_path, dst_path in pending_renames:
-            _create_metadata_json_for_single_parquet(dst_path)
+            _create_metadata_json_for_single_parquet(
+                dst_path, parameters=meta_parameters
+            )
     except Exception as e:
         _rollback_this_call_partition_files(pending_renames)
         raise V4Error(
-            f"metadata.json write failed for partition {partition_start}: {e}"
+            f"metadata.json write failed for {day_label(day_key)}: {e}"
         ) from e
     elapsed_ms = (time.monotonic() - t0) * 1000
     return PartitionWriteResult(
-        partition_start=partition_start,
+        day_key=day_key,
         files_written=len(pending_renames),
         rows_total=rows_total,
         bytes_total=bytes_total,

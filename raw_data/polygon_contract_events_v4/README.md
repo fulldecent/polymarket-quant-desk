@@ -12,7 +12,7 @@ python raw_data/polygon_contract_events_v4/main.py
 ```
 
 Run it again whenever you want fresh data. It resumes from the sunk frontier, so an interrupted
-run costs you nothing beyond the partition it was working on.
+run costs you nothing beyond the UTC day it was working on.
 
 `POLYGON_RPC_URL` accepts one or more HTTPS JSON-RPC URLs, separated by commas or whitespace.
 Each URL is an independent scrape lane with its own planner, worker pool, and sticky-footer line.
@@ -23,9 +23,9 @@ These options exist, and none of them is needed for a normal run:
 
 | Option | Default | What it does |
 | --- | --- | --- |
-| `--sink-workers N` | 1 | Parquet partitions written concurrently. |
+| `--sink-workers N` | 1 | UTC days written concurrently. |
 | `--max-calls N` | no limit | Stop after N RPC calls. Useful for a smoke test. |
-| `--lag-tolerance N` | 2 | Treat the scrape as caught up within N blocks of the chain head. |
+| `--lag-tolerance N` | 2 | Stop when the gap up to the safe head (chain head minus 256 blocks) is within N blocks. |
 
 ## How it tunes itself
 
@@ -71,7 +71,8 @@ python -m pytest raw_data/polygon_contract_events_v4/tests/data_validation -v
 
 ## Reproducibility
 
-Given identical source data (immutable blockchain and faithful RPC responses), this program will always generate Parquet files with the same rows in the same order within each partition.
+Given identical source data (immutable blockchain and faithful RPC responses), this program
+will always generate Parquet files with the same rows in the same order within each UTC day.
 
 ## Deployed contract source code
 

@@ -1,10 +1,12 @@
 """
 Assert: ``block_timestamp`` is present, non-null, constant per
-``block_number`` within a partition, and in a plausible Unix-seconds range.
+``block_number`` within a UTC day, and in a plausible Unix-seconds range.
 
-Header times come from ``eth_getBlockByNumber``. They are data, not a
-partition key. Polygon header times can go backwards; this test does not
-require timestamps to be monotonic.
+Header times come from ``eth_getBlockByNumber``. Bor rejects a header
+whose timestamp is not strictly after its parent by at least the period
+(``ErrInvalidTimestamp``, commit ``9c445ef``, ``consensus/bor/bor.go``
+lines 131–133). This test checks the stored Unix-seconds range and that
+one block has one timestamp. It does not walk consecutive headers.
 """
 from helpers import iter_partitions_with_files
 
@@ -32,7 +34,7 @@ def test_block_timestamp_is_unix_seconds(con):
             WHERE block_timestamp IS NULL
         """).fetchone()[0]
         if missing:
-            missing_offenders.append(f"10K={block_start} nulls={missing}")
+            missing_offenders.append(f"day {block_start} nulls={missing}")
 
         out_of_range = con.execute(f"""
             WITH all_events AS ({union_sql})

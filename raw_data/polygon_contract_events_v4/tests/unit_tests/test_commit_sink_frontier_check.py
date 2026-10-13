@@ -1,57 +1,47 @@
-"""
-Test for commit_sink frontier-ordering enforcement.
+"""commit_sink accepts only the closed day that starts on the next unsunk block."""
 
-The documented contract in _internal/README.md and persistence.py:
+import sys
+from pathlib import Path
 
-    "commit_sink must be passed the partition that extends the sunk
-     frontier by exactly one. Out-of-order commits raise PartitionFrontierError."
+import pytest
 
-This test verifies the frontier check logic by testing the expected
-partition computation without requiring actual Parquet files on disk.
-"""
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from raw_data.polygon_contract_events_v4._internal.tables import SCRAPE_START_BLOCK, PARTITION_SIZE_10K
+from _internal.errors import PartitionFrontierError
+from _internal.persistence import HotStore, HotStoreConfig
+from day_layout import D0, D1, bounds
+
+SCHEMA = str(Path(__file__).resolve().parents[2] / "schema.sql")
 
 
-def test_commit_sink_frontier_calculation_logic():
-    """
-    Verify the frontier calculation logic used by commit_sink.
-
-    This is a pure logic test that demonstrates the expected partition
-    computation is correct per the documented contract.
-    """
-    # Initial state: nothing sunk
-    sunk_frontier = SCRAPE_START_BLOCK - 1
-
-    # Expected first partition (from commit_sink implementation)
-    expected_first = (
-        (SCRAPE_START_BLOCK // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
-        if sunk_frontier == SCRAPE_START_BLOCK - 1
-        else ((sunk_frontier + 1) // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
+@pytest.fixture
+def store(tmp_path):
+    hot = HotStore(
+        str(tmp_path / "test.db"),
+        SCHEMA,
+        config=HotStoreConfig(duckdb_memory_limit="256MB", duckdb_temp_dir=str(tmp_path)),
     )
-
-    # The first valid partition may start before SCRAPE_START_BLOCK
-    # (e.g., 33600000 < 33605403)
-    assert expected_first <= SCRAPE_START_BLOCK
-    assert expected_first % PARTITION_SIZE_10K == 0
-
-    # The partition's END block must be >= SCRAPE_START_BLOCK
-    assert expected_first + PARTITION_SIZE_10K - 1 >= SCRAPE_START_BLOCK
+    hot.open_first_day(D0)
+    first, last = bounds(0)
+    hot.persist(first, last + 1, {}, day_cuts=[(D1, last + 1)])
+    yield hot
+    hot.close()
 
 
-def test_second_partition_calculation():
-    """
-    Verify that after sinking p0, the expected next partition is p0 + 10K.
-    """
-    p0 = (SCRAPE_START_BLOCK // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
+def test_commit_sink_rejects_a_later_day(store):
+    with pytest.raises(PartitionFrontierError):
+        store.commit_sink(D1)
 
-    # After sinking p0, sunk_frontier would be p0 + 9999
-    sunk_frontier_after_p0 = p0 + PARTITION_SIZE_10K - 1
+    _first, last = bounds(0)
+    store.commit_sink(D0)
+    assert store.get_sunk_frontier() == last
 
-    expected_next = (
-        (SCRAPE_START_BLOCK // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
-        if sunk_frontier_after_p0 == SCRAPE_START_BLOCK - 1
-        else ((sunk_frontier_after_p0 + 1) // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
-    )
 
-    assert expected_next == p0 + PARTITION_SIZE_10K
+def test_an_open_day_cannot_be_committed(store):
+    _first, last = bounds(0)
+    store.commit_sink(D0)
+
+    with pytest.raises(PartitionFrontierError, match="not a closed span"):
+        store.commit_sink(D1)
+    assert store.get_sunk_frontier() == last

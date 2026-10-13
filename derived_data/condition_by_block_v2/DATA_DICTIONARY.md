@@ -10,9 +10,9 @@ Files are stored in `$CONDITION_BY_BLOCK_V2_DIR`. References below to filenames 
 
 | Dataset | Role |
 |---|---|
-| `fills_v2` | Sole source. Every column is aggregated from fill legs in the same 10K partition. |
+| `fills_v2` | Sole source. Every column is aggregated from fill legs in the same UTC day. |
 
-`fills_v2` must be fully materialized through the target partition before this dataset is produced. The producer reads only partitions whose inclusive end block is `<=` the `fills_v2` frontier. It does not read `polygon_contract_events_v4` or `token_id_map_v2`.
+`fills_v2` must be materialized through the target UTC day before this dataset is produced. The producer reads only days at or before the contiguous `fills_v2` frontier. It does not read `polygon_contract_events_v4` or `token_id_map_v2`. Row grain stays `(block_number, condition_id)`.
 
 Fills after condition resolution are already suppressed in `fills_v2`; this dataset does not re-apply that filter.
 
@@ -33,7 +33,7 @@ USDC and condition-token amounts use 6 decimal places (raw units; `1_000_000` = 
 
 One row per `(block_number, condition_id)` that has at least one `fills_v2` leg in that block.
 
-A block in which a condition did not trade produces no row for that pair. A 10K partition in which no condition traded still writes a zero-row `data.parquet` plus `metadata.json`.
+A block in which a condition did not trade produces no row for that pair. A manifested UTC day in which no condition traded still writes a zero-row `data.parquet` plus `metadata.json`.
 
 ## Schema
 
@@ -91,11 +91,11 @@ This ordering makes each partition file row-for-row reproducible from identical 
 
 ## Partitioning
 
-**1M/10K nested partitioning** (same scheme as `fills_v2`).
+**UTC day folders** `year=YYYY/month=MM/day=DD` (same scheme as `fills_v2`). Row grain is unchanged: one row per `(block_number, condition_id)`.
 
-Each row is materialized in exactly the 10K partition whose block range contains its `block_number`. A 10K block range with no rows still writes a zero-row `data.parquet` plus `metadata.json`. Once written, a partition file is immutable.
+Each row is stored in the UTC day whose block span contains its `block_number`. The day identity is the folder, not a column. A manifested day with no rows still writes a zero-row `data.parquet` plus `metadata.json`. Once written, a day folder is immutable.
 
-The start partition is the 10K partition containing `SCRAPE_START_BLOCK`. Every consecutive 10K partition from there through the upstream frontier is materialized, with no gaps.
+Every contiguous manifested UTC day through the upstream frontier is materialized, with no gaps.
 
 ## Guarantees
 
@@ -106,18 +106,18 @@ When the producer exists, data-validation tests must assert:
 - No `NULL` values.
 - `octet_length(condition_id) = 32`.
 - Rows within each file are sorted by `(block_number, condition_id)`.
-- `(block_number, condition_id)` is unique within each partition.
+- `(block_number, condition_id)` is unique within each day file.
 - `fill_count ≥ 1`.
 - `high_yes_price ≥ low_yes_price`, `high_yes_price ≥ open_yes_price`, `high_yes_price ≥ close_yes_price`, `low_yes_price ≤ open_yes_price`, `low_yes_price ≤ close_yes_price`.
-- Against `fills_v2` for the same partition: `matched_usdc = sum(abs(gross_usdc)) / 2` and `matched_yes_tokens = sum(abs(net_yes_tokens)) / 2` and `fee_usdc = sum(fee_usdc)` and `fill_count = count(*)` grouped by `(block_number, condition_id)`.
-- Consecutive 10K coverage from the start partition through the landed frontier; every partition folder has `data.parquet` and `metadata.json`.
+- Against `fills_v2` for the same UTC day: `matched_usdc = sum(abs(gross_usdc)) / 2` and `matched_yes_tokens = sum(abs(net_yes_tokens)) / 2` and `fee_usdc = sum(fee_usdc)` and `fill_count = count(*)` grouped by `(block_number, condition_id)`.
+- Contiguous UTC-day coverage from the first manifested day through the landed frontier; every day folder has `data.parquet` and `metadata.json`. A missing day inside that range is a failure.
 
 ## Out of scope
 
 - Per-token / per-book OHLC. Users of this stack think in conditions. YES and NO books are coupled by the exchange matcher; the executable price is a condition object.
 - Splits, merges, redeems, converts, or any ledger other than `fills_v2`.
-- Resolution outcome. That lives on `condition_by_10k_v2`.
-- Account-level volume. That lives on `account_condition_by_10k_v2` / `account_by_10k_v2` as `volume_*` (not divided by two).
+- Resolution outcome. That lives on `condition_by_day_v2`.
+- Account-level volume. That lives on `account_condition_by_day_v2` / `account_by_day_v2` as `volume_*` (not divided by two).
 
 ## Versioning
 

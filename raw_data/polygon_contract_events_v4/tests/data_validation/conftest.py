@@ -99,7 +99,7 @@ def con():
 
 @pytest.fixture(scope="session")
 def ranges():
-    """Sorted list of complete 1M ranges for V1 exchange order_filled.
+    """Sorted UTC day keys present for both V1 exchange order_filled trees.
 
     Most legacy assertion queries rely on V1 fields like maker_asset_id and
     taker_asset_id, so this fixture intentionally scopes to V1 exchange paths.
@@ -113,6 +113,6 @@ def ranges():
         )
     )
     if not r:
-        pytest.skip("no complete 1M partitions found")
+        pytest.skip("no complete UTC days found")
     return r
 

@@ -124,6 +124,8 @@ import time
 import duckdb
 import pyarrow as pa
 
+from lib.ymd_partition import day_label, prev_day_key
+
 from .errors import (
     DuplicateRowError,
     OperationCancelled,
@@ -137,7 +139,6 @@ from .fee_charged import (
     reject_poison_value,
 )
 from .tables import (
-    PARTITION_SIZE_10K,
     SCRAPE_START_BLOCK,
     all_columns,
     all_table_names,
@@ -214,58 +215,50 @@ def _coalesce_ranges(
     return out
 
 
-def _find_ready_partitions(
+def _range_covered(
     unsunk_rows: list[tuple[int, int, bool]],
-) -> list[int]:
-    """Return every 10K-aligned partition start ``P`` such that the
-    inclusive range ``[P, P + 9_999]`` is fully covered by at least one
-    unsunk row in ``unsunk_rows``.
-
-    Special case for the first partition: blocks below
-    ``SCRAPE_START_BLOCK`` are conceptually pre-history and treated as
-    "covered by definition" since the scraper never records them. So
-    the first partition ``P0 = floor(SCRAPE_START_BLOCK / 10K) * 10K``
-    is considered ready when a row covers
-    ``[SCRAPE_START_BLOCK, P0 + 9_999]``, even though it does not
-    extend down to ``P0``.
-
-    All rows in ``unsunk_rows`` represent unsunk (not yet sunk to cold tier)
-    block ranges.
-    """
-    p0 = (SCRAPE_START_BLOCK // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
-    ready: list[int] = []
+    first: int,
+    last: int,
+) -> bool:
+    """True when one unsunk row contains ``[first, last]``."""
     for f, t, sunk in unsunk_rows:
-        # All rows should be unsunk at this point (only unsunk ranges remain in DB)
         if sunk:
             raise V4Error(
-                f"_find_ready_partitions received a sunk row ({f},{t}); "
-                f"logic error in row selection"
+                f"_range_covered received a sunk row ({f},{t}); "
+                "logic error in row selection"
             )
-        # First partition special case: an unsunk row that begins at
-        # or before ``SCRAPE_START_BLOCK`` and extends through the end
-        # of partition ``p0`` makes ``p0`` ready, even though the row
-        # does not extend all the way down to ``p0`` itself.
-        if f <= SCRAPE_START_BLOCK and t >= p0 + PARTITION_SIZE_10K - 1:
-            ready.append(p0)
-        # First 10K boundary strictly after the first-partition special
-        # case (so we don't double-count).
-        first_p = ((f + PARTITION_SIZE_10K - 1) // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
-        if first_p == p0:
-            first_p += PARTITION_SIZE_10K
-        p = first_p
-        while p + PARTITION_SIZE_10K - 1 <= t:
-            ready.append(p)
-            p += PARTITION_SIZE_10K
+        if f <= first and t >= last:
+            return True
+    return False
+
+
+def _find_ready_days(
+    unsunk_rows: list[tuple[int, int, bool]],
+    spans: list[tuple[int, int, int | None]],
+    *,
+    sunk_frontier: int,
+    safe_head: int | None,
+) -> list[int]:
+    """Return the next closed UTC day that is fully loaded and behind ``safe_head``.
+
+    A day is the next one only when its ``first_block`` is the first block
+    above ``sunk_frontier`` (or ``SCRAPE_START_BLOCK`` when nothing is sunk).
+    ``safe_head is None`` means the chain head is not known yet, so nothing
+    is ready. Later closed days wait their turn.
+    """
+    if safe_head is None:
+        return []
+    expected_first = (
+        SCRAPE_START_BLOCK if sunk_frontier < SCRAPE_START_BLOCK else sunk_frontier + 1
+    )
+    ready: list[int] = []
+    for day_key, first, last in spans:
+        if last is None or first != expected_first or last > safe_head:
+            continue
+        if _range_covered(unsunk_rows, first, last):
+            ready.append(day_key)
     ready.sort()
-    # De-duplicate while preserving order (multiple unsunk rows could
-    # in theory claim the same partition after coalescing — defensive).
-    seen: set[int] = set()
-    out: list[int] = []
-    for p in ready:
-        if p not in seen:
-            seen.add(p)
-            out.append(p)
-    return out
+    return ready
 
 
 # ---------------------------------------------------------------------------
@@ -307,19 +300,14 @@ class PersistResult:
     elapsed_ms: float
 
     ready_partitions: tuple[int, ...]
-    """10K-aligned partition start blocks that just became ready to sink
-    as a direct result of this call.
+    """UTC day keys (``YYYYMMDD``) that just became ready to sink.
 
-    A partition ``P`` is "ready to sink" when the inclusive range
-    ``[P, P + 9_999]`` is fully covered by unsunk rows of
-    ``loaded_block_ranges``.
-
-    Only partitions that were NOT already ready before this call appear
-    here; this lets the caller drive the sink writer with a simple
-    "append to my queue" pattern instead of polling. The tuple is sorted
-    ascending. May be empty if no full 10K partition was completed by
-    this call. May contain multiple partitions if this call covered
-    several 10K boundaries at once.
+    A day is ready when it is closed, it starts on the next unsunk block,
+    its block range is fully loaded, and its last block is ``<= safe_head``.
+    Only days that were not already ready before this call appear here.
+    The tuple is sorted ascending and is usually empty or a single day.
+    A day that closed before it was 256 blocks behind head is omitted
+    until a later call sees a high enough ``safe_head``.
     """
 
 
@@ -428,6 +416,8 @@ class HotStore:
         self._closed = False
         self._column_types: dict[str, dict[str, str]] = {}
         self.sunk_frontier = SCRAPE_START_BLOCK - 1  # In-memory sunk frontier, populated at startup
+        self.safe_head: int | None = None
+        self.first_day_key: int | None = None
 
         if not os.path.isfile(schema_path):
             raise FileNotFoundError(f"schema_path does not exist: {schema_path}")
@@ -474,6 +464,7 @@ class HotStore:
         """Ensure every table from schema.sql exists with the expected columns."""
         expected_tables = set(all_table_names())
         expected_tables.add("loaded_block_ranges")
+        expected_tables.add("utc_day_span")
 
         rows = self._conn.execute(
             """
@@ -569,6 +560,8 @@ class HotStore:
         to_block: int,
         rows_by_target: Mapping[tuple[str, str], Sequence[Mapping[str, object]]],
         *,
+        day_cuts: Sequence[tuple[int, int]] = (),
+        safe_head: int | None = None,
         progress_cb: ProgressCallback | None = None,
         stop_event: threading.Event | None = None,
     ) -> PersistResult:
@@ -716,12 +709,16 @@ class HotStore:
                 if stop_event and stop_event.is_set():
                     raise OperationCancelled("persist cancelled before start")
 
-                # Snapshot the "ready partitions" set BEFORE this call's
-                # changes so the diff against the post-call set gives us
-                # exactly the partitions whose final missing block landed
-                # in this transaction.
+                # Snapshot ready days before this call so the diff is only
+                # the days this transaction closed or covered.
+                head = self.safe_head if safe_head is None else safe_head
                 ready_before = set(
-                    _find_ready_partitions(self._get_loaded_ranges_unsunk(conn))
+                    _find_ready_days(
+                        self._get_loaded_ranges_unsunk(conn),
+                        self._load_day_spans(conn),
+                        sunk_frontier=self.sunk_frontier,
+                        safe_head=head,
+                    )
                 )
 
                 # Begin transaction
@@ -774,13 +771,18 @@ class HotStore:
                     (from_block, to_block),
                 )
 
-                # Coalesce unsunk ranges
+                # Coalesce unsunk ranges, then record any UTC midnights this
+                # chunk crossed. Cuts roll back with the rest of the transaction.
                 self._coalesce_unsunk_ranges(conn)
+                self._apply_day_cuts(conn, day_cuts)
 
-                # Determine which partitions just became ready as a direct
-                # result of this call.
                 ready_after = set(
-                    _find_ready_partitions(self._get_loaded_ranges_unsunk(conn))
+                    _find_ready_days(
+                        self._get_loaded_ranges_unsunk(conn),
+                        self._load_day_spans(conn),
+                        sunk_frontier=self.sunk_frontier,
+                        safe_head=head,
+                    )
                 )
                 newly_ready = tuple(sorted(ready_after - ready_before))
 
@@ -815,6 +817,138 @@ class HotStore:
         raise V4Error(
             f"persist failed after {_MVCC_MAX_ATTEMPTS} MVCC retries: {last_conflict}"
         ) from last_conflict
+
+    def set_safe_head(self, block: int) -> None:
+        """Remember the highest block the scraper is willing to sink."""
+        self.safe_head = int(block)
+
+    def open_first_day(self, day_key: int) -> None:
+        """Open the UTC day of ``SCRAPE_START_BLOCK`` if the hot DB has none.
+
+        A restart must see the same day. A different day already stored is
+        a fatal mismatch with the header that was just read.
+        """
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT day_key, first_block FROM utc_day_span ORDER BY first_block LIMIT 1"
+        ).fetchone()
+        day_key = int(day_key)
+        if row is None:
+            conn.execute(
+                "INSERT INTO utc_day_span (day_key, first_block, last_block) "
+                "VALUES (?, ?, NULL)",
+                [day_key, SCRAPE_START_BLOCK],
+            )
+            self.first_day_key = day_key
+            return
+        stored_day, stored_first = int(row[0]), int(row[1])
+        if stored_day != day_key or stored_first != SCRAPE_START_BLOCK:
+            raise V4Error(
+                f"hot DB opens {day_label(stored_day)} at block {stored_first}; "
+                f"header day is {day_label(day_key)} at {SCRAPE_START_BLOCK}"
+            )
+        self.first_day_key = day_key
+
+    def max_loaded_block(self) -> int | None:
+        """Highest ``to_block`` in ``loaded_block_ranges``, or None if empty."""
+        conn = self._get_conn()
+        row = conn.execute("SELECT MAX(to_block) FROM loaded_block_ranges").fetchone()
+        if row is None or row[0] is None:
+            return None
+        return int(row[0])
+
+    def current_day_span(self) -> tuple[int, int, int | None] | None:
+        """The open or next unsunk day: ``(day_key, first_block, last_block)``."""
+        expected = (
+            SCRAPE_START_BLOCK
+            if self.sunk_frontier < SCRAPE_START_BLOCK
+            else self.sunk_frontier + 1
+        )
+        conn = self._get_conn()
+        row = conn.execute(
+            """
+            SELECT day_key, first_block, last_block
+            FROM utc_day_span
+            WHERE first_block = ?
+            """,
+            [expected],
+        ).fetchone()
+        if row is None:
+            return None
+        last = None if row[2] is None else int(row[2])
+        return int(row[0]), int(row[1]), last
+
+    def _load_day_spans(
+        self, conn: duckdb.DuckDBPyConnection
+    ) -> list[tuple[int, int, int | None]]:
+        rows = conn.execute(
+            "SELECT day_key, first_block, last_block FROM utc_day_span ORDER BY first_block"
+        ).fetchall()
+        out: list[tuple[int, int, int | None]] = []
+        for day_key, first, last in rows:
+            out.append((int(day_key), int(first), None if last is None else int(last)))
+        return out
+
+    def _apply_day_cuts(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        cuts: Sequence[tuple[int, int]],
+    ) -> None:
+        """Record days that start at ``first_block`` and close the day before.
+
+        ``cuts`` is ``(day_key, first_block)`` in any order. The previous
+        day must already be open. A cut whose previous day is not open
+        fails the transaction so the chunk can be retried after the
+        earlier chunk lands.
+        """
+        for day_key, first_block in sorted((int(k), int(b)) for k, b in cuts):
+            if first_block < SCRAPE_START_BLOCK:
+                raise ValueError(
+                    f"day cut {day_label(day_key)} starts at {first_block}, "
+                    f"before SCRAPE_START_BLOCK"
+                )
+            prev = prev_day_key(day_key)
+            row = conn.execute(
+                "SELECT first_block, last_block FROM utc_day_span WHERE day_key = ?",
+                [prev],
+            ).fetchone()
+            if row is None:
+                raise V4Error(
+                    f"day cut {day_label(day_key)} at block {first_block} "
+                    f"but {day_label(prev)} is not open"
+                )
+            prev_first = int(row[0])
+            prev_last = None if row[1] is None else int(row[1])
+            new_last = first_block - 1
+            if new_last < prev_first:
+                raise V4Error(
+                    f"day cut {day_label(day_key)} at {first_block} ends "
+                    f"{day_label(prev)} before its first block {prev_first}"
+                )
+            if prev_last is None:
+                conn.execute(
+                    "UPDATE utc_day_span SET last_block = ? WHERE day_key = ?",
+                    [new_last, prev],
+                )
+            elif prev_last != new_last:
+                raise V4Error(
+                    f"{day_label(prev)} already ends at {prev_last}, not {new_last}"
+                )
+            existing = conn.execute(
+                "SELECT first_block FROM utc_day_span WHERE day_key = ?",
+                [day_key],
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO utc_day_span (day_key, first_block, last_block) "
+                    "VALUES (?, ?, NULL)",
+                    [day_key, first_block],
+                )
+            elif int(existing[0]) != first_block:
+                raise V4Error(
+                    f"{day_label(day_key)} already starts at {int(existing[0])}, "
+                    f"not {first_block}"
+                )
 
     def _coalesce_unsunk_ranges(self, conn: duckdb.DuckDBPyConnection) -> None:
         """Coalesce adjacent unsunk ranges in loaded_block_ranges.
@@ -1014,24 +1148,20 @@ class HotStore:
         """
         return self.sunk_frontier
 
-    def list_10k_partitions_ready_to_sink(self) -> list[int]:
-        """Return every 10K-aligned partition start block ``P`` such
-        that ``[P, P + 9999]`` is fully covered by unsunk rows of
-        ``loaded_block_ranges``, in ascending order.
+    def list_days_ready_to_sink(self) -> list[int]:
+        """Return UTC day keys that are closed, fully loaded, and ``<= safe_head``.
 
-        Normally a caller does not need to call this — ``persist()``
-        returns the same information incrementally via
-        ``PersistResult.ready_partitions``. This method is for recovery
-        / startup, where the caller wants the full backlog of unsunk
-        complete partitions before doing any ingestion.
-
-        Postconditions:
-            * Every returned ``P`` is a multiple of 10_000.
-            * Every returned ``P`` satisfies ``P >= SCRAPE_START_BLOCK``.
+        ``persist()`` reports the same fact incrementally. This method is
+        the startup backlog, including a day that closed earlier and was
+        waiting on ``safe_head``.
         """
         conn = self._get_conn()
-        loaded = self._get_loaded_ranges_unsunk(conn)
-        return _find_ready_partitions(loaded)
+        return _find_ready_days(
+            self._get_loaded_ranges_unsunk(conn),
+            self._load_day_spans(conn),
+            sunk_frontier=self.sunk_frontier,
+            safe_head=self.safe_head,
+        )
 
     # ------------------------------------------------------------------
     # Recovery
@@ -1045,125 +1175,41 @@ class HotStore:
         stop_event: threading.Event | None = None,
         manifest_frontier: int | None = None,
     ) -> int:
-        """Mark partitions as sunk based on Parquet files already on disk.
+        """Advance the in-memory frontier to the manifest frontier.
 
-        Walks the cold-tier directory tree under ``cold_tier_root`` and
-        marks every 10K partition whose ``data.parquet`` files are
-        present as ``sunk_to_parquet=TRUE`` in ``loaded_block_ranges``.
+        A parquet file with no manifest ``_SUCCESS`` does not move the
+        frontier. When ``manifest_frontier`` is omitted, the manifests
+        are read. A hole in that run raises ``V4Error``.
 
-        This is the recovery path after a crash that interrupted the
-        sink's final atomic commit: the Parquet files reached the cold
-        tier, but the hot DB was not yet updated. Calling this at
-        scraper startup re-syncs the two stores.
-
-        If ``manifest_frontier`` is provided, reconcile only scans forward
-        from that point, avoiding a full recursive glob of the cold tier.
-
-        Returns the number of partitions newly marked as sunk.
-
-        Args:
-            cold_tier_root: Absolute path to the cold-tier root.
-            progress_cb: Optional progress callback with ``op=\"reconcile\"``.
-            stop_event: Optional cancellation flag.
-            manifest_frontier: Optional hint (highest block in manifest).
-                Enables optimized scanning forward instead of full glob.
-
-        Raises:
-            OperationCancelled: ``stop_event`` was set.
+        Returns how many manifested days extend past the previous frontier.
         """
-        import glob
-        from pathlib import Path
+        from lib.ymd_partition import day_block_span, iter_manifest_day_keys
 
-        from .tables import PARTITION_SIZE_10K, SCRAPE_START_BLOCK
+        from .parquet_sink import get_sunk_frontier as get_manifest_frontier
 
-        cold_root = Path(cold_tier_root)
-        if not cold_root.is_dir():
+        if stop_event and stop_event.is_set():
+            raise OperationCancelled("reconcile interrupted")
+        if not os.path.isdir(cold_tier_root):
             raise FileNotFoundError(f"cold_tier_root does not exist: {cold_tier_root}")
-
-        # Discover partitions on disk. Optimized scan if manifest_frontier known.
-        partitions_on_disk: set[int] = set()
-
-        # Fetch the hot DB sunk frontier before the scan so we can extend the window past it.
-        # This prevents a scenario where manifest_frontier lags behind the hot DB sunk frontier
-        # (e.g. after a crash between cold-tier write and hot DB commit_sink), causing the scan
-        # to miss already-landed cold partitions and then re-submit them to the sink pool.
-        sunk_frontier = self.get_sunk_frontier()
-
-        # Optimized forward scan is only safe when the hot DB already has a sunk anchor.
-        # If the hot DB is fresh/empty (no sunk frontier), we must discover all landed cold
-        # partitions; otherwise older already-sunk partitions can be missed and later re-sunk.
-        can_use_optimized_scan = (
-            sunk_frontier > SCRAPE_START_BLOCK - 1
-            and manifest_frontier is not None
-            and manifest_frontier >= SCRAPE_START_BLOCK - 1
-        )
-
-        if can_use_optimized_scan:
-            # Optimized: scan forward from manifest frontier, extended to cover the hot DB sunk
-            # frontier so we always detect cold partitions that were written after the manifest
-            # frontier but before the sunk frontier was updated.
-            scan_start = ((manifest_frontier + 1) // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
-            scan_limit = scan_start + 1_000_000
-            if sunk_frontier > SCRAPE_START_BLOCK - 1:
-                # Extend window to reach at least 1 full 1M-block band past the sunk frontier.
-                scan_limit = max(scan_limit, sunk_frontier + 1_000_000)
-
-            for p in range(scan_start, scan_limit, PARTITION_SIZE_10K):
-                k1m = (p // 1_000_000) * 1_000_000
-                # Cold path: cold_root/<contract>/<event>/1M=.../10K=.../data.parquet
-                # Two wildcard levels needed; recursive=False treats ** as * (one level only).
-                pattern = str(cold_root / "*" / "*" / f"1M={k1m}" / f"10K={p}" / "data.parquet")
-                matches = glob.glob(pattern, recursive=False)
-                if matches:
-                    partitions_on_disk.add(p)
-        else:
-            # Fallback: full recursive glob (backward compat)
-            pattern = str(cold_root / "**" / "**" / "10K=*" / "data.parquet")
-            parquet_files = glob.glob(pattern, recursive=True)
-
-            for f in parquet_files:
-                try:
-                    part_dir = Path(f).parent.name
-                    if not part_dir.startswith("10K="):
-                        continue
-                    p = int(part_dir.split("=", 1)[1])
-                    if p + PARTITION_SIZE_10K - 1 >= SCRAPE_START_BLOCK:
-                        partitions_on_disk.add(p)
-                except (ValueError, IndexError):
-                    continue
-
-        if progress_cb:
-            progress_cb(
-                op="reconcile",
-                phase="scan",
-                rows_done=len(partitions_on_disk),
-                message=f"found {len(partitions_on_disk)} partitions on disk",
+        if manifest_frontier is None:
+            frontier = get_manifest_frontier(
+                cold_tier_root, first_day_key=self.first_day_key
             )
-
-        if sunk_frontier <= SCRAPE_START_BLOCK - 1:
-            expected_next = (SCRAPE_START_BLOCK // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
         else:
-            expected_next = ((sunk_frontier + 1) // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
-
-        newly_sunk = sorted(p for p in partitions_on_disk if p >= expected_next)
-
-        if not newly_sunk:
+            frontier = int(manifest_frontier)
+        old = self.sunk_frontier
+        if frontier <= old:
             if progress_cb:
-                progress_cb(op="reconcile", phase="update", message="no new partitions to mark")
+                progress_cb(
+                    op="reconcile", phase="update", message="no new days to mark"
+                )
             return 0
-
-        # The frontier means "[SCRAPE_START_BLOCK, N] is entirely sunk", so it may only advance
-        # across partitions that are contiguous from where it already is. A partition found on
-        # disk above a gap says nothing about the gap, which still has to be scraped.
         claimed = 0
-        expected = expected_next
-        for partition in newly_sunk:
-            if partition != expected:
-                break
-            self.sunk_frontier = partition + PARTITION_SIZE_10K - 1
-            expected = partition + PARTITION_SIZE_10K
-            claimed += 1
-
+        for day_key in iter_manifest_day_keys(cold_tier_root):
+            _min_block, max_block = day_block_span(cold_tier_root, day_key)
+            if max_block > old:
+                claimed += 1
+        self.sunk_frontier = frontier
         if progress_cb:
             progress_cb(
                 op="reconcile",
@@ -1171,131 +1217,87 @@ class HotStore:
                 rows_done=claimed,
                 message=f"advanced sunk frontier to {self.sunk_frontier}",
             )
-
         return claimed
 
     def populate_sunk_frontier_from_manifests(self, cold_tier_root: str) -> None:
-        """Populate in-memory sunk frontier by scanning manifest _SUCCESS files.
-        
-        This should be called at startup after manifest contiguity checks.
-        
-        Args:
-            cold_tier_root: Absolute path to the cold-tier root.
-        """
-        import glob
-        from pathlib import Path
-
+        """Set the in-memory frontier from manifest ``_SUCCESS`` files."""
         from .parquet_sink import get_sunk_frontier as get_manifest_frontier
-        from .tables import PARTITION_SIZE_10K
 
         try:
-            frontier = get_manifest_frontier(cold_tier_root)
-            self.sunk_frontier = frontier
-        except (FileNotFoundError, ValueError):
-            # No manifests exist yet
+            self.sunk_frontier = get_manifest_frontier(
+                cold_tier_root, first_day_key=self.first_day_key
+            )
+        except FileNotFoundError:
             self.sunk_frontier = SCRAPE_START_BLOCK - 1
 
-    # ------------------------------------------------------------------
-    # Async cleanup
-    # ------------------------------------------------------------------
+    def schedule_delete_sunk_partition_rows(self, first_block: int, last_block: int) -> None:
+        """Delete hot rows and loaded-range coverage for one sunk day.
 
-    def schedule_delete_sunk_partition_rows(self, partition_start: int) -> None:
-        """Schedule asynchronous deletion of rows for a sunk partition.
-        
-        After a partition is confirmed durable in cold-tier files and manifest
-        is written, rows from the hot DB are deleted asynchronously. This is
-        non-critical for correctness (manifest is the source of truth), so
-        deletions can happen independently from each other and from new ingestion.
-        
-        Args:
-            partition_start: Must be a multiple of 10_000, >= SCRAPE_START_BLOCK.
+        A loaded range that hangs past ``last_block`` keeps its tail. The
+        manifest remains the source of truth if this delete is interrupted.
         """
-        if partition_start % PARTITION_SIZE_10K != 0:
-            raise ValueError(f"partition_start {partition_start} is not 10K-aligned")
-        
-        p_end = partition_start + PARTITION_SIZE_10K - 1
+        if first_block > last_block:
+            raise ValueError(f"empty sunk range [{first_block}, {last_block}]")
         conn = self._get_conn()
-        
         try:
-            # Delete from every event table for this partition's block range
             for table in all_table_names():
                 conn.execute(
-                    f"""
-                    DELETE FROM {table}
-                    WHERE block_number BETWEEN ? AND ?
-                    """,
-                    (partition_start, p_end),
+                    f"DELETE FROM {table} WHERE block_number BETWEEN ? AND ?",
+                    (first_block, last_block),
                 )
+            covered = conn.execute(
+                """
+                SELECT from_block, to_block FROM loaded_block_ranges
+                WHERE NOT (to_block < ? OR from_block > ?)
+                """,
+                (first_block, last_block),
+            ).fetchall()
+            for raw_from, raw_to in covered:
+                f, t = int(raw_from), int(raw_to)
+                conn.execute(
+                    "DELETE FROM loaded_block_ranges WHERE from_block = ? AND to_block = ?",
+                    (f, t),
+                )
+                if f < first_block:
+                    conn.execute(
+                        "INSERT INTO loaded_block_ranges (from_block, to_block) VALUES (?, ?)",
+                        (f, first_block - 1),
+                    )
+                if t > last_block:
+                    conn.execute(
+                        "INSERT INTO loaded_block_ranges (from_block, to_block) VALUES (?, ?)",
+                        (last_block + 1, t),
+                    )
         except Exception as e:
-            raise V4Error(f"failed to delete partition {partition_start} rows: {e}") from e
+            raise V4Error(
+                f"failed to delete sunk rows [{first_block}, {last_block}]: {e}"
+            ) from e
 
+    def commit_sink(self, day_key: int) -> None:
+        """Mark one closed UTC day sunk and drop its hot rows.
 
-    # ------------------------------------------------------------------
-    # Sink integration
-    # ------------------------------------------------------------------
-
-    def commit_sink(self, partition_start: int) -> None:
-        """Mark a partition as sunk and schedule async cleanup.
-
-        Called by the orchestrator after a sink worker has reported success on
-        ``parquet_sink.write_partition_files`` AND the manifest file has been
-        written durably. By that time, every Parquet file for the partition is
-        durable and renamed into place.
-
-        This method:
-        1. Validates frontier ordering (partition must be the next in sequence).
-        2. Updates in-memory sunk_frontier.
-        3. Schedules async cleanup of rows from event tables.
-
-        The hot DB rows are deleted asynchronously (non-critical for correctness
-        since manifest is the source of truth). A crash leaves the files durable
-        and the rows in the hot DB; at next startup, sunk_frontier is
-        recalculated from manifest files, so the rows are ignored.
-
-        Frontier-ordering contract: ``partition_start`` must extend the existing
-        sunk frontier by exactly one 10K partition:
-
-          * If ``sunk_frontier == SCRAPE_START_BLOCK - 1`` (nothing sunk yet),
-            the first valid partition is
-            ``floor(SCRAPE_START_BLOCK / 10_000) * 10_000``.
-          * Otherwise, ``partition_start ==
-            (sunk_frontier + 1) // 10_000 * 10_000``, i.e. the partition
-            immediately above the current sunk frontier.
-
-        Out-of-order commits raise ``PartitionFrontierError``.
-
-        Preconditions:
-            * ``partition_start`` is a multiple of 10_000 and >= SCRAPE_START_BLOCK.
-            * [partition_start, partition_start + 9_999] is covered by
-              an unsunk row of ``loaded_block_ranges``.
-            * The Parquet files for this partition exist on disk for every
-              eligible (contract, event) and manifest has been written.
+        The day must start on the next unsunk block. Out-of-order commits
+        raise ``PartitionFrontierError``. The frontier advances to the day's
+        ``last_block``.
         """
-        if partition_start % PARTITION_SIZE_10K != 0:
-            raise ValueError(f"partition_start {partition_start} is not 10K-aligned")
-
-        if partition_start + PARTITION_SIZE_10K - 1 < SCRAPE_START_BLOCK:
-            raise ValueError(
-                f"partition_start {partition_start} ends before "
-                f"SCRAPE_START_BLOCK {SCRAPE_START_BLOCK}"
-            )
-
-        # Frontier check
-        sunk_frontier = self.get_sunk_frontier()
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT first_block, last_block FROM utc_day_span WHERE day_key = ?",
+            [int(day_key)],
+        ).fetchone()
+        if row is None or row[1] is None:
+            raise PartitionFrontierError(f"day {int(day_key)} is not a closed span")
+        first, last = int(row[0]), int(row[1])
         expected = (
-            (SCRAPE_START_BLOCK // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
-            if sunk_frontier == SCRAPE_START_BLOCK - 1
-            else ((sunk_frontier + 1) // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
+            SCRAPE_START_BLOCK
+            if self.sunk_frontier < SCRAPE_START_BLOCK
+            else self.sunk_frontier + 1
         )
-        if partition_start != expected:
+        if first != expected:
             raise PartitionFrontierError(
-                f"commit_sink out of order: got {partition_start}, expected {expected}"
+                f"commit_sink out of order: day {int(day_key)} starts at {first}, "
+                f"expected {expected}"
             )
-
-        # Advance the sunk frontier
-        p_end = partition_start + PARTITION_SIZE_10K - 1
-        self.sunk_frontier = p_end
-
-        # Schedule async cleanup of rows from event tables
-        self.schedule_delete_sunk_partition_rows(partition_start)
+        self.sunk_frontier = last
+        self.schedule_delete_sunk_partition_rows(first, last)
 

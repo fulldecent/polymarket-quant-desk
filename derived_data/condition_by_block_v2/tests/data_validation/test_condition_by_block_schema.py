@@ -44,15 +44,12 @@ def _output_dir() -> Path:
 
 def _all_data_files(out: Path) -> list[Path]:
     files = []
-    for m_dir in out.glob("1M=*"):
-        if not m_dir.is_dir():
+    for day_path in out.glob("year=*/month=*/day=*"):
+        if not day_path.is_dir() or day_path.name.endswith(".tmp"):
             continue
-        for k_dir in m_dir.glob("10K=*"):
-            if not k_dir.is_dir() or k_dir.name.endswith(".tmp"):
-                continue
-            data = k_dir / "data.parquet"
-            if data.exists():
-                files.append(data)
+        data = day_path / "data.parquet"
+        if data.exists():
+            files.append(data)
     return sorted(files)
 
 

@@ -9,8 +9,8 @@ OUTPUT
 ------
 Partitioned parquet at:
 
-    {CONDITION_BY_BLOCK_V2_DIR}/1M={N}/10K={K}/data.parquet
-    {CONDITION_BY_BLOCK_V2_DIR}/1M={N}/10K={K}/metadata.json
+    {CONDITION_BY_BLOCK_V2_DIR}/year=YYYY/month=MM/day=DD/data.parquet
+    {CONDITION_BY_BLOCK_V2_DIR}/year=YYYY/month=MM/day=DD/metadata.json
 
 See DATA_DICTIONARY.md for the full schema and invariant documentation.
 
@@ -19,7 +19,7 @@ USAGE
     python derived_data/condition_by_block_v2/main.py [options]
 
     --dry-run       print the work plan without writing any data
-    --sample N      process only the first N incomplete partitions
+    --sample N      process only the first N incomplete days
 """
 
 from __future__ import annotations
@@ -42,16 +42,10 @@ sys.path.insert(0, str(_project_root))
 from lib.env import require_directory_env, require_env  # noqa: E402
 from lib.git_utils import assert_git_clean  # noqa: E402
 from lib.metadata_utils import create_parquet_metadata_json, parquet_content_hash  # noqa: E402
-from lib.partition_utils import (  # noqa: E402
-    enumerate_partitions,
-    partition_dir,
-    partition_end,
-)
 from lib.run_logging import (  # noqa: E402
     PhaseWork,
     RunOutput,
     configure_duckdb_progress,
-    print_partition_sunk,
     print_paths,
     print_run_summary,
     print_work_plan,
@@ -62,12 +56,21 @@ from lib.atomic_publish import (  # noqa: E402
     create_temp_location,
     publish_atomically,
 )
-from lib.derived_frontier import scan_frontier_1M_10K_folders  # noqa: E402
+from lib.derived_frontier import scan_frontier_ymd_folders  # noqa: E402
+from lib.ymd_partition import (  # noqa: E402
+    assert_contiguous_day_keys,
+    day_block_span,
+    day_dir,
+    day_key_parts,
+    day_label,
+    iter_manifest_day_keys,
+)
 from raw_data.polygon_contract_events_v4 import SCRAPE_START_BLOCK  # noqa: E402
 
 DATASET = "condition_by_block_v2"
 SOURCE_SCRIPT = "derived_data/condition_by_block_v2/main.py"
 
+RAW = require_env("POLYGON_CONTRACT_EVENTS_V4_DIR")
 FILLS = require_env("FILLS_V2_DIR")
 OUT_DIR = require_env("CONDITION_BY_BLOCK_V2_DIR")
 SCRATCH_DIR = require_directory_env("SCRATCH_DIR")
@@ -80,8 +83,36 @@ def _sql_quote(value: str) -> str:
     return value.replace("'", "''")
 
 
-def _fills_path(k_val: int) -> Path:
-    return Path(FILLS) / partition_dir(k_val) / "data.parquet"
+def _fills_path(day_key: int) -> Path:
+    return Path(FILLS) / day_dir(day_key) / "data.parquet"
+
+
+def _manifest_days() -> list[int]:
+    keys = iter_manifest_day_keys(RAW)
+    assert_contiguous_day_keys(keys)
+    return keys
+
+
+def _covered_days(roots: list[str]) -> list[int]:
+    """Manifested days covered by a contiguous landed prefix of every root."""
+    raw_days = _manifest_days()
+    if not raw_days:
+        return []
+    covered = raw_days
+    start = raw_days[0]
+    for root in roots:
+        latest = scan_frontier_ymd_folders(
+            base_path=root,
+            starting_day_key=start,
+            tmp_suffix=".tmp",
+            cb_progress=lambda _day_key: None,
+        )
+        if latest is None:
+            return []
+        covered = [key for key in covered if key <= latest]
+        if not covered:
+            return []
+    return covered
 
 
 def yes_price_expr(alias: str = "f") -> str:
@@ -95,7 +126,7 @@ def yes_price_expr(alias: str = "f") -> str:
     """
 
 
-def _assert_no_zero_amounts(con: duckdb.DuckDBPyConnection, fills_path: Path, k_val: int) -> None:
+def _assert_no_zero_amounts(con: duckdb.DuckDBPyConnection, fills_path: Path, day_key: int) -> None:
     n = con.execute(
         f"""
         SELECT COUNT(*)
@@ -105,7 +136,7 @@ def _assert_no_zero_amounts(con: duckdb.DuckDBPyConnection, fills_path: Path, k_
     ).fetchone()[0]
     if n:
         raise RuntimeError(
-            f"10K={k_val}: {n} fills_v2 legs have net_yes_tokens = 0 or gross_usdc = 0"
+            f"{day_label(day_key)}: {n} fills_v2 legs have net_yes_tokens = 0 or gross_usdc = 0"
         )
 
 
@@ -156,9 +187,9 @@ def empty_sql() -> str:
     """
 
 
-def _partition_input_hashes(k_val: int) -> dict[str, str]:
+def _day_input_hashes(day_key: int) -> dict[str, str]:
     hashes: dict[str, str] = {}
-    path = _fills_path(k_val)
+    path = _fills_path(day_key)
     if path.exists():
         rel = str(path.relative_to(FILLS))
         hashes[rel] = parquet_content_hash(path)
@@ -168,23 +199,26 @@ def _partition_input_hashes(k_val: int) -> dict[str, str]:
 def _write_metadata(
     con: duckdb.DuckDBPyConnection,
     chunk_dir: Path,
-    m_val: int,
-    k_val: int,
+    day_key: int,
+    min_block: int,
+    max_block: int,
     input_hashes: dict[str, str],
 ) -> None:
     part = chunk_dir / "data.parquet"
     if not part.exists():
         raise RuntimeError(f"data.parquet not found at {part} after write; cannot create metadata")
+    year, month, day = day_key_parts(day_key)
     create_parquet_metadata_json(
         part,
         dataset=DATASET,
         source_script=SOURCE_SCRIPT,
         input_hashes=input_hashes,
         parameters={
-            "1M": m_val,
-            "10K": k_val,
-            "min_block": k_val,
-            "max_block": partition_end(k_val),
+            "year": year,
+            "month": month,
+            "day": day,
+            "min_block": min_block,
+            "max_block": max_block,
         },
         row_count_connection=con,
         created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -193,20 +227,22 @@ def _write_metadata(
 
 def process_chunk(
     con: duckdb.DuckDBPyConnection,
-    m_val: int,
-    k_val: int,
+    day_key: int,
+    min_block: int,
+    max_block: int,
     log: logging.Logger,
     *,
     work: PhaseWork | None = None,
 ) -> int:
-    chunk_dir = Path(OUT_DIR) / partition_dir(k_val)
+    chunk_dir = Path(OUT_DIR) / day_dir(day_key)
     if chunk_dir.exists():
         sys.exit(f"FATAL: refusing to overwrite immutable partition: {chunk_dir}")
     chunk_dir.parent.mkdir(parents=True, exist_ok=True)
 
-    fills_path = _fills_path(k_val)
+    label = day_label(day_key)
+    fills_path = _fills_path(day_key)
     if not fills_path.exists():
-        raise RuntimeError(f"fills_v2 partition missing for 10K={k_val}: {fills_path}")
+        raise RuntimeError(f"fills_v2 day missing for {label}: {fills_path}")
 
     if work is not None:
         work.phase("building")
@@ -214,7 +250,7 @@ def process_chunk(
         f"SELECT COUNT(*) FROM read_parquet('{_sql_quote(fills_path.as_posix())}')"
     ).fetchone()[0]
     if n_src:
-        _assert_no_zero_amounts(con, fills_path, k_val)
+        _assert_no_zero_amounts(con, fills_path, day_key)
         sql = aggregate_sql(fills_path)
     else:
         sql = empty_sql()
@@ -226,7 +262,7 @@ def process_chunk(
     )
     if work is not None:
         work.phase("hashing")
-    input_hashes = _partition_input_hashes(k_val)
+    input_hashes = _day_input_hashes(day_key)
     try:
         out_parquet = temp_loc.path / "data.parquet"
         if work is not None:
@@ -237,7 +273,7 @@ def process_chunk(
             f"(FORMAT PARQUET, COMPRESSION ZSTD)",
             work=work,
         )
-        _write_metadata(con, temp_loc.path, m_val, k_val, input_hashes)
+        _write_metadata(con, temp_loc.path, day_key, min_block, max_block, input_hashes)
         publish_atomically(temp_loc)
         row_count = int(
             con.execute(
@@ -245,18 +281,22 @@ def process_chunk(
                 [(chunk_dir / "data.parquet").as_posix()],
             ).fetchone()[0]
         )
-        log.info(f"10K={k_val}: wrote {row_count:,} condition-block bars")
+        log.info(f"{label}: wrote {row_count:,} condition-block bars")
         return row_count
     except Exception:
         cleanup_temp(temp_loc)
         raise
 
 
+def _print_day_sunk(out: RunOutput, day_key: int, rows: int, elapsed: float) -> None:
+    out.print(f"  -> day {day_label(day_key)}  rows {rows:,}  {elapsed:.1f}s")
+
+
 def main() -> None:
     global _global_con
     parser = argparse.ArgumentParser(description=f"Materialize {DATASET}")
     parser.add_argument("--dry-run", action="store_true", help="print work plan without writing")
-    parser.add_argument("--sample", type=int, default=0, help="process only first N partitions")
+    parser.add_argument("--sample", type=int, default=0, help="process only first N days")
     args = parser.parse_args()
 
     assert_git_clean(_project_root)
@@ -268,6 +308,7 @@ def main() -> None:
         out,
         output=OUT_DIR,
         extra=[
+            ("raw", RAW),
             ("fills", FILLS),
             ("scratch", SCRATCH_DIR),
         ],
@@ -283,44 +324,44 @@ def main() -> None:
 
     signal.signal(signal.SIGINT, _handle_sigint)
 
-    fills_latest = scan_frontier_1M_10K_folders(
-        base_path=FILLS,
-        starting_partition=SCRAPE_START_BLOCK,
-        tmp_suffix=".tmp",
-        cb_progress=lambda _partition: None,
+    available = _covered_days([FILLS])
+    frontier = day_block_span(RAW, available[-1])[1] if available else none_below
+    todo = [key for key in available if not (Path(OUT_DIR) / day_dir(key)).exists()]
+    already_landed = len(available) - len(todo)
+    self_latest = (
+        scan_frontier_ymd_folders(
+            base_path=OUT_DIR,
+            starting_day_key=available[0],
+            tmp_suffix=".tmp",
+            cb_progress=lambda _day_key: None,
+        )
+        if available
+        else None
     )
-    frontier = partition_end(fills_latest) if fills_latest is not None else none_below
-    all_partitions = enumerate_partitions(SCRAPE_START_BLOCK, frontier)
-
-    latest_landed = scan_frontier_1M_10K_folders(
-        base_path=OUT_DIR,
-        starting_partition=SCRAPE_START_BLOCK,
-        tmp_suffix=".tmp",
-        cb_progress=lambda _partition: None,
-    )
-    self_frontier = partition_end(latest_landed) if latest_landed is not None else none_below
-    todo_start = max(SCRAPE_START_BLOCK, self_frontier + 1)
-    todo = enumerate_partitions(todo_start, frontier)
-    already_landed = len(all_partitions) - len(todo)
+    self_frontier = day_block_span(RAW, self_latest)[1] if self_latest is not None else none_below
     if args.sample:
         todo = todo[: args.sample]
 
     print_work_plan(
         out,
         frontier=frontier,
-        total=len(all_partitions),
+        total=len(available),
         already_landed=already_landed,
         todo=len(todo),
         sample=args.sample,
     )
     out.log_only(f"# main — start at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
-    out.log_only(f"fills frontier:       {frontier:,}" if frontier > none_below else "fills frontier:       none")
+    out.log_only(
+        f"fills frontier:       {frontier:,}"
+        if frontier > none_below
+        else "fills frontier:       none"
+    )
     out.log_only(
         f"self frontier:        {self_frontier:,}"
         if self_frontier > none_below
         else "self frontier:        none"
     )
-    out.log_only(f"partitions total:     {len(all_partitions):,}")
+    out.log_only(f"days total:           {len(available):,}")
     out.log_only(f"already landed:       {already_landed:,}")
     out.log_only(f"to process:           {len(todo):,}")
     if args.sample:
@@ -328,11 +369,9 @@ def main() -> None:
 
     if args.dry_run:
         if todo:
-            first_m, first_k = todo[0]
-            last_m, last_k = todo[-1]
-            out.print(f"dry-run: would process {len(todo):,} partitions")
-            out.print(f"  first: 1M={first_m} 10K={first_k}")
-            out.print(f"  last:  1M={last_m} 10K={last_k}")
+            out.print(f"dry-run: would process {len(todo):,} days")
+            out.print(f"  first: {day_label(todo[0])}")
+            out.print(f"  last:  {day_label(todo[-1])}")
         else:
             out.print("dry-run: nothing to do")
         return
@@ -361,16 +400,17 @@ def main() -> None:
     status = "OK"
     with out.status:
         out.status.total(0, len(todo))
-        for m_val, k_val in todo:
+        for day_key in todo:
             if _stop_event.is_set():
                 status = "interrupted"
                 out.log_only("interrupted by user")
                 break
-            work = PhaseWork(out.status, f"10K={k_val:,}")
+            work = PhaseWork(out.status, day_label(day_key))
             work.phase("building")
             t0 = time.monotonic()
-            row_count = process_chunk(con, m_val, k_val, out.log, work=work)
-            print_partition_sunk(out, k_val, row_count, time.monotonic() - t0)
+            min_block, max_block = day_block_span(RAW, day_key)
+            row_count = process_chunk(con, day_key, min_block, max_block, out.log, work=work)
+            _print_day_sunk(out, day_key, row_count, time.monotonic() - t0)
             processed += 1
             rows_done += row_count
             out.status.total(processed, len(todo))
@@ -379,7 +419,7 @@ def main() -> None:
         status = "interrupted"
 
     if processed:
-        self_frontier = partition_end(todo[processed - 1][1])
+        self_frontier = day_block_span(RAW, todo[processed - 1])[1]
 
     print_run_summary(
         out,

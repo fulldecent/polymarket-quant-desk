@@ -17,10 +17,12 @@ _DATASET_DIR = Path(__file__).resolve().parents[2]
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from lib.partition_utils import partition_dir  # noqa: E402
+from lib.ymd_partition import day_dir  # noqa: E402
 
-K_VAL = 70_000_000
-M_VAL = 70_000_000
+DAY_KEY = 20261012
+MIN_BLOCK = 70_000_000
+MAX_BLOCK = 70_009_999
+K_VAL = MIN_BLOCK
 COND_A = bytes.fromhex("aa" * 32)
 COND_B = bytes.fromhex("bb" * 32)
 ACCT = bytes.fromhex("11" * 20)
@@ -37,7 +39,7 @@ def _load_main():
 
 
 def _write_fills(base: Path, rows: list[dict]) -> Path:
-    path = base / partition_dir(K_VAL) / "data.parquet"
+    path = base / day_dir(DAY_KEY) / "data.parquet"
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
         table = pa.table(
@@ -80,8 +82,8 @@ def _run(tmp_path: Path, rows: list[dict]):
     mod.OUT_DIR = str(out)
     con = duckdb.connect()
     log = logging.getLogger("test")
-    n = mod.process_chunk(con, M_VAL, K_VAL, log)
-    result_path = out / partition_dir(K_VAL) / "data.parquet"
+    n = mod.process_chunk(con, DAY_KEY, MIN_BLOCK, MAX_BLOCK, log)
+    result_path = out / day_dir(DAY_KEY) / "data.parquet"
     table = pq.read_table(result_path)
     return n, table, result_path
 

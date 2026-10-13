@@ -1,4 +1,4 @@
-"""Validate schema, types, and sort order for condition_by_10k_v2."""
+"""Validate schema, types, and sort order for condition_by_day_v2."""
 
 from __future__ import annotations
 
@@ -33,26 +33,23 @@ _EXPECTED_COLUMNS = [
 
 
 def _output_dir() -> Path:
-    val = os.environ.get("CONDITION_BY_10K_V2_DIR", "")
+    val = os.environ.get("CONDITION_BY_DAY_V2_DIR", "")
     if not val:
-        pytest.skip("CONDITION_BY_10K_V2_DIR is not set")
+        pytest.skip("CONDITION_BY_DAY_V2_DIR is not set")
     out = Path(val)
     if not out.exists():
-        pytest.skip(f"CONDITION_BY_10K_V2_DIR does not exist: {out}")
+        pytest.skip(f"CONDITION_BY_DAY_V2_DIR does not exist: {out}")
     return out
 
 
 def _all_data_files(out: Path) -> list[Path]:
     files = []
-    for m_dir in out.glob("1M=*"):
-        if not m_dir.is_dir():
+    for day_path in out.glob("year=*/month=*/day=*"):
+        if not day_path.is_dir() or day_path.name.endswith(".tmp"):
             continue
-        for k_dir in m_dir.glob("10K=*"):
-            if not k_dir.is_dir() or k_dir.name.endswith(".tmp"):
-                continue
-            data = k_dir / "data.parquet"
-            if data.exists():
-                files.append(data)
+        data = day_path / "data.parquet"
+        if data.exists():
+            files.append(data)
     return sorted(files)
 
 

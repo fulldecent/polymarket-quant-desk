@@ -7,24 +7,14 @@ This tightens test_fee_reconciliation_per_tx.py from a per-transaction sum
 check to a per-fill structural match (1:1 on order_hash, full decomposition).
 
 FeeModuleCTF deployed at block 75,253,526 and FeeModuleNegRisk at 75,253,721.
-Complete 1M ranges below those deployment blocks have no fee_refunded data, so
-the intersection of complete ranges naturally excludes the pre-module period.
+Days before those deployment blocks have no fee_refunded data, so the
+intersection of days present on both sides excludes the pre-module period.
 """
 from pathlib import Path
 
 import pytest
 
-from helpers import RAW, complete_1m_ranges_for_paths
-
-
-def _available_10ks(path: Path) -> set[int]:
-    if not path.exists():
-        return set()
-    return {
-        int(d.name.split("=")[1])
-        for d in path.iterdir()
-        if d.is_dir() and d.name.startswith("10K=")
-    }
+from helpers import complete_1m_ranges_for_paths, event_day_parquet
 
 
 def _bad_fills(con, of_path: Path, fr_path: Path) -> int:
@@ -63,17 +53,11 @@ def _run(con, exchange: str, fee_module: str) -> int:
     ranges = sorted(set(ranges_all[:3] + ranges_all[-3:]))
     bad_total = 0
 
-    for r in ranges:
-        of_base = Path(RAW) / exchange / "order_filled" / f"1M={r}"
-        fr_base = Path(RAW) / fee_module / "fee_refunded" / f"1M={r}"
-        common = sorted(_available_10ks(of_base) & _available_10ks(fr_base))
-        sampled = sorted(set(common[:2] + common[-2:]))
-
-        for k in sampled:
-            of_p = of_base / f"10K={k}" / "data.parquet"
-            fr_p = fr_base / f"10K={k}" / "data.parquet"
-            if of_p.exists() and fr_p.exists():
-                bad_total += _bad_fills(con, of_p, fr_p)
+    for day_key in ranges:
+        of_p = event_day_parquet(exchange, "order_filled", day_key)
+        fr_p = event_day_parquet(fee_module, "fee_refunded", day_key)
+        if of_p.exists() and fr_p.exists():
+            bad_total += _bad_fills(con, of_p, fr_p)
 
     return bad_total
 
@@ -82,7 +66,7 @@ def test_ctf_fee_refunded_per_fill(con):
     """CTFExchange: every order_filled has exactly one fee_refunded with correct decomposition."""
     result = _run(con, "CTFExchange", "FeeModuleCTF")
     if result == -1:
-        pytest.skip("no 1M ranges complete in both CTFExchange/order_filled and FeeModuleCTF/fee_refunded")
+        pytest.skip("no UTC days present in both CTFExchange/order_filled and FeeModuleCTF/fee_refunded")
     assert result == 0, (
         f"{result} CTFExchange order_filled row(s) lack a 1:1 fee_refunded match "
         "or fail refund + fee_charged == gross fee"
@@ -93,7 +77,10 @@ def test_negrisk_fee_refunded_per_fill(con):
     """NegRiskCtfExchange: every order_filled has exactly one fee_refunded with correct decomposition."""
     result = _run(con, "NegRiskCtfExchange", "FeeModuleNegRisk")
     if result == -1:
-        pytest.skip("no 1M ranges complete in both NegRiskCtfExchange/order_filled and FeeModuleNegRisk/fee_refunded")
+        pytest.skip(
+            "no UTC days present in both NegRiskCtfExchange/order_filled "
+            "and FeeModuleNegRisk/fee_refunded"
+        )
     assert result == 0, (
         f"{result} NegRiskCtfExchange order_filled row(s) lack a 1:1 fee_refunded match "
         "or fail refund + fee_charged == gross fee"

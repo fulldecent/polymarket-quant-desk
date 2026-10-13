@@ -12,8 +12,8 @@ the status line, and the orchestration that ties together the four library modul
         ``loaded_block_ranges`` bookkeeping, sink commit. Every write against the hot DB happens on
         this thread (the main thread).
     * ``_internal.parquet_sink.write_partition_files`` — runs in a background pool. Opens its own
-        read-only DuckDB connection on the hot DB, writes one 10K partition's complete set of
-        Parquet files, returns.
+        DuckDB connection on the hot DB, writes one UTC day's complete set of Parquet files,
+        returns.
 
 The control loop is:
 
@@ -21,17 +21,19 @@ The control loop is:
       already exist on the cold tier, so a crash between a sink worker's rename and the
       orchestrator's ``commit_sink`` is recovered automatically.
   2. Ask the chain for the current head block.
-  3. Compute gaps from ``SCRAPE_START_BLOCK`` to the head, print the startup banner.
+  3. Compute gaps from ``SCRAPE_START_BLOCK`` to ``chain_head - REORG_BUFFER_BLOCKS``, and print
+      the startup banner. Blocks inside the reorg buffer are not sunk.
   4. Carve requests off those gaps, sizing each one from measured event density
       (``_internal.chunk_planner``) and hill-climbing concurrency, result budget and post-response
       sleep on blocks/second in fixed-parameter epochs (``_internal.epoch_optimizer``).
-  5. As each RPC completes, decode the logs and call ``store.persist`` in a single atomic
-      transaction. Any 10K partition that just became ready is submitted to the sink pool.
-  6. As sink workers complete (in commit-frontier order), call
-     ``store.commit_sink(partition_start)`` to delete the partition's
-     hot rows and advance the sunk frontier.
-    7. When the queue drains, re-check the chain head; if new gaps appeared, rebuild the queue and
-         continue. Stop when within ``--lag-tolerance`` blocks of the head.
+  5. As each RPC completes, decode the logs, record any UTC midnight the chunk crossed, and call
+      ``store.persist`` in a single atomic transaction. Any closed day that is fully loaded and
+      at or below the safe head is submitted to the sink pool.
+  6. As sink workers complete (in calendar order), call ``store.commit_sink(day_key)`` to delete
+      the day's hot rows and advance the sunk frontier.
+  7. When the queue drains, re-check the chain head; if new gaps appeared below the safe head,
+      rebuild the queue and continue. Stop when the gap up to the safe head is within
+      ``--lag-tolerance`` blocks.
 
 CTRL-C is honored at every point in the loop. The first interrupt sets a shared stop flag that
 propagates into the RPC client, the persistence layer, the sink workers, and the rechunker. The
@@ -104,8 +106,13 @@ sys.path.insert(0, str(_project_root))
 
 from lib.env import require_directory_env  # noqa: E402
 from lib.git_utils import assert_git_clean  # noqa: E402
-from lib.partition_utils import mask_partition  # noqa: E402
 from lib.run_logging import format_duration  # noqa: E402
+from lib.ymd_partition import (  # noqa: E402
+    day_key_from_timestamp,
+    day_label,
+    first_block_on_or_after,
+    midnights_crossed,
+)
 
 from _internal.chunk_planner import ChunkPlanner
 from _internal.epoch_optimizer import MAX_WORKERS, EpochOptimizer
@@ -141,7 +148,7 @@ from _internal.rpc_client import (
     is_rate_limit_message,
 )
 from _internal.tables import (
-    PARTITION_SIZE_10K,
+    REORG_BUFFER_BLOCKS,
     SCRAPE_START_BLOCK,
 )
 
@@ -306,28 +313,63 @@ def _fmt_range(from_block: int, to_block: int) -> str:
     return f"{from_block:,}\u2013{to_block:,}"
 
 
-def _next_partition_progress(store: HotStore, sunk_frontier: int) -> tuple[int, int]:
-    """Return ``(partition_start, blocks_loaded)`` for the partition currently being filled.
-
-    Counts blocks present in hot-DB unsunk ranges regardless of contiguity.
-    """
-    next_start = (
-        (max(sunk_frontier, SCRAPE_START_BLOCK - 1) + 1) // PARTITION_SIZE_10K
-    ) * PARTITION_SIZE_10K
-    next_end = next_start + PARTITION_SIZE_10K - 1
-
+def _blocks_loaded_between(store: HotStore, start: int, end: int) -> int:
+    """Count unsunk loaded blocks that overlap ``[start, end]``."""
     loaded = 0
     for from_b, to_b, _ in store.list_loaded_ranges(include_sunk=False):
-        if to_b < next_start:
+        if to_b < start:
             continue
-        if from_b > next_end:
+        if from_b > end:
             break
-        overlap_start = max(from_b, next_start)
-        overlap_end = min(to_b, next_end)
+        overlap_start = max(from_b, start)
+        overlap_end = min(to_b, end)
         if overlap_start <= overlap_end:
             loaded += overlap_end - overlap_start + 1
+    return loaded
 
-    return next_start, min(loaded, PARTITION_SIZE_10K)
+
+def _day_cuts_for_chunk(
+    rpc_client: RpcClient,
+    from_block: int,
+    to_block: int,
+    ts_by_block: dict[int, int],
+) -> list[tuple[int, int]]:
+    """Return ``(day_key, first_block)`` for each UTC midnight this chunk crosses.
+
+    The left edge is the header of ``from_block - 1`` when that block is in
+    range, so a midnight that falls between two chunks is still a cut at
+    ``from_block``. Header time only moves forward, so each midnight has
+    one first block.
+    """
+    need = [from_block, to_block]
+    if from_block > SCRAPE_START_BLOCK:
+        need.append(from_block - 1)
+    missing = [block for block in need if block not in ts_by_block]
+    if missing:
+        ts_by_block.update(rpc_client.get_block_timestamps(missing))
+
+    left_block = from_block - 1 if from_block > SCRAPE_START_BLOCK else from_block
+    ts_left = ts_by_block[left_block]
+    ts_right = ts_by_block[to_block]
+    if ts_right < ts_left:
+        raise V4Error(
+            f"header time went backwards between block {left_block} and {to_block}"
+        )
+
+    def ts_at(block: int) -> int:
+        cached = ts_by_block.get(block)
+        if cached is None:
+            ts_by_block.update(rpc_client.get_block_timestamps([block]))
+            cached = ts_by_block[block]
+        return cached
+
+    cuts: list[tuple[int, int]] = []
+    search_lo = left_block
+    for midnight in midnights_crossed(ts_left, ts_right):
+        cut_block = first_block_on_or_after(ts_at, search_lo, to_block, midnight)
+        cuts.append((day_key_from_timestamp(midnight), cut_block))
+        search_lo = cut_block
+    return cuts
 
 
 # ---------------------------------------------------------------------------
@@ -739,7 +781,8 @@ def _fetch_range(
       * ``"cancelled"`` — ``_stop_event`` was set before the request finished.
 
     For ``ok`` the dict also has ``rows_by_target`` (``dict[(contract, event), list[row]]``),
-    ``raw_log_count``, and ``elapsed_sec``.
+    ``raw_log_count``, ``elapsed_sec``, and ``day_cuts`` (``list[(day_key, first_block)]``
+    for each UTC midnight the chunk crossed, including a zero-log chunk).
 
     The function never raises: the caller deals with structured outcomes only. Mid-flight
     cancellation via ``_stop_event`` returns ``"cancelled"`` rather than propagating
@@ -826,52 +869,61 @@ def _fetch_range(
         for rows in rows_by_target.values()
         for row in rows
     }
-    if block_numbers:
-        try:
-            ts_by_block = rpc_client.get_block_timestamps(list(block_numbers))
-        except OperationCancelled:
-            return {"status": "cancelled", "wid": wid, "elapsed_sec": time.monotonic() - t0}
-        except HTTPError as e:
-            _interruptible_sleep(sleep_after_response_sec)
-            if e.is_retryable:
-                return {
-                    "status": "throttled",
-                    "wid": wid,
-                    "elapsed_sec": time.monotonic() - t0,
-                    "http_status": e.status_code,
-                }
+    ts_by_block: dict[int, int] = {}
+    try:
+        if block_numbers:
+            ts_by_block.update(rpc_client.get_block_timestamps(sorted(block_numbers)))
+        day_cuts = _day_cuts_for_chunk(rpc_client, from_block, to_block, ts_by_block)
+    except OperationCancelled:
+        return {"status": "cancelled", "wid": wid, "elapsed_sec": time.monotonic() - t0}
+    except HTTPError as e:
+        _interruptible_sleep(sleep_after_response_sec)
+        if e.is_retryable:
             return {
-                "status": "fatal",
+                "status": "throttled",
                 "wid": wid,
                 "elapsed_sec": time.monotonic() - t0,
-                "error_message": f"header fetch: HTTP {e.status_code} from the RPC provider",
+                "http_status": e.status_code,
             }
-        except Exception as e:
-            _interruptible_sleep(sleep_after_response_sec)
-            if is_rate_limit_message(str(e)):
-                return {
-                    "status": "throttled",
-                    "wid": wid,
-                    "elapsed_sec": time.monotonic() - t0,
-                    "http_status": 429,
-                }
+        return {
+            "status": "fatal",
+            "wid": wid,
+            "elapsed_sec": time.monotonic() - t0,
+            "error_message": f"header fetch: HTTP {e.status_code} from the RPC provider",
+        }
+    except (ValueError, V4Error) as e:
+        return {
+            "status": "fatal",
+            "wid": wid,
+            "elapsed_sec": time.monotonic() - t0,
+            "error_message": f"header day cut: {type(e).__name__}: {e}",
+        }
+    except Exception as e:
+        _interruptible_sleep(sleep_after_response_sec)
+        if is_rate_limit_message(str(e)):
             return {
-                "status": "error",
+                "status": "throttled",
                 "wid": wid,
                 "elapsed_sec": time.monotonic() - t0,
-                "error_message": f"header fetch: {type(e).__name__}: {e}",
+                "http_status": 429,
             }
-        missing = block_numbers - set(ts_by_block)
-        if missing:
-            return {
-                "status": "fatal",
-                "wid": wid,
-                "elapsed_sec": time.monotonic() - t0,
-                "error_message": f"missing header timestamp for blocks {sorted(missing)[:8]}",
-            }
-        for rows in rows_by_target.values():
-            for row in rows:
-                row["block_timestamp"] = ts_by_block[row["block_number"]]
+        return {
+            "status": "error",
+            "wid": wid,
+            "elapsed_sec": time.monotonic() - t0,
+            "error_message": f"header fetch: {type(e).__name__}: {e}",
+        }
+    missing = block_numbers - set(ts_by_block)
+    if missing:
+        return {
+            "status": "fatal",
+            "wid": wid,
+            "elapsed_sec": time.monotonic() - t0,
+            "error_message": f"missing header timestamp for blocks {sorted(missing)[:8]}",
+        }
+    for rows in rows_by_target.values():
+        for row in rows:
+            row["block_timestamp"] = ts_by_block[row["block_number"]]
 
     _interruptible_sleep(sleep_after_response_sec)
 
@@ -881,6 +933,7 @@ def _fetch_range(
         "elapsed_sec": elapsed,
         "rows_by_target": rows_by_target,
         "raw_log_count": raw_log_count,
+        "day_cuts": day_cuts,
     }
 
 
@@ -952,21 +1005,21 @@ class _RpcLane:
 # ---------------------------------------------------------------------------
 #
 # ``write_partition_files`` runs in a background pool. The orchestrator tracks each in-flight
-# write by its ``partition_start`` so it can call ``HotStore.commit_sink`` in commit-frontier
-# order when futures finish.
+# write by its UTC day key so it can call ``HotStore.commit_sink`` in calendar order when
+# futures finish.
 #
-# Frontier order matters: ``commit_sink`` only accepts the partition immediately above the current
-# sunk frontier. The sink pool may finish out of order (faster partitions complete first), so the
-# orchestrator buffers completed-but-not-yet-committed results and drains them in order.
+# Order matters: ``commit_sink`` only accepts the day that starts on the next unsunk block.
+# The sink pool may finish out of order, so the orchestrator buffers completed results and
+# drains them in that order.
 
 class _SinkOrchestrator:
     """Manage the sink worker pool and frontier-ordered commits.
 
     Owns:
       * a ``ThreadPoolExecutor`` with at most ``--sink-workers`` threads;
-      * a map ``Future -> partition_start`` for in-flight writes;
-      * a buffer of completed-but-not-yet-committed ``(partition_start, write_result)`` entries,
-        keyed by ``partition_start`` so the orchestrator can pop them in frontier order.
+      * a map ``Future -> day_key`` for in-flight writes;
+      * a buffer of completed-but-not-yet-committed results, keyed by day key so the
+        orchestrator can pop them in calendar order.
 
     Used pattern:
 
@@ -1019,18 +1072,17 @@ class _SinkOrchestrator:
     def fatal_error(self) -> BaseException | None:
         return self._fatal_error
 
-    def submit(self, partition_start: int) -> None:
-        """Schedule one partition for sinking.
+    def submit(self, day_key: int) -> None:
+        """Schedule one closed UTC day for sinking.
 
-        Idempotent in the sense that already-submitted partitions are skipped — useful because
-        ``HotStore.persist`` may surface the same partition both via its ``ready_partitions`` field
-        and via a startup ``list_10k_partitions_ready_to_sink`` call.
+        Already-submitted days are skipped. ``persist`` and a later
+        ``list_days_ready_to_sink`` can both name the same day.
         """
-        if partition_start in self._submitted_partitions:
+        if day_key in self._submitted_partitions:
             return
         if _stop_event.is_set():
             return
-        self._submitted_partitions.add(partition_start)
+        self._submitted_partitions.add(day_key)
         # Sink workers use their own DuckDB connection with matching config.
         # This avoids cross-thread transactional contention on a shared
         # connection while still reading a consistent snapshot via MVCC.
@@ -1038,12 +1090,12 @@ class _SinkOrchestrator:
             write_partition_files,
             self._db_path,
             self._cold_root,
-            partition_start,
+            day_key,
             duckdb_connect_config=self._sink_connect_config,
             progress_cb=self._progress_cb,
             stop_event=_stop_event,
         )
-        self._in_flight[future] = partition_start
+        self._in_flight[future] = day_key
 
     def reap_completed(self) -> None:
         """Move any finished futures into the commit-pending buffer.
@@ -1054,72 +1106,67 @@ class _SinkOrchestrator:
         """
         done = [f for f in self._in_flight if f.done()]
         for fut in done:
-            partition_start = self._in_flight.pop(fut)
+            day_key = self._in_flight.pop(fut)
             try:
                 result = fut.result()
             except BaseException as e:  # noqa: BLE001
                 # Any worker exception is fatal: the cold tier could be inconsistent (some temp
-                # files unrenamed, some renamed in earlier partitions). Surface to the main loop
+                # files unrenamed, some renamed for an earlier day). Surface to the main loop
                 # so it can stop everything cleanly. Don't re-raise here so we can keep reaping
                 # the rest of the in-flight set for a cleaner shutdown.
-                self._submitted_partitions.discard(partition_start)
+                self._submitted_partitions.discard(day_key)
                 self._fatal_error = e
                 _print_message(
-                    f"  SINK FAIL  10K={partition_start:,}  "
+                    f"  SINK FAIL  {day_label(day_key)}  "
                     f"{type(e).__name__}: {e}"
                 )
                 continue
-            self._completed[partition_start] = result
+            self._completed[day_key] = result
 
     def commit_ready(self) -> int:
-        """Commit every completed partition that is at the sunk frontier.
+        """Commit every completed day that starts on the next unsunk block.
 
-        Returns the number of commits performed. Each call advances the sunk frontier by exactly
-        that many 10K partitions. Stops as soon as the next-expected partition is not yet in the
-        buffer.
+        Returns the number of commits performed. Stops as soon as that day
+        is not yet in the buffer. An open day is not committable.
 
         Must be called from the orchestrator thread because
         ``HotStore.commit_sink`` is single-threaded.
         """
         n_committed = 0
         while self._completed:
-            sunk_frontier = self._store.get_sunk_frontier()
-            if sunk_frontier <= SCRAPE_START_BLOCK - 1:
-                expected_next = (SCRAPE_START_BLOCK // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
-            else:
-                expected_next = ((sunk_frontier + 1) // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
+            span = self._store.current_day_span()
+            if span is None or span[2] is None:
+                return n_committed
+            expected_next = span[0]
             if expected_next not in self._completed:
                 return n_committed
             write_result = self._completed.pop(expected_next)
+            label = day_label(expected_next)
             try:
-                # The manifest is what makes a partition sunk, so it goes first and in frontier
-                # order. Only then may anything treat this partition as final.
+                # The manifest is what makes a day sunk, so it goes first and in
+                # calendar order. Only then may anything treat this day as final.
                 if not publish_manifest(self._cold_root, expected_next):
                     raise V4Error(
-                        f"partition {expected_next} is missing Parquet files for one or more "
+                        f"{label} is missing Parquet files for one or more "
                         "targets, so it cannot be declared sunk"
                     )
                 self._store.commit_sink(expected_next)
             except PartitionFrontierError as e:
-                # The library should not get here if we are computing ``expected_next`` correctly,
-                # so treat any frontier rejection as fatal rather than silently dropping the
-                # commit.
                 self._fatal_error = e
                 _print_message(
-                    f"  COMMIT_SINK FRONTIER ERROR  10K={expected_next:,}: {e}"
+                    f"  COMMIT_SINK FRONTIER ERROR  {label}: {e}"
                 )
                 return n_committed
             except V4Error as e:
                 self._fatal_error = e
                 _print_message(
-                    f"  COMMIT_SINK FAIL  10K={expected_next:,}: {e}"
+                    f"  COMMIT_SINK FAIL  {label}: {e}"
                 )
                 return n_committed
             n_committed += 1
             mb = write_result.bytes_total / (1024 * 1024)
-            partition_end = expected_next + PARTITION_SIZE_10K - 1
             _print_message(
-                f"  <- sunk {partition_end:,}"
+                f"  <- sunk {label}"
                 f"  rows: {write_result.rows_total:,}"
                 f"  bytes: {mb:.1f} MiB"
                 f"  {write_result.elapsed_ms / 1000:.1f}s"
@@ -1145,6 +1192,7 @@ def _print_banner(
     sunk_frontier: int,
     loaded_frontier: int,
     chain_head: int,
+    safe_head: int,
     gaps: list[tuple[int, int]],
     total_gap_blocks: int,
     unsunk_ranges: int,
@@ -1177,6 +1225,10 @@ def _print_banner(
     if unsunk_ranges > 0:
         banner_lines.append(f"unsunk ranges in hot: {unsunk_ranges}")
     banner_lines.append(f"chain head:           {chain_head:,}")
+    banner_lines.append(
+        f"safe head:            {safe_head:,}  "
+        f"(chain head minus {REORG_BUFFER_BLOCKS} blocks)"
+    )
     banner_lines.append("")
     if gaps:
         banner_lines.append(
@@ -1295,7 +1347,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--lag-tolerance", type=int, default=2,
-        help="stop when within N blocks of chain head (default: 2)",
+        help=(
+            "stop when the gap up to the safe head (chain head minus "
+            f"{REORG_BUFFER_BLOCKS} blocks) is within N blocks (default: 2)"
+        ),
     )
     args = parser.parse_args()
 
@@ -1417,7 +1472,7 @@ def main() -> None:
             sys.exit(f"Could not open hot DB at {env['db_path']}: {e}")
 
         # --- Read manifest frontier --------------------------------
-        # A published manifest means that partition is final. Incomplete event folders above the
+        # A published manifest means that day is final. Incomplete event folders above the
         # frontier are unpublished; cleanup below removes them before roll-forward, which
         # fail-fasts on a two-file violation.
         status_ui.spinner("startup", "Reading manifest frontier")
@@ -1426,7 +1481,7 @@ def main() -> None:
                                elapsed_ms=None, message="", partition=None):
             if partition is not None:
                 status_ui.spinner(
-                    "startup", f"Finding sunk partition {mask_partition(partition)}"
+                    "startup", f"Finding sunk day {day_label(partition)}"
                 )
 
         try:
@@ -1440,8 +1495,8 @@ def main() -> None:
         _print_message(f"Manifest frontier read complete: frontier={manifest_frontier:,}.")
 
         # --- Cleanup unpublished leftovers above the frontier -------
-        # Must run before roll-forward. Incomplete 10K folders (parquet without metadata, mixed
-        # targets) are unpublished junk; complete two-file 10Ks stay so roll-forward can publish
+        # Must run before roll-forward. Incomplete day folders (parquet without metadata, mixed
+        # targets) are unpublished junk; complete two-file days stay so roll-forward can publish
         # _SUCCESS.
         status_ui.spinner("startup", "Cleaning temporary files at the frontier")
 
@@ -1450,7 +1505,7 @@ def main() -> None:
             if partition is not None:
                 status_ui.spinner(
                     "startup",
-                    f"Cleaning temporary files for partition {mask_partition(partition)}",
+                    f"Cleaning temporary files for {day_label(partition)}",
                 )
 
         try:
@@ -1466,98 +1521,9 @@ def main() -> None:
             f"removed={cleaned_manifest:,} path(s)."
         )
 
-        # --- Roll manifest frontier forward -------------------------
-        status_ui.spinner("startup", "Touching up sunk partitions")
-
-        def _manifest_progress(*, op, phase, rows_done=None, rows_total=None,
-                               elapsed_ms=None, message="", partition=None):
-            if partition is not None:
-                status_ui.spinner(
-                    "startup", f"Touching up sunk partition {mask_partition(partition)}"
-                )
-
-        try:
-            published_manifests = roll_forward_manifests_to_exhaustion(
-                env["cold_root"],
-                progress_cb=_manifest_progress,
-                stop_event=_stop_event,
-            )
-        except OperationCancelled:
-            raise KeyboardInterrupt
-        except V4Error as e:
-            sys.exit(f"FATAL: manifest startup checks failed: {e}")
-
-        _print_message(
-            "Manifest roll-forward complete: "
-            f"published={published_manifests:,} partition(s)."
-        )
-
-        manifest_frontier = get_manifest_frontier(env["cold_root"])
-        # Manifest is the durable source of truth for sunk frontier at startup.
-        store.sunk_frontier = manifest_frontier
-
-        # --- Reconcile hot DB progress with cold tier ----------------
-        # If we crashed between a sink worker's rename and the orchestrator's commit_sink, the
-        # Parquet files reached disk but the hot DB still has the rows. Reconcile fixes that
-        # without re-scraping.
-        status_ui.spinner("startup", "Reading sunk partitions from the hot database")
-
-        def _reconcile_progress(*, op, phase, rows_done=None, rows_total=None,
-                                elapsed_ms=None, message="", partition=None):
-            if phase == "scan":
-                status_ui.spinner("startup", "Scanning the cold tier for sunk partitions")
-            elif phase == "update":
-                status_ui.spinner(
-                    "startup", "Recording sunk partitions in the hot database"
-                )
-
-        try:
-            newly_sunk = store.reconcile_with_cold_tier(
-                env["cold_root"],
-                progress_cb=_reconcile_progress,
-                stop_event=_stop_event,
-                manifest_frontier=manifest_frontier,
-            )
-        except OperationCancelled:
-            raise KeyboardInterrupt
-        except V4Error as e:
-            sys.exit(f"FATAL: reconcile_with_cold_tier failed: {e}")
-        if newly_sunk:
-            _print_message(f"Reconciled {newly_sunk:,} partition(s) from existing cold-tier files.")
-
-        # --- Sink orchestrator --------------------------------------
-        def _sink_progress_cb(*, op, phase, rows_done=None, rows_total=None,
-                              elapsed_ms=None, message="", partition=None):
-            # Takes over the partition row: by the time a partition is being written, it is full.
-            if op == "sink" and phase == "copy" and partition is not None:
-                status_ui.bar(
-                    "partition",
-                    f"Sinking partition {mask_partition(partition)}",
-                    rows_done or 0,
-                    rows_total or 1,
-                )
-
-        sink = _SinkOrchestrator(
-            store=store,
-            db_path=env["db_path"],
-            cold_root=env["cold_root"],
-            max_workers=args.sink_workers,
-            progress_cb=_sink_progress_cb,
-        )
-
-        # Anything already in the hot DB and ready to sink at startup (e.g. a clean shutdown after
-        # persist but before sink) should go to the sink pool immediately.
-        backlog = store.list_10k_partitions_ready_to_sink()
-        for p in backlog:
-            sink.submit(p)
-        if backlog:
-            _print_message(f"Submitted {len(backlog):,} pre-existing ready partition(s) to the sink pool.")
-
-        status_ui.clear("startup")
-
         # --- Chain head ---------------------------------------------
-        # Queried in parallel with all of the startup disk work above; needed only now, to plan
-        # the scrape. Any failure is fatal.
+        # Queried in parallel with the startup disk work above. Roll-forward needs the
+        # scrape-start header, so the head join happens before any day is published.
         try:
             chain_head = head_future.result()
         except OperationCancelled:
@@ -1578,11 +1544,162 @@ def main() -> None:
                 f"returning incorrect data or is in a failed state."
             )
 
+        loaded_max = store.max_loaded_block()
+        if loaded_max is not None and loaded_max > chain_head:
+            sys.exit(
+                f"FATAL: chain head {chain_head:,} is behind loaded block {loaded_max:,}. "
+                "The RPC endpoint rewound into data already stored."
+            )
+
         _log_event("chain_head", f"chain head {chain_head:,}", chain_head=chain_head)
 
-        # Work planning must ignore already-sunk history and only consider
-        # unsunk coverage above the sunk frontier.
-        gaps = store.find_gaps(SCRAPE_START_BLOCK, chain_head, include_sunk=False)
+        # --- First UTC day, from one header of SCRAPE_START_BLOCK ----
+        status_ui.spinner("startup", "Reading the scrape-start header")
+        first_day_key: int | None = None
+        header_errors: list[str] = []
+        for lane in lanes:
+            if not lane.live:
+                continue
+            try:
+                stamps = lane.client.get_block_timestamps([SCRAPE_START_BLOCK])
+                first_day_key = day_key_from_timestamp(stamps[SCRAPE_START_BLOCK])
+                break
+            except OperationCancelled:
+                raise KeyboardInterrupt
+            except Exception as e:  # noqa: BLE001
+                header_errors.append(f"{lane.label}: {e}")
+                _fail_lane(lane, str(e))
+        if first_day_key is None:
+            detail = "; ".join(header_errors) if header_errors else "no live RPC endpoints"
+            sys.exit(
+                "FATAL: could not read the header of "
+                f"SCRAPE_START_BLOCK {SCRAPE_START_BLOCK:,}: {detail}"
+            )
+        try:
+            store.open_first_day(first_day_key)
+        except V4Error as e:
+            sys.exit(f"FATAL: {e}")
+
+        # --- Roll manifest frontier forward -------------------------
+        status_ui.spinner("startup", "Touching up sunk days")
+
+        def _manifest_progress(*, op, phase, rows_done=None, rows_total=None,
+                               elapsed_ms=None, message="", partition=None):
+            if partition is not None:
+                status_ui.spinner(
+                    "startup", f"Touching up sunk day {day_label(partition)}"
+                )
+
+        try:
+            published_manifests = roll_forward_manifests_to_exhaustion(
+                env["cold_root"],
+                first_day_key=first_day_key,
+                progress_cb=_manifest_progress,
+                stop_event=_stop_event,
+            )
+        except OperationCancelled:
+            raise KeyboardInterrupt
+        except V4Error as e:
+            sys.exit(f"FATAL: manifest startup checks failed: {e}")
+
+        _print_message(
+            "Manifest roll-forward complete: "
+            f"published={published_manifests:,} day(s)."
+        )
+
+        manifest_frontier = get_manifest_frontier(
+            env["cold_root"], first_day_key=first_day_key
+        )
+        # Manifest is the durable source of truth for sunk frontier at startup.
+        store.sunk_frontier = manifest_frontier
+
+        # --- Reconcile hot DB progress with cold tier ----------------
+        # If we crashed between a sink worker's rename and the orchestrator's commit_sink, the
+        # Parquet files reached disk but the hot DB still has the rows. Reconcile fixes that
+        # without re-scraping. Parquet with no manifest does not move the frontier.
+        status_ui.spinner("startup", "Reading sunk days from the hot database")
+
+        def _reconcile_progress(*, op, phase, rows_done=None, rows_total=None,
+                                elapsed_ms=None, message="", partition=None):
+            if phase == "scan":
+                status_ui.spinner("startup", "Scanning the cold tier for sunk days")
+            elif phase == "update":
+                status_ui.spinner(
+                    "startup", "Recording sunk days in the hot database"
+                )
+
+        try:
+            newly_sunk = store.reconcile_with_cold_tier(
+                env["cold_root"],
+                progress_cb=_reconcile_progress,
+                stop_event=_stop_event,
+                manifest_frontier=manifest_frontier,
+            )
+        except OperationCancelled:
+            raise KeyboardInterrupt
+        except V4Error as e:
+            sys.exit(f"FATAL: reconcile_with_cold_tier failed: {e}")
+        if newly_sunk:
+            _print_message(f"Reconciled {newly_sunk:,} day(s) from existing cold-tier files.")
+
+        # --- Sink orchestrator --------------------------------------
+        # Spinner and bar for key "partition" live in different stores. clear() drops both,
+        # so a mode switch clears first and then sets only one.
+        part_mode: str | None = None
+        spin_day: int | None = None
+        spin_t0 = 0.0
+
+        def _show_partition_spinner(description: str) -> None:
+            nonlocal part_mode
+            if part_mode != "spin":
+                status_ui.clear("partition")
+                part_mode = "spin"
+            status_ui.spinner("partition", description)
+
+        def _show_partition_bar(description: str, done: int, total: int) -> None:
+            nonlocal part_mode
+            if part_mode != "bar":
+                status_ui.clear("partition")
+                part_mode = "bar"
+            status_ui.bar("partition", description, done, total)
+
+        def _sink_progress_cb(*, op, phase, rows_done=None, rows_total=None,
+                              elapsed_ms=None, message="", partition=None):
+            # Takes over the day row while files for that day are copied.
+            if op == "sink" and phase == "copy" and partition is not None:
+                _show_partition_bar(
+                    f"Sinking {day_label(partition)}",
+                    rows_done or 0,
+                    rows_total or 1,
+                )
+
+        sink = _SinkOrchestrator(
+            store=store,
+            db_path=env["db_path"],
+            cold_root=env["cold_root"],
+            max_workers=args.sink_workers,
+            progress_cb=_sink_progress_cb,
+        )
+
+        safe_head = chain_head - REORG_BUFFER_BLOCKS
+        store.set_safe_head(safe_head)
+
+        # A day that closed before the head was known waits here, not only inside persist.
+        backlog = store.list_days_ready_to_sink()
+        for p in backlog:
+            sink.submit(p)
+        if backlog:
+            _print_message(
+                f"Submitted {len(backlog):,} pre-existing ready day(s) to the sink pool."
+            )
+
+        status_ui.clear("startup")
+
+        # Gaps stop at the safe head. Nothing inside the reorg buffer is fetched or sunk.
+        if safe_head < SCRAPE_START_BLOCK:
+            gaps = []
+        else:
+            gaps = store.find_gaps(SCRAPE_START_BLOCK, safe_head, include_sunk=False)
         total_gap_blocks = sum(t - f + 1 for f, t in gaps)
         sunk_frontier = store.get_sunk_frontier()
         loaded_frontier = store.get_loaded_frontier()
@@ -1597,6 +1714,7 @@ def main() -> None:
             sunk_frontier=sunk_frontier,
             loaded_frontier=loaded_frontier,
             chain_head=chain_head,
+            safe_head=safe_head,
             gaps=gaps,
             total_gap_blocks=total_gap_blocks,
             unsunk_ranges=unsunk_ranges,
@@ -1606,13 +1724,14 @@ def main() -> None:
         total_target = max(total_gap_blocks, 1)
         status_ui.bar("main", "Total progress", 0, total_target)
 
-        if not gaps and sink.in_flight == 0 and sink.pending_commit == 0:
+        if (
+            safe_head >= SCRAPE_START_BLOCK
+            and not gaps
+            and sink.in_flight == 0
+            and sink.pending_commit == 0
+        ):
             caught_up_confirmed = True
-            lag = (
-                chain_head - loaded_frontier
-                if loaded_frontier >= 0
-                else chain_head - SCRAPE_START_BLOCK
-            )
+            lag = safe_head - loaded_frontier if loaded_frontier >= 0 else safe_head - SCRAPE_START_BLOCK + 1
             _log_event(
                 "caught-up proof",
                 "caught up",
@@ -1654,18 +1773,35 @@ def main() -> None:
             return True
 
         def _refresh_bars() -> None:
-            """Repaint the footer from current progress."""
+            """Repaint the footer from current progress.
+
+            An open day has no known length, so the row is a spinner. Once the
+            next midnight has been seen, the closed span is a bar. A sink in
+            flight owns the row and is not overwritten here.
+            """
+            nonlocal part_mode, spin_day, spin_t0
             if sink.in_flight == 0:
-                # While a partition is being written the sink owns this row.
-                partition_start_now, partition_loaded = _next_partition_progress(
-                    store, store.get_sunk_frontier()
-                )
-                status_ui.bar(
-                    "partition",
-                    f"Partition {mask_partition(partition_start_now)}",
-                    partition_loaded,
-                    PARTITION_SIZE_10K,
-                )
+                span = store.current_day_span()
+                if span is None:
+                    status_ui.clear("partition")
+                    part_mode = None
+                else:
+                    day_key, first, last = span
+                    if last is None:
+                        loaded = _blocks_loaded_between(store, first, 2**32 - 1)
+                        if spin_day != day_key or part_mode != "spin":
+                            spin_day = day_key
+                            spin_t0 = time.monotonic()
+                        elapsed_s = max(0.0, time.monotonic() - spin_t0)
+                        _show_partition_spinner(
+                            f"{day_label(day_key)}  blks: {loaded:,}  {elapsed_s:.0f}s"
+                        )
+                    else:
+                        _show_partition_bar(
+                            day_label(day_key),
+                            _blocks_loaded_between(store, first, last),
+                            last - first + 1,
+                        )
             status_ui.bar(
                 "main", "Total progress", min(blocks_done, total_target), total_target
             )
@@ -1735,7 +1871,8 @@ def main() -> None:
                 )
 
         _top_up_in_flight()
-        if not _in_flight():
+        _refresh_bars()
+        if not _in_flight() and pending_ranges:
             if _all_rpc_lanes_fatal(lanes):
                 fatal_reason = _all_lanes_fatal_message(lanes)
             else:
@@ -1812,6 +1949,8 @@ def main() -> None:
                             from_block=from_b,
                             to_block=to_b,
                             rows_by_target=rows_by_target,
+                            day_cuts=result.get("day_cuts") or (),
+                            safe_head=store.safe_head,
                             stop_event=_stop_event,
                         )
                     except OperationCancelled:
@@ -1830,6 +1969,12 @@ def main() -> None:
                         # in ``loaded_block_ranges`` and will be picked up again via ``find_gaps``
                         # on the next run.
                         if _stop_event.is_set():
+                            continue
+                        # The chunk crossed into a day whose previous day is not
+                        # open yet. Roll back already happened. Retry after the
+                        # earlier chunk lands.
+                        if "is not open" in str(e) and (_in_flight() or pending_ranges):
+                            _return_chunk(pending_ranges, (from_b, to_b))
                             continue
                         fatal_reason = (
                             f"persist failed for [{from_b:,}-{to_b:,}]: "
@@ -1858,25 +2003,10 @@ def main() -> None:
                             endpoint=lane.label,
                         )
                     _refresh_bars()
-                    sf = store.get_sunk_frontier()
 
-                    # Blocks in this chunk that land beyond the partition being filled next.
-                    next_partition_start = (
-                        (max(sf, SCRAPE_START_BLOCK - 1) + 1) // PARTITION_SIZE_10K
-                    ) * PARTITION_SIZE_10K
-                    next_partition_end = next_partition_start + PARTITION_SIZE_10K - 1
-                    overlap_start = max(from_b, next_partition_start)
-                    overlap_end = min(to_b, next_partition_end)
-                    contributing = max(0, overlap_end - overlap_start + 1)
-                    beyond_blks = chunk_span - contributing
-
-                    # Print after persist succeeds
-                    _suffix = f" (beyond next: {beyond_blks:,} blks)" if beyond_blks > 0 else ""
                     line = Text("  -> blks: ")
                     line.append(f"{chunk_span:,}", style=_COLOR_DONE)
-                    line.append(
-                        f"  evts: {raw_log_count:,}  {elapsed_s:.1f}s{_suffix}"
-                    )
+                    line.append(f"  evts: {raw_log_count:,}  {elapsed_s:.1f}s")
                     _print_message(line)
 
                     for p in persist_result.ready_partitions:
@@ -2050,9 +2180,35 @@ def main() -> None:
                 finally:
                     status_ui.clear("head")
 
-                # Recompute only unsunk gaps; sunk history is immutable and
-                # must never be re-scheduled.
-                new_gaps = store.find_gaps(SCRAPE_START_BLOCK, new_head, include_sunk=False)
+                loaded_max = store.max_loaded_block()
+                if loaded_max is not None and loaded_max > new_head:
+                    fatal_reason = (
+                        f"chain head {new_head:,} is behind loaded block {loaded_max:,}"
+                    )
+                    _print_message(f"FATAL: {fatal_reason}")
+                    _stop_event.set()
+                    break
+
+                safe_head = new_head - REORG_BUFFER_BLOCKS
+                store.set_safe_head(safe_head)
+                for day_key in store.list_days_ready_to_sink():
+                    sink.submit(day_key)
+
+                # The reorg buffer has not cleared the scrape start. Wait.
+                # Do not treat an empty gap as caught up.
+                if safe_head < SCRAPE_START_BLOCK:
+                    if new_head != chain_head:
+                        _print_message(
+                            f"  Chain head {new_head:,} is inside the "
+                            f"{REORG_BUFFER_BLOCKS}-block buffer. Waiting."
+                        )
+                    chain_head = new_head
+                    time.sleep(2.0)
+                    continue
+
+                # Recompute only unsunk gaps up to the safe head. Sunk history
+                # is immutable and must never be re-scheduled.
+                new_gaps = store.find_gaps(SCRAPE_START_BLOCK, safe_head, include_sunk=False)
                 new_gap_blocks = sum(t - f + 1 for f, t in new_gaps)
 
                 if new_gap_blocks <= args.lag_tolerance:

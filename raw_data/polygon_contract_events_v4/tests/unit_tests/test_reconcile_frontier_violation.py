@@ -1,10 +1,8 @@
 """
-Reconciling against the cold tier must never claim blocks that were not written.
+Reconciling against the cold tier follows manifests, not loose Parquet.
 
-The sunk frontier means "[SCRAPE_START_BLOCK, N] is entirely on the cold tier". Recovering it by
-looking at files on disk is only safe while those files are contiguous from where the frontier
-already sits: a partition sitting above a gap says nothing about the gap, and claiming it would
-silently drop the missing blocks from the work queue forever.
+A day folder with no ``_SUCCESS`` is unpublished. A hole in the manifest
+run is an error. Claiming either one would drop blocks from the work queue.
 """
 
 import sys
@@ -13,12 +11,14 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from _internal.errors import V4Error
 from _internal.persistence import HotStore, HotStoreConfig
-from _internal.tables import PARTITION_SIZE_10K, SCRAPE_START_BLOCK
+from _internal.tables import SCRAPE_START_BLOCK
+from day_layout import D0, D1, D2, bounds, plant_day
 
 SCHEMA = str(Path(__file__).resolve().parents[2] / "schema.sql")
-FIRST = (SCRAPE_START_BLOCK // PARTITION_SIZE_10K) * PARTITION_SIZE_10K
 
 
 @pytest.fixture
@@ -39,22 +39,9 @@ def cold_root(tmp_path):
     return root
 
 
-def write_partition(cold_root: Path, partition_start: int) -> None:
-    one_million = (partition_start // 1_000_000) * 1_000_000
-    directory = (
-        cold_root
-        / "ConditionalTokens"
-        / "condition_preparation"
-        / f"1M={one_million}"
-        / f"10K={partition_start}"
-    )
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / "data.parquet").write_bytes(b"parquet")
-
-
-def test_a_partition_above_a_gap_is_not_claimed(store, cold_root):
-    """The earlier partition has no files, so it still has to be scraped."""
-    write_partition(cold_root, FIRST + PARTITION_SIZE_10K)
+def test_parquet_without_a_manifest_is_not_claimed(store, cold_root):
+    plant_day(cold_root, D0, *bounds(0))
+    plant_day(cold_root, D1, *bounds(1))
 
     claimed = store.reconcile_with_cold_tier(str(cold_root))
 
@@ -62,24 +49,25 @@ def test_a_partition_above_a_gap_is_not_claimed(store, cold_root):
     assert store.get_sunk_frontier() == SCRAPE_START_BLOCK - 1
 
 
-def test_contiguous_partitions_are_claimed(store, cold_root):
-    write_partition(cold_root, FIRST)
-    write_partition(cold_root, FIRST + PARTITION_SIZE_10K)
+def test_contiguous_manifests_are_claimed(store, cold_root):
+    plant_day(cold_root, D0, *bounds(0), manifest=True)
+    _first, last = bounds(1)
+    plant_day(cold_root, D1, *bounds(1), manifest=True)
 
     claimed = store.reconcile_with_cold_tier(str(cold_root))
 
     assert claimed == 2
-    assert store.get_sunk_frontier() == FIRST + 2 * PARTITION_SIZE_10K - 1
+    assert store.get_sunk_frontier() == last
 
 
-def test_claiming_stops_at_the_first_gap(store, cold_root):
-    write_partition(cold_root, FIRST)
-    write_partition(cold_root, FIRST + 2 * PARTITION_SIZE_10K)  # a hole in between
+def test_a_manifest_hole_is_not_a_prefix(store, cold_root):
+    plant_day(cold_root, D0, *bounds(0), manifest=True)
+    plant_day(cold_root, D2, *bounds(2), manifest=True)
 
-    claimed = store.reconcile_with_cold_tier(str(cold_root))
+    with pytest.raises(V4Error, match="skip"):
+        store.reconcile_with_cold_tier(str(cold_root))
 
-    assert claimed == 1
-    assert store.get_sunk_frontier() == FIRST + PARTITION_SIZE_10K - 1
+    assert store.get_sunk_frontier() == SCRAPE_START_BLOCK - 1
 
 
 def test_nothing_on_disk_leaves_the_frontier_alone(store, cold_root):

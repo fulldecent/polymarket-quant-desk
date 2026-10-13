@@ -5,9 +5,8 @@ V1 fee_charged (CTFExchange/fee_charged, NegRiskCtfExchange/fee_charged) has a
 token_id column.  V2 fee_charged (CTFExchangeV2/fee_charged, …) drops it.
 This test scopes exclusively to V1 paths to avoid schema conflicts.
 """
-import os
 import pytest
-from helpers import RAW, glob_all, ZERO_ASSET_ID_SQL
+from helpers import event_day_parquet, glob_all, ZERO_ASSET_ID_SQL
 
 
 def test_fee_charged_tokens_are_registered(con, ranges):
@@ -18,9 +17,9 @@ def test_fee_charged_tokens_are_registered(con, ranges):
     v1_paths = []
     for contract in ("CTFExchange", "NegRiskCtfExchange"):
         for r in sampled:
-            d = os.path.join(RAW, contract, "fee_charged", f"1M={r}")
-            if os.path.isdir(d):
-                v1_paths.append(f"'{d}/**/*.parquet'")
+            parquet = event_day_parquet(contract, "fee_charged", r)
+            if parquet.is_file():
+                v1_paths.append(f"'{parquet}'")
 
     if not v1_paths:
         pytest.skip("no V1 fee_charged partitions found")

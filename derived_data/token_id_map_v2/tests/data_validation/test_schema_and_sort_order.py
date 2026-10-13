@@ -55,40 +55,23 @@ def _output_dir() -> Path:
 
 
 def _all_data_files(out: Path) -> list[Path]:
-    """Return all data.parquet files from properly-named 1M/10K partitions.
+    """Return data.parquet files from year=/month=/day= folders.
 
-    Directory names are validated to ensure they match the format 1M=<int> and
-    10K=<int>, avoiding false matches on temporary or malformed directories.
+    ``.tmp`` siblings and names that are not a UTC day are skipped.
     """
+    from lib.ymd_partition import day_key_from_hive_dir
+
     files = []
-    for m_dir in out.glob("1M=*"):
-        if not m_dir.is_dir():
+    for day_path in out.glob("year=*/month=*/day=*"):
+        if not day_path.is_dir() or day_path.name.endswith(".tmp"):
             continue
-        # Validate 1M directory name is exactly 1M=<integer>
         try:
-            parts = m_dir.name.split("=")
-            if len(parts) != 2 or parts[0] != "1M":
-                continue
-            int(parts[1])  # Validate it's an integer
+            day_key_from_hive_dir(day_path)
         except ValueError:
             continue
-
-        for k_dir in m_dir.glob("10K=*"):
-            if not k_dir.is_dir():
-                continue
-            # Validate 10K directory name is exactly 10K=<integer>
-            try:
-                parts = k_dir.name.split("=")
-                if len(parts) != 2 or parts[0] != "10K":
-                    continue
-                int(parts[1])  # Validate it's an integer
-            except ValueError:
-                continue
-
-            data_file = k_dir / "data.parquet"
-            if data_file.exists():
-                files.append(data_file)
-
+        data_file = day_path / "data.parquet"
+        if data_file.exists():
+            files.append(data_file)
     return sorted(files)
 
 

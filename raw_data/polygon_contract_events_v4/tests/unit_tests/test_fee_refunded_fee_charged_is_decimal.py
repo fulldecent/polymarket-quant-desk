@@ -14,9 +14,11 @@ from pathlib import Path
 import pytest
 from eth_abi import encode as abi_encode
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 
+from day_layout import D0
 from _internal.errors import V4Error
 from _internal.event_decoders import decode_log_strict
 from _internal.parquet_sink import write_partition_files
@@ -122,11 +124,16 @@ def test_sink_refuses_to_publish_poisoned_fee_charged(tmp_path):
             "UPDATE fee_module_ctf__fee_refunded SET fee_charged = ?",
             [poison],
         )
+        store.connection.execute(
+            "INSERT INTO utc_day_span (day_key, first_block, last_block) "
+            "VALUES (?, ?, ?)",
+            [D0, 81_270_000, 81_279_999],
+        )
         with pytest.raises(V4Error, match="not uint256 decimals"):
             write_partition_files(
                 db,
                 str(cold),
-                81_270_000,
+                D0,
                 duckdb_connect_config={
                     "memory_limit": store.config.duckdb_memory_limit,
                     "threads": str(store.config.duckdb_threads),

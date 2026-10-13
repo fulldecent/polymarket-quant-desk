@@ -12,8 +12,8 @@
 --
 -- Conventions:
 --
---   1. One table per (contract, event) pair. The partition layout is 
---      {contract}/{event}/1M=N/10K=N/.
+--   1. One table per (contract, event) pair. The partition layout is
+--      {contract}/{event}/year=YYYY/month=MM/day=DD/.
 --
 --   2. No contract_address column. The emitting contract is implicit from the directory path.
 --
@@ -74,6 +74,24 @@ CREATE TABLE IF NOT EXISTS loaded_block_ranges (
 
     PRIMARY KEY (from_block, to_block),
     CHECK (from_block <= to_block)
+);
+
+-- =====================================================================
+-- utc_day_span (which blocks belong to which UTC day)
+--
+-- One row per UTC day the scrape has opened. day_key is YYYYMMDD.
+-- first_block is the first block whose header time falls on that day
+-- (the scrape-start block, for the first day). last_block is NULL until
+-- a later block's header time falls on a later day; it is then the block
+-- immediately before that later day's first block. Header time strictly
+-- increases, so these ranges are contiguous and do not overlap.
+-- A day is sinkable only once last_block is set and the range is loaded.
+
+CREATE TABLE IF NOT EXISTS utc_day_span (
+    day_key      UINTEGER PRIMARY KEY,
+    first_block  UINTEGER NOT NULL,
+    last_block   UINTEGER,
+    CHECK (last_block IS NULL OR last_block >= first_block)
 );
 
 -- =====================================================================

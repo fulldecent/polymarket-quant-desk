@@ -1,4 +1,4 @@
-"""Unit tests for account_condition_by_10k_v2 aggregation."""
+"""Unit tests for account_condition_by_day_v2 aggregation."""
 
 from __future__ import annotations
 
@@ -15,10 +15,12 @@ _DATASET_DIR = Path(__file__).resolve().parents[2]
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from lib.partition_utils import partition_dir  # noqa: E402
+from lib.ymd_partition import day_dir  # noqa: E402
 
-K_VAL = 70_000_000
-M_VAL = 70_000_000
+DAY_KEY = 20261012
+MIN_BLOCK = 70_000_000
+MAX_BLOCK = 70_009_999
+K_VAL = MIN_BLOCK
 COND_A = bytes.fromhex("aa" * 32)
 COND_B = bytes.fromhex("bb" * 32)
 ACCT_1 = bytes.fromhex("11" * 20)
@@ -27,7 +29,7 @@ ACCT_2 = bytes.fromhex("22" * 20)
 
 def _load_main():
     spec = importlib.util.spec_from_file_location(
-        "account_condition_by_10k_v2_main", _DATASET_DIR / "main.py"
+        "account_condition_by_day_v2_main", _DATASET_DIR / "main.py"
     )
     mod = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -39,7 +41,7 @@ def _run(tmp_path: Path, rows: list[dict]):
     mod = _load_main()
     fills = tmp_path / "fills"
     out = tmp_path / "out"
-    path = fills / partition_dir(K_VAL) / "data.parquet"
+    path = fills / day_dir(DAY_KEY) / "data.parquet"
     path.parent.mkdir(parents=True, exist_ok=True)
     table = pa.table(
         {
@@ -58,8 +60,10 @@ def _run(tmp_path: Path, rows: list[dict]):
     pq.write_table(table, path)
     mod.FILLS = str(fills)
     mod.OUT_DIR = str(out)
-    n = mod.process_chunk(duckdb.connect(), M_VAL, K_VAL, logging.getLogger("test"))
-    return n, pq.read_table(out / partition_dir(K_VAL) / "data.parquet")
+    n = mod.process_chunk(
+        duckdb.connect(), DAY_KEY, MIN_BLOCK, MAX_BLOCK, logging.getLogger("test")
+    )
+    return n, pq.read_table(out / day_dir(DAY_KEY) / "data.parquet")
 
 
 def test_groups_account_condition_and_does_not_halve_volume(tmp_path: Path):

@@ -13,7 +13,7 @@ Pure-library modules used by the scraper. No CLI, no `.env` loading, no logging 
 | `chunk_planner.py` | `ChunkPlanner` — sizes each request from measured events per block, and discovers the provider's result and block-span limits from refusals |
 | `epoch_optimizer.py` | `EpochOptimizer` — ramps concurrency and result budget to the provider's envelope, then hill-climbs blocks per second in fixed-parameter epochs |
 | `persistence.py` | `HotStore` — owns the hot DuckDB connection; atomic event ingestion; `loaded_block_ranges` maintenance; sink commit |
-| `parquet_sink.py` | `write_partition_files` — cold-tier-producer: opens its own read-only DuckDB connection, writes one partition's Parquet files, returns. `publish_manifest` then declares the partition sunk, and the orchestrator follows up with `HotStore.commit_sink`. |
+| `parquet_sink.py` | `write_partition_files` — cold-tier-producer: opens its own read-only DuckDB connection, writes one UTC day's Parquet files, returns. `publish_manifest` then declares the day sunk, and the orchestrator follows up with `HotStore.commit_sink`. |
 
 ## Integrity model
 
@@ -32,7 +32,7 @@ COPY (
     SELECT DISTINCT ON (block_number, transaction_index, log_index)
         <columns in canonical order>
     FROM <hot_table>
-    WHERE block_number BETWEEN P AND P + 9999
+    WHERE block_number BETWEEN first_block AND last_block
     ORDER BY block_number, transaction_index, log_index
 ) TO '<tmp>' (FORMAT PARQUET, COMPRESSION ZSTD);
 ```
@@ -47,9 +47,9 @@ This is specified in `../DATA_DICTIONARY.md`.
 
 `cleanup_temp_dirs_after_frontier` runs at scraper startup **before** manifest roll-forward. It
 deletes incomplete event folders above the frontier (parquet without metadata, mixed targets,
-leftover temps) so `write_partition_files` can redo that 10K from hot. A complete unpublished 10K
-is left in place for roll-forward to publish `_SUCCESS`. Folders at or below the frontier are
-never deleted.
+leftover temps) so `write_partition_files` can redo that UTC day from hot. A complete unpublished
+day is left in place for roll-forward to publish `_SUCCESS`. Folders at or below the frontier are
+never deleted. A day folder is `year=YYYY/month=MM/day=DD/`.
 
 ## Concurrency model
 
@@ -59,24 +59,24 @@ The library is designed for one orchestrator (main thread) plus one or more sink
 
 The sink workers do all the slow work. Each worker call:
 
-1. Receives `(db_path, cold_root, partition_start)` from the orchestrator.
+1. Receives `(db_path, cold_root, day_key)` from the orchestrator.
 2. Opens its own read-only DuckDB connection on the hot `.db` file.
-3. Runs every `(contract, event)` Parquet COPY for that partition, renames the temp files into place.
+3. Runs every `(contract, event)` Parquet COPY for that UTC day, renames the temp files into place.
 4. Closes its connection. Returns a `PartitionWriteResult`.
 
-The worker never calls back into `HotStore`. When the orchestrator receives the worker's result, it calls `store.commit_sink(partition_start)` to delete the partition's rows from the hot DB and flip the `loaded_block_ranges` row to sunk — all on the orchestrator's thread.
+The worker never calls back into `HotStore`. When the orchestrator receives the worker's result, it calls `store.commit_sink(day_key)` to advance the in-memory frontier and delete that day's rows from the hot DB — all on the orchestrator's thread.
 
 This works without races because:
 
 * DuckDB supports multiple connections to the same file from one process. The worker's read-only connection sees an MVCC snapshot of rows that `persist()` has already committed. The worker's reads do not block the orchestrator's writes and vice versa.
-* The orchestrator only `persist()`s ranges above the loaded frontier (driven by `find_gaps` on `loaded_block_ranges`), so a partition being drained by a worker is never re-touched.
+* The orchestrator only `persist()`s ranges above the loaded frontier (driven by `find_gaps` on `loaded_block_ranges`), so a day being drained by a worker is never re-touched.
 * The worker's COPY finishes before its `Future` resolves; the orchestrator's `commit_sink` runs strictly after that.
 
 Orchestrator sketch (illustrative — not in the library):
 
 ```python
 store = HotStore(db_path, schema_path)
-pending: dict[Future, int] = {}    # Future -> partition_start
+pending: dict[Future, int] = {}    # Future -> day_key
 executor = ThreadPoolExecutor(max_workers=N)
 
 while not done:
@@ -99,32 +99,34 @@ while not done:
 
 ## `loaded_block_ranges` invariant
 
-The hot DB has exactly one bookkeeping table, `loaded_block_ranges`. Its rows must satisfy:
+The hot DB has two bookkeeping tables. `loaded_block_ranges` records ingested block ranges. `utc_day_span` records each opened UTC day (`day_key`, `first_block`, `last_block`). The sunk frontier is in memory, loaded from manifests. Rows of `loaded_block_ranges` must satisfy:
 
-> Rows are strictly disjoint AND non-adjacent **within each `sunk_to_parquet` value**. Two rows with the same status MUST NOT touch (`a.to_block + 1 == b.from_block` is forbidden — they must be coalesced into one row). Two rows with OPPOSITE status MAY touch (a sunk range ends exactly where an unsunk range begins).
+> No two rows overlap or touch. For any pair, either `a.to_block + 1 < b.from_block` or `a.from_block > b.to_block + 1`.
 
-`persist()` enforces this on every insert by splitting any opposite-status row that overlaps the new range, then unioning every same-status row that touches or overlaps it. `commit_sink()` does the same when flipping a range from unsunk to sunk.
+`persist()` coalesces a new range into any unsunk row it touches. `commit_sink()` deletes the covered slice after the frontier advances. `utc_day_span` rows stay after the sink.
 
 ## Frontier ordering
 
 Two frontiers matter:
 
 * **Loaded frontier**: highest block `N` such that `[SCRAPE_START_BLOCK, N]` is fully covered by `loaded_block_ranges` (any status). The scrape loop's high-water mark.
-* **Sunk frontier**: highest block `N` such that `[SCRAPE_START_BLOCK, N]` is fully covered by rows with `sunk_to_parquet=TRUE`. The cold tier's high-water mark.
+* **Sunk frontier**: highest block `N` such that cold manifests cover `[SCRAPE_START_BLOCK, N]`. The cold tier's high-water mark. It lives in memory on `HotStore`, loaded from manifests at startup.
 
-The cold-tier Parquet contract requires the sunk frontier to advance one 10K partition at a time, with every eligible `(contract, event)` file landing as a batch. `HotStore.commit_sink` enforces this: every call must be passed the partition that extends the sunk frontier by exactly one. Out-of-order commits raise `PartitionFrontierError`. The check lives on `commit_sink` (not on `write_partition_files`) because `commit_sink` is the only path that actually advances the sunk frontier; the worker is a pure producer that trusts its caller.
+The cold-tier Parquet contract requires the sunk frontier to advance one UTC day at a time, with every eligible `(contract, event)` file landing as a batch. `HotStore.commit_sink` enforces this: every call must be passed the day that starts on the next unsunk block. Out-of-order commits raise `PartitionFrontierError`. The check lives on `commit_sink` (not on `write_partition_files`) because `commit_sink` is the only path that actually advances the sunk frontier; the worker is a pure producer that trusts its caller.
 
-## Telling the caller about ready partitions
+A day is ready only when its `last_block` is set, hot coverage of `[first_block, last_block]` is one unsunk range, and `last_block` is at or below the safe head (chain head minus 256). `safe_head is None` means nothing is ready.
 
-A naïve client that wants to keep the sink writer busy would call `HotStore.list_10k_partitions_ready_to_sink` after every `persist()` — wasteful when most calls do not complete any partition.
+## Telling the caller about ready days
 
-Instead, `persist()` returns a `PersistResult` whose `ready_partitions: tuple[int, ...]` field lists every 10K partition that just became ready as a direct result of that call. The client appends those to its sink queue and forgets about polling. The list may be empty (most calls), or contain multiple values (one `persist` can complete several 10K partitions if it covers a range that straddles them).
+A naïve client that wants to keep the sink writer busy would call `HotStore.list_days_ready_to_sink` after every `persist()` — wasteful when most calls do not complete any day.
 
-`list_10k_partitions_ready_to_sink` remains available for startup / recovery, when the caller wants the full backlog before it has run any `persist`.
+Instead, `persist()` returns a `PersistResult` whose `ready_partitions: tuple[int, ...]` field lists every UTC day key (`YYYYMMDD`) that just became ready as a direct result of that call. The client appends those to its sink queue and forgets about polling. The list may be empty (most calls). Only the next unsunk day can be ready, so one call closes at most that day.
+
+`list_days_ready_to_sink` remains available for startup / recovery, when the caller wants the full backlog before it has run any `persist`.
 
 ## Per-table sink granularity (open optimization)
 
-Currently `commit_sink` is the only point that touches all 42 event tables in one transaction. For very large 10K partitions this DELETE- of-everything-plus-progress-update could become slow.
+Currently `commit_sink` is the only point that touches all event tables in one transaction. For a busy UTC day this DELETE of everything could become slow.
 
 A future variant could track sink progress on a per-(contract, event) basis instead of per-block-range — splitting the work into 42 small atomic transactions. The frontier-ordering contract still requires the Parquet files to land as one batch, but the hot-DB DELETEs do not have to. The trade-off is per-transaction overhead vs. lock duration; benchmark before changing.
 

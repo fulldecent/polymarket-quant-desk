@@ -13,14 +13,11 @@ Assert two event-ordering invariants that extend test_no_trading_after_resolutio
    payout_redemption for the same condition C. Redeeming and then splitting or
    merging in the same tx would indicate malformed or adversarial transactions.
 """
-import os
-from pathlib import Path
-
 import pytest
 
 from helpers import (
-    RAW,
     complete_1m_ranges_for_paths,
+    event_day_parquet,
     glob_all,
     glob_complete_contract_prefix,
 )
@@ -38,7 +35,7 @@ def test_no_v2_trading_after_resolution(con):
     nrv2_ranges = complete_1m_ranges_for_paths(["NegRiskCtfExchangeV2/order_filled"])
     v2_ranges = sorted(ctfv2_ranges | nrv2_ranges)
     if not v2_ranges:
-        pytest.skip("no complete v2 order_filled 1M ranges found")
+        pytest.skip("no complete v2 order_filled UTC days found")
 
     # Build a resolved-token lookup. v2 exchanges share token IDs with v1 and
     # do not emit token_registered; join against v1 token_registered instead.
@@ -56,12 +53,12 @@ def test_no_v2_trading_after_resolution(con):
     sampled = sorted(set(v2_ranges[:2] + v2_ranges[-2:]))
     bad_total = 0
 
-    for r in sampled:
+    for day_key in sampled:
         for contract in ("CTFExchangeV2", "NegRiskCtfExchangeV2"):
-            src_dir = Path(RAW) / contract / "order_filled" / f"1M={r}"
-            if not src_dir.exists():
+            src_path = event_day_parquet(contract, "order_filled", day_key)
+            if not src_path.exists():
                 continue
-            src = f"read_parquet('{RAW}/{contract}/order_filled/1M={r}/**/*.parquet')"
+            src = f"read_parquet('{src_path}')"
             n = con.execute(f"""
                 SELECT COUNT(*)
                 FROM {src} of

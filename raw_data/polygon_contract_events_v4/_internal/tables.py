@@ -33,10 +33,15 @@ There is no ``transaction_hash`` column. Grain is
 ``(block_number, transaction_index, log_index)``. Audit lookups use
 ``eth_getTransactionByBlockNumberAndIndex``.
 
-SCRAPE_START_BLOCK is the earliest block from which any partition is
-materialized. Partitions whose end block falls below the contract's
-deployment block are never written; partitions at or above it are
-expected.
+SCRAPE_START_BLOCK is the earliest block from which any day is
+materialized. The first day is the UTC day of that block's header.
+Blocks before it are not in the dataset. A contract that deploys
+mid-day still gets that day's files once the day's last block is at
+or after the deployment block.
+
+REORG_BUFFER_BLOCKS is how far behind chain head a block must sit
+before it may be persisted. A reorg deeper than this can rewrite a
+day that has already been sunk. Sunk days are not rewritten in place.
 """
 
 from __future__ import annotations
@@ -51,8 +56,10 @@ from dataclasses import dataclass
 # ---------------------------------------------------------------------------
 
 SCRAPE_START_BLOCK: int = 33_605_403
-PARTITION_SIZE_10K: int = 10_000
-PARTITION_SIZE_1M: int = 1_000_000
+# Blocks within this distance of chain head are not sunk. Polygon
+# checkpoint spacing was historically 256; the buffer matches that. A
+# deeper reorg can still rewrite a sunk day. There is no rewrite path.
+REORG_BUFFER_BLOCKS: int = 256
 
 # Common column order for every event table.
 COMMON_COLUMNS: tuple[str, ...] = (
@@ -281,9 +288,8 @@ def targets_active_at(end_block: int) -> list[tuple[str, str]]:
     """Return every ``(contract, event)`` whose contract was deployed at or
     before ``end_block``.
 
-    Use this to determine which Parquet files must be written for one 10K
-    partition: the v4 frontier contract requires all such files to land
-    together.
+    Use this to determine which Parquet files must be written for one UTC
+    day: the v4 frontier contract requires all such files to land together.
     """
     return [
         (c, e) for c, e in all_targets()

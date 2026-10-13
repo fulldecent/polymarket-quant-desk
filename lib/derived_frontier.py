@@ -19,6 +19,7 @@ from .partition_utils import (
     partition_end,
     partition_start,
 )
+from .ymd_partition import day_dir, next_day_key
 
 
 def _partition_folder(base: Path, partition: int) -> Path:
@@ -85,6 +86,44 @@ def scan_frontier_1M_10K_folders(
         cb_progress(nxt)
         latest = nxt
 
+    return latest
+
+
+def scan_frontier_ymd_folders(
+    base_path: str | Path,
+    starting_day_key: int,
+    tmp_suffix: str,
+    cb_progress: Callable[[int], None],
+) -> int | None:
+    """Return the highest contiguous UTC day folder from ``starting_day_key``.
+
+    Presence of ``year=/month=/day=`` is enough. A sibling
+    ``day=DD{tmp_suffix}`` invalidates that day. A missing start folder,
+    or a temp sibling of the start folder, returns ``None``. This does
+    not replace ``scan_frontier_1M_10K_folders``.
+    """
+    root = Path(base_path)
+    if not root.is_dir():
+        return None
+
+    def folder(day_key: int) -> Path:
+        return root / day_dir(day_key)
+
+    current_dir = folder(starting_day_key)
+    current_tmp = current_dir.with_name(current_dir.name + tmp_suffix)
+    if not current_dir.is_dir() or current_tmp.exists():
+        return None
+
+    cb_progress(starting_day_key)
+    latest = starting_day_key
+    while True:
+        nxt = next_day_key(latest)
+        nxt_dir = folder(nxt)
+        nxt_tmp = nxt_dir.with_name(nxt_dir.name + tmp_suffix)
+        if nxt_tmp.exists() or not nxt_dir.is_dir():
+            break
+        cb_progress(nxt)
+        latest = nxt
     return latest
 
 

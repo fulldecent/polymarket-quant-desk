@@ -13,15 +13,15 @@ standard or NegRisk). Such a split/merge carries the collateral, parent
 collection, condition, and partition (index sets) that fully determine each
 token_id, so token IDs are derived directly with no collateral-resolution
 heuristic and no dependency on ``token_registered``. Partitions are processed in
-ascending block order; a 4-tuple is materialized in the first 10K partition in
+ascending block order; a 4-tuple is materialized in the first UTC day in
 which it is discovered and suppressed thereafter.
 
 OUTPUT
 ------
 Partitioned parquet at:
 
-    {TOKEN_ID_MAP_V2_DIR}/1M={N}/10K={K}/data.parquet
-    {TOKEN_ID_MAP_V2_DIR}/1M={N}/10K={K}/metadata.json
+    {TOKEN_ID_MAP_V2_DIR}/year=YYYY/month=MM/day=DD/data.parquet
+    {TOKEN_ID_MAP_V2_DIR}/year=YYYY/month=MM/day=DD/metadata.json
 
 See DATA_DICTIONARY.md for full schema and invariant documentation.
 
@@ -36,7 +36,7 @@ USAGE
     python derived_data/token_id_map_v2/main.py [options]
 
     --dry-run       print the work plan without writing any data
-    --sample N      process only the first N incomplete chunks
+    --sample N      process only the first N incomplete days
 """
 
 import argparse
@@ -61,21 +61,20 @@ from lib.ct_helpers import get_collection_id, get_position_id  # noqa: E402
 from lib.env import require_directory_env, require_env  # noqa: E402
 from lib.git_utils import assert_git_clean  # noqa: E402
 from lib.metadata_utils import create_parquet_metadata_json, parquet_content_hash  # noqa: E402
-from lib.partition_utils import (  # noqa: E402
-    PARTITION_10K_LABEL,
-    PARTITION_1M_LABEL,
-    enumerate_partitions,
-    partition_dir,
-    partition_end,
-    partition_start,
+from lib.derived_frontier import scan_frontier_ymd_folders  # noqa: E402
+from lib.ymd_partition import (  # noqa: E402
+    assert_contiguous_day_keys,
+    day_block_span,
+    day_dir,
+    day_key_parts,
+    day_label,
+    iter_manifest_day_keys,
 )
-from lib.derived_frontier import scan_frontier_1M_10K_folders  # noqa: E402
 
 from lib.run_logging import (  # noqa: E402
     PhaseWork,
     RunOutput,
     configure_duckdb_progress,
-    print_partition_sunk,
     print_paths,
     print_run_summary,
     print_work_plan,
@@ -86,7 +85,7 @@ from lib.atomic_publish import (  # noqa: E402
     publish_atomically,
     cleanup_temp,
 )
-from raw_data.polygon_contract_events_v4 import get_sunk_frontier, SCRAPE_START_BLOCK  # noqa: E402
+from raw_data.polygon_contract_events_v4 import SCRAPE_START_BLOCK  # noqa: E402
 
 # ============================================================================
 # constants
@@ -128,12 +127,6 @@ CT_SPLIT_MERGE_TABLES = (
 # have a different oracle and therefore no market_id.
 NEG_RISK_ADAPTER = bytes.fromhex("d91e80cf2e7be2e162c6513ced06f1dd0da35296")
 
-# The first 10K partition Polymarket data can occupy. Every consecutive 10K
-# partition from here up to the frontier is materialized, with no gaps. Even a
-# partition with zero new tokens gets a (possibly zero-row) data.parquet and a
-# metadata.json. This matches SCRAPE_START_BLOCK of polygon_contract_events_v4.
-START_PARTITION_10K = partition_start(SCRAPE_START_BLOCK)
-
 # Output Parquet schema. Types MUST match the raw polygon_contract_events_v4
 # logical Parquet types so the columns join cleanly:
 #   BLOB  -> Parquet BYTE_ARRAY (no logical type, variable length) == pa.binary()
@@ -172,8 +165,9 @@ SCRATCH_DIR = require_directory_env("SCRATCH_DIR")
 def _write_metadata(
     con: duckdb.DuckDBPyConnection,
     chunk_dir: Path,
-    m_val: int,
-    k_val: int,
+    day_key: int,
+    min_block: int,
+    max_block: int,
     input_hashes: dict[str, str],
     log: logging.Logger,
 ) -> None:
@@ -181,17 +175,18 @@ def _write_metadata(
     part = chunk_dir / "data.parquet"
     if not part.exists():
         raise RuntimeError(f"data.parquet not found at {part} after write; cannot create metadata")
-
+    year, month, day = day_key_parts(day_key)
     create_parquet_metadata_json(
         part,
         dataset="token_id_map_v2",
         source_script="derived_data/token_id_map_v2/main.py",
         input_hashes=input_hashes,
         parameters={
-            "1M": m_val,
-            "10K": k_val,
-            "min_block": k_val,
-            "max_block": partition_end(k_val),
+            "year": year,
+            "month": month,
+            "day": day,
+            "min_block": min_block,
+            "max_block": max_block,
         },
         row_count_connection=con,
         created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -216,10 +211,17 @@ def _load_negrisk_market_lookup(
     one row per condition_id (verified across the dataset), so this is a function.
     Non-NegRisk conditions are absent from the result and map to NULL market_id.
     """
-    glob = f"{RAW}/ConditionalTokens/condition_preparation/**/data.parquet"
+    keys = iter_manifest_day_keys(RAW)
+    assert_contiguous_day_keys(keys)
+    paths = _existing_event_paths(
+        ("ConditionalTokens/condition_preparation",),
+        keys,
+    )
+    if not paths:
+        return {}
     rows = run_sql(con, f"""
         SELECT condition_id, question_id
-        FROM read_parquet('{glob}')
+        FROM read_parquet({_parquet_list_literal(paths)})
         WHERE oracle = ?
     """, [NEG_RISK_ADAPTER], work=work).fetchall()
     lookup: dict[bytes, bytes] = {}
@@ -230,13 +232,20 @@ def _load_negrisk_market_lookup(
     return lookup
 
 
-def _existing_partition_paths(tables: tuple[str, ...], k_val: int) -> list[str]:
-    """Return the data.parquet paths that exist for these tables in this 10K partition."""
+def _existing_event_paths(tables: tuple[str, ...], day_keys: list[int] | int) -> list[str]:
+    """Return data.parquet paths that exist for these tables on these UTC days.
+
+    Only days passed in are considered. Callers pass manifested day keys so a
+    raw day without ``_SUCCESS`` is never read.
+    """
+    keys = [day_keys] if isinstance(day_keys, int) else day_keys
     paths: list[str] = []
-    for table in tables:
-        p = Path(RAW) / table / partition_dir(k_val) / "data.parquet"
-        if p.exists():
-            paths.append(str(p))
+    for day_key in keys:
+        rel = day_dir(day_key)
+        for table in tables:
+            p = Path(RAW) / table / rel / "data.parquet"
+            if p.exists():
+                paths.append(str(p))
     return paths
 
 
@@ -246,38 +255,39 @@ def _parquet_list_literal(paths: list[str]) -> str:
     return "[" + ", ".join(quoted) + "]"
 
 
-def _partition_input_hashes(k_val: int) -> dict[str, str]:
-    """SHA-256 of every raw input partition file read to build this partition.
+def _day_input_hashes(day_key: int) -> dict[str, str]:
+    """SHA-256 of every raw input file read to build this UTC day.
 
     Covers the ``orders_matched`` filter tables and the ConditionalTokens
-    split/merge row-source tables for this 10K partition — the files that fully
+    split/merge row-source tables for this day — the files that fully
     determine which token tuples are discovered here. Keys are paths relative to
     the raw root so the provenance is portable across storage locations.
     """
     hashes: dict[str, str] = {}
-    for path in _existing_partition_paths(ORDERS_MATCHED_TABLES + CT_SPLIT_MERGE_TABLES, k_val):
+    tables = ORDERS_MATCHED_TABLES + CT_SPLIT_MERGE_TABLES
+    for path in _existing_event_paths(tables, day_key):
         rel = os.path.relpath(path, RAW)
         hashes[rel] = parquet_content_hash(Path(path))
     return hashes
 
 
-def _discover_partition_tuples(
+def _discover_day_tuples(
     con: duckdb.DuckDBPyConnection,
-    k_val: int,
+    day_key: int,
     work: PhaseWork | None = None,
 ) -> list[tuple[bytes, bytes, bytes, int]]:
-    """Discover the token grain tuples introduced by trades in this 10K partition.
+    """Discover the token grain tuples introduced by trades on this UTC day.
 
     A ConditionalTokens split/merge is Polymarket-related when it shares a
     transaction with an exchange ``orders_matched`` event (v1 or v2, standard or
     NegRisk). Both legs live in the same transaction and therefore the same block
-    and partition, so the join is partition-local. Each qualifying split/merge
+    and UTC day, so the join is day-local. Each qualifying split/merge
     carries the collateral, parent collection, condition, and partition (index
     sets) that fully determine a token_id. The returned tuples are distinct and
     not yet filtered against previously seen tuples.
     """
-    match_paths = _existing_partition_paths(ORDERS_MATCHED_TABLES, k_val)
-    ct_paths = _existing_partition_paths(CT_SPLIT_MERGE_TABLES, k_val)
+    match_paths = _existing_event_paths(ORDERS_MATCHED_TABLES, day_key)
+    ct_paths = _existing_event_paths(CT_SPLIT_MERGE_TABLES, day_key)
     if not match_paths or not ct_paths:
         return []
 
@@ -318,33 +328,34 @@ def _build_output_table(
 
 def process_chunk(
     con: duckdb.DuckDBPyConnection,
-    m_val: int,
-    k_val: int,
+    day_key: int,
+    min_block: int,
+    max_block: int,
     *,
     condition_to_market: dict[bytes, bytes],
     log: logging.Logger,
     work: PhaseWork | None = None,
 ) -> tuple[int, dict[str, str]]:
-    """Process one 10K partition: discover new tuples, compute token_ids, write atomically.
+    """Process one UTC day: discover new tuples, compute token_ids, write atomically.
 
-    Every partition ALWAYS produces an output (data.parquet + metadata.json), even
+    Every day ALWAYS produces an output (data.parquet + metadata.json), even
     when there are zero new tokens. The first-seen rule suppresses any 4-tuple that
-    was already materialized in an earlier partition, so a partition may legitimately
+    was already materialized on an earlier day, so a day may legitimately
     contain zero rows. Newly written tuples are inserted into seen_tuples so that
-    subsequent partitions in the same run honour the first-seen invariant.
+    subsequent days in the same run honour the first-seen invariant.
     """
-    chunk_dir = Path(OUT_DIR) / partition_dir(k_val)
+    chunk_dir = Path(OUT_DIR) / day_dir(day_key)
     if chunk_dir.exists():
         sys.exit(
             f"FATAL: refusing to overwrite immutable partition: {chunk_dir}"
         )
     chunk_dir.parent.mkdir(parents=True, exist_ok=True)
 
-    # Discover candidate grain tuples from this partition's trade-linked CT ops,
-    # then keep only those not already materialized in an earlier partition.
+    # Discover candidate grain tuples from this day's trade-linked CT ops,
+    # then keep only those not already materialized on an earlier day.
     if work is not None:
         work.phase("discovering")
-    candidates = _discover_partition_tuples(con, k_val, work=work)
+    candidates = _discover_day_tuples(con, day_key, work=work)
     new_grain: list[tuple[bytes, bytes, bytes, int]] = []
     if candidates:
         con.register("candidates", pa.table({
@@ -393,20 +404,19 @@ def process_chunk(
     row_count = new_table.num_rows
 
     # Atomic write — ALWAYS, even for zero rows.
-    chunk_name = chunk_dir.name  # e.g., "10K=33600000"
     temp_loc = create_temp_location(
         parent_dir=chunk_dir.parent,
-        final_name=chunk_name,
+        final_name=chunk_dir.name,
         temp_suffix=".tmp",
     )
     if work is not None:
         work.phase("hashing")
-    input_hashes = _partition_input_hashes(k_val)
+    input_hashes = _day_input_hashes(day_key)
     try:
         if work is not None:
             work.phase("writing")
         pq.write_table(new_table, temp_loc.path / "data.parquet", compression="zstd")
-        _write_metadata(con, temp_loc.path, m_val, k_val, input_hashes, log)
+        _write_metadata(con, temp_loc.path, day_key, min_block, max_block, input_hashes, log)
         publish_atomically(temp_loc)
         # Record newly materialized tuples so later partitions suppress duplicates.
         if row_count:
@@ -417,7 +427,7 @@ def process_chunk(
                 FROM new_rows
             """, work=work)
             con.unregister("new_rows")
-        log.info(f"10K={k_val}: wrote {row_count:,} token mappings")
+        log.info(f"{day_label(day_key)}: wrote {row_count:,} token mappings")
         return row_count, input_hashes
     except Exception:
         cleanup_temp(temp_loc)
@@ -436,7 +446,7 @@ def _load_seen_tuples(con: duckdb.DuckDBPyConnection, work: PhaseWork | None = N
 
     Returns the number of rows in the first-seen table (0 on a first run).
     """
-    glob = f"{OUT_DIR}/**/*.parquet"
+    glob = f"{OUT_DIR}/year=*/month=*/day=*/data.parquet"
     run_sql(con, """
         CREATE OR REPLACE TEMP TABLE seen_tuples (
             collateral_token BLOB,
@@ -457,11 +467,21 @@ def _load_seen_tuples(con: duckdb.DuckDBPyConnection, work: PhaseWork | None = N
     return int(con.execute("SELECT COUNT(*) FROM seen_tuples").fetchone()[0])
 
 
+def _manifest_days() -> list[int]:
+    keys = iter_manifest_day_keys(RAW)
+    assert_contiguous_day_keys(keys)
+    return keys
+
+
+def _print_day_sunk(out: RunOutput, day_key: int, rows: int, elapsed: float) -> None:
+    out.print(f"  -> day {day_label(day_key)}  rows {rows:,}  {elapsed:.1f}s")
+
+
 def main() -> None:
     global _global_con
     parser = argparse.ArgumentParser(description="Materialize token_id_map_v2")
     parser.add_argument("--dry-run", action="store_true", help="print work plan without writing")
-    parser.add_argument("--sample", type=int, default=0, help="process only first N partitions")
+    parser.add_argument("--sample", type=int, default=0, help="process only first N days")
     args = parser.parse_args()
 
     assert_git_clean(_project_root)
@@ -488,45 +508,46 @@ def main() -> None:
 
     signal.signal(signal.SIGINT, _handle_sigint)
 
-    # Every consecutive 10K partition from the Polymarket start partition up to the
-    # frontier must exist as an output partition (no gaps). Partition discovery is by
-    # block range, NOT by source-folder existence: a 10K range with no source events
-    # still produces a zero-row data.parquet + metadata.json.
-    frontier = get_sunk_frontier(RAW)
-    all_partitions = enumerate_partitions(SCRAPE_START_BLOCK, frontier)
-
-    # Discover self frontier via strict contiguous 1M/10K scanner (tmp-aware),
-    # then plan only partitions above that frontier.
-    latest_landed_partition = scan_frontier_1M_10K_folders(
-        base_path=OUT_DIR,
-        starting_partition=SCRAPE_START_BLOCK,
-        tmp_suffix=".tmp",
-        cb_progress=lambda _partition: None,
+    # Every contiguous manifested UTC day is one output folder, including a day
+    # with no source events (zero-row data.parquet + metadata.json).
+    available = _manifest_days()
+    frontier = day_block_span(RAW, available[-1])[1] if available else none_below
+    todo = [key for key in available if not (Path(OUT_DIR) / day_dir(key)).exists()]
+    already_landed = len(available) - len(todo)
+    self_latest = (
+        scan_frontier_ymd_folders(
+            base_path=OUT_DIR,
+            starting_day_key=available[0],
+            tmp_suffix=".tmp",
+            cb_progress=lambda _day_key: None,
+        )
+        if available
+        else None
     )
-    self_frontier = (
-        partition_end(latest_landed_partition)
-        if latest_landed_partition is not None
-        else none_below
-    )
-    todo_start = max(SCRAPE_START_BLOCK, self_frontier + 1)
-    todo = enumerate_partitions(todo_start, frontier)
-    already_landed = len(all_partitions) - len(todo)
+    self_frontier = day_block_span(RAW, self_latest)[1] if self_latest is not None else none_below
     if args.sample:
         todo = todo[: args.sample]
 
     print_work_plan(
         out,
         frontier=frontier,
-        total=len(all_partitions),
+        total=len(available),
         already_landed=already_landed,
         todo=len(todo),
         sample=args.sample,
     )
     out.log_only(f"# main — start at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
-    out.log_only(f"upstream frontier:    {frontier:,}")
-    out.log_only(f"self frontier:        {self_frontier:,}" if self_frontier > none_below else "self frontier:        none")
-    out.log_only(f"start partition 10K:  {START_PARTITION_10K:,}")
-    out.log_only(f"partitions total:     {len(all_partitions):,}")
+    out.log_only(
+        f"upstream frontier:    {frontier:,}"
+        if frontier > none_below
+        else "upstream frontier:    none"
+    )
+    out.log_only(
+        f"self frontier:        {self_frontier:,}"
+        if self_frontier > none_below
+        else "self frontier:        none"
+    )
+    out.log_only(f"days total:           {len(available):,}")
     out.log_only(f"already landed:       {already_landed:,}")
     out.log_only(f"to process:           {len(todo):,}")
     if args.sample:
@@ -534,11 +555,9 @@ def main() -> None:
 
     if args.dry_run:
         if todo:
-            first_m, first_k = todo[0]
-            last_m, last_k = todo[-1]
-            out.print(f"dry-run: would process {len(todo):,} partitions")
-            out.print(f"  first: 1M={first_m} 10K={first_k}")
-            out.print(f"  last:  1M={last_m} 10K={last_k}")
+            out.print(f"dry-run: would process {len(todo):,} days")
+            out.print(f"  first: {day_label(todo[0])}")
+            out.print(f"  last:  {day_label(todo[-1])}")
         else:
             out.print("dry-run: nothing to do")
         return
@@ -581,23 +600,25 @@ def main() -> None:
             f"in {time.monotonic() - t_load:.1f}s"
         )
 
-        for m_val, k_val in todo:
+        for day_key in todo:
             if _stop_event.is_set():
                 status = "interrupted"
                 out.log_only("interrupted by user")
                 break
-            work = PhaseWork(out.status, f"10K={k_val:,}")
+            work = PhaseWork(out.status, day_label(day_key))
             work.phase("discovering")
             t0 = time.monotonic()
+            min_block, max_block = day_block_span(RAW, day_key)
             row_count, _ = process_chunk(
                 con,
-                m_val,
-                k_val,
+                day_key,
+                min_block,
+                max_block,
                 condition_to_market=condition_to_market,
                 log=out.log,
                 work=work,
             )
-            print_partition_sunk(out, k_val, row_count, time.monotonic() - t0)
+            _print_day_sunk(out, day_key, row_count, time.monotonic() - t0)
             processed += 1
             rows_done += row_count
             out.status.total(processed, len(todo))
@@ -606,7 +627,7 @@ def main() -> None:
         status = "interrupted"
 
     if processed:
-        self_frontier = partition_end(todo[processed - 1][1])
+        self_frontier = day_block_span(RAW, todo[processed - 1])[1]
 
     print_run_summary(
         out,

@@ -6,7 +6,7 @@ Lookup table: `(collateral_token, parent_collection_id, condition_id, index_set)
 
 Every outcome token that trades on a Polymarket exchange. (See [coverage note](#coverage) below.)
 
-A ConditionalTokens split/merge is treated as Polymarket-related only when it shares a transaction with an exchange `orders_matched` event from any of the four exchanges (`CTFExchange`, `CTFExchangeV2`, `NegRiskCtfExchange`, `NegRiskCtfExchangeV2`). Both legs live in the same transaction — and therefore the same block and 10K partition — so the join is partition-local. Each qualifying `ConditionalTokens/position_split` or `ConditionalTokens/positions_merge` row carries the `collateral_token`, `parent_collection_id`, `condition_id`, and `partition` (index sets) that fully determine each `token_id`. NegRisk markets are covered without special handling: the NegRiskAdapter performs its split/merge against the wrapped collateral, so the underlying `ConditionalTokens` event already carries the correct collateral.
+A ConditionalTokens split/merge is treated as Polymarket-related only when it shares a transaction with an exchange `orders_matched` event from any of the four exchanges (`CTFExchange`, `CTFExchangeV2`, `NegRiskCtfExchange`, `NegRiskCtfExchangeV2`). Both legs live in the same transaction — and therefore the same block and the same UTC day — so the join is day-local. Each qualifying `ConditionalTokens/position_split` or `ConditionalTokens/positions_merge` row carries the `collateral_token`, `parent_collection_id`, `condition_id`, and `partition` (index sets) that fully determine each `token_id`. NegRisk markets are covered without special handling: the NegRiskAdapter performs its split/merge against the wrapped collateral, so the underlying `ConditionalTokens` event already carries the correct collateral.
 
 ## Grain
 
@@ -27,18 +27,18 @@ Each `(collateral_token, parent_collection_id, condition_id, index_set)` is also
 
 ## Physical sort order
 
-Within each partition file, rows are sorted ascending by `token_id` (byte-wise ascending).
+Within each day file, rows are sorted ascending by `token_id` (byte-wise ascending).
 
 ## Partitioning
 
-**1M/10K nested partitioning** (same scheme as raw tables).
+**UTC day folders** `year=YYYY/month=MM/day=DD` (same scheme as the raw v4 tables).
 
-Each `token_id` is materialized in **exactly one partition** — the 10K partition in which it was *first seen* in a trade-linked `ConditionalTokens` split/merge (a split/merge sharing a transaction with an exchange `orders_matched` event).
+Each `token_id` is materialized in **exactly one UTC day** — the day in which it was *first seen* in a trade-linked `ConditionalTokens` split/merge (a split/merge sharing a transaction with an exchange `orders_matched` event). The day identity is the folder, not a column.
 
-- Partitions are processed in strict ascending block order.
-- When materializing a 10K partition, the job loads all previously materialized `token_id_map_v2` partitions (or a compact "seen" representation) to suppress duplicates.
-- Once a partition file (`data.parquet` + `metadata.json`) is written, it is **immutable** — it is never modified.
-- The global set of all partitions is **globally unique** (no `token_id` or 4-tuple appears in more than one partition) while each individual partition file remains immutable.
+- Days are processed in calendar order.
+- When materializing a UTC day, the job loads all previously materialized `token_id_map_v2` days (or a compact "seen" representation) to suppress duplicates.
+- Once a day folder (`data.parquet` + `metadata.json`) is written, it is **immutable** — it is never modified.
+- The global set of all days is **globally unique** (no `token_id` or 4-tuple appears in more than one day) while each individual day file remains immutable.
 
 This design allows incremental materialization while preserving the immutability contract required for derived data.
 
@@ -48,24 +48,24 @@ Validation scripts live in `tests/data_validation/`. Each guarantee below links 
 
 ### Identity, schema, and sort guarantees
 
-- [test_schema_and_sort_order.py](tests/data_validation/test_schema_and_sort_order.py) — no duplicate `token_id` or 4-tuple (`collateral_token`, `parent_collection_id`, `condition_id`, `index_set`) across the entire dataset. **Scope:** all landed partitions.
-- [test_schema_and_sort_order.py](tests/data_validation/test_schema_and_sort_order.py) — physical schema matches contract types (`BLOB` as Parquet `BYTE_ARRAY`, `index_set` as unsigned `INT32`) and rows are sorted by `token_id` (byte-wise ascending). **Scope:** all landed partitions.
-- [test_schema_and_sort_order.py](tests/data_validation/test_schema_and_sort_order.py) — `parent_collection_id = ZERO32` for all rows. **Scope:** all landed partitions.
-- [test_schema_and_sort_order.py](tests/data_validation/test_schema_and_sort_order.py) — `index_set > 0` for all rows. **Scope:** all landed partitions.
+- [test_schema_and_sort_order.py](tests/data_validation/test_schema_and_sort_order.py) — no duplicate `token_id` or 4-tuple (`collateral_token`, `parent_collection_id`, `condition_id`, `index_set`) across the entire dataset. **Scope:** all landed days.
+- [test_schema_and_sort_order.py](tests/data_validation/test_schema_and_sort_order.py) — physical schema matches contract types (`BLOB` as Parquet `BYTE_ARRAY`, `index_set` as unsigned `INT32`) and rows are sorted by `token_id` (byte-wise ascending). **Scope:** all landed days.
+- [test_schema_and_sort_order.py](tests/data_validation/test_schema_and_sort_order.py) — `parent_collection_id = ZERO32` for all rows. **Scope:** all landed days.
+- [test_schema_and_sort_order.py](tests/data_validation/test_schema_and_sort_order.py) — `index_set > 0` for all rows. **Scope:** all landed days.
 
 ### NegRisk enrichment guarantees
 
 - [test_schema_and_sort_order.py](tests/data_validation/test_schema_and_sort_order.py) — `market_id` is populated if and only if the condition oracle is `NegRiskAdapter`; otherwise `market_id` is `NULL`. **Scope:** all map rows joined to `ConditionalTokens/condition_preparation`.
-- [test_schema_and_sort_order.py](tests/data_validation/test_schema_and_sort_order.py) — non-null `market_id` values are 32 bytes with final byte cleared, and each `condition_id` maps to a single `market_id`. **Scope:** all landed partitions.
+- [test_schema_and_sort_order.py](tests/data_validation/test_schema_and_sort_order.py) — non-null `market_id` values are 32 bytes with final byte cleared, and each `condition_id` maps to a single `market_id`. **Scope:** all landed days.
 
 ### Partition and coverage guarantees
 
-- [test_partition_coverage.py](tests/data_validation/test_partition_coverage.py) — partitions are consecutive from the start partition, each partition has `data.parquet` plus `metadata.json`, and each `10K` partition sits under the correct `1M` parent. **Scope:** landed partition folders.
+- [test_partition_coverage.py](tests/data_validation/test_partition_coverage.py) — UTC days are contiguous from the first manifested day through the landed frontier, and each day folder has `data.parquet` plus `metadata.json`. A missing day inside that range is a failure. **Scope:** landed day folders.
 - [test_exchange_token_coverage.py](tests/data_validation/test_exchange_token_coverage.py) — exchange outcome-token coverage stays above 99% by both row-weighted and distinct-token metrics. **Scope:** all supported exchange `order_filled` tables against the full token map.
 
 ## Attaching `market_id`
 
-`market_id` is resolved per `condition_id` from `ConditionalTokens/condition_preparation` and embedded directly in each partition (no separate post-join step). The derivation is:
+`market_id` is resolved per `condition_id` from `ConditionalTokens/condition_preparation` and embedded directly in each day file (no separate post-join step). The derivation is:
 
 1. Look up the condition's single `condition_preparation` row (one row per `condition_id`; verified unique across the dataset).
 2. If `oracle = NegRiskAdapter` (`0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296`), the row's `question_id` is the NegRisk questionId and `market_id = question_id` with its final byte cleared (`questionId & ~0xFF`, i.e. [NegRiskIdLib.getMarketId](../../raw_data/polygon_contract_events_v4/deployed_contract_source_code/NegRiskAdapter-0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296/NegRiskAdapter/src/libraries/NegRiskIdLib.sol#L25)).

@@ -16,7 +16,7 @@ _project_root = Path(__file__).resolve().parents[4]
 load_dotenv(_project_root / ".env")
 sys.path.insert(0, str(_project_root))
 
-from lib.partition_utils import PARTITION_10K_LABEL, PARTITION_1M_LABEL
+
 
 
 def _fills_dir() -> Path:
@@ -41,7 +41,7 @@ def _connect() -> duckdb.DuckDBPyConnection:
 
 def _fills_data_glob() -> str:
     d = _fills_dir()
-    return f"{d}/{PARTITION_1M_LABEL}=*/{PARTITION_10K_LABEL}=*/data.parquet"
+    return f"{d}/year=*/month=*/day=*/data.parquet"
 
 
 def test_no_nulls_in_non_nullable_columns():
@@ -77,7 +77,7 @@ def test_condition_id_null_only_when_token_missing():
     token_map_dir = os.environ.get("TOKEN_ID_MAP_V2_DIR", "")
     if not token_map_dir:
         pytest.skip("TOKEN_ID_MAP_V2_DIR is not set")
-    tok_glob = f"{Path(token_map_dir)}/**/*.parquet"
+    tok_glob = f"{Path(token_map_dir)}/year=*/month=*/day=*/data.parquet"
 
     bad = con.execute(
         f"""
@@ -101,9 +101,11 @@ def test_condition_id_null_only_when_token_missing():
 
 
 def test_physical_sort_order():
-    """Rows within each partition file are sorted by (block_number, logical_fill_index)."""
+    """Rows within each day file are sorted by (block_number, logical_fill_index)."""
     d = _fills_dir()
-    for part_dir in sorted(d.rglob(f"{PARTITION_10K_LABEL}=*")):
+    for part_dir in sorted(d.glob("year=*/month=*/day=*")):
+        if not part_dir.is_dir() or part_dir.name.endswith(".tmp"):
+            continue
         pq_path = part_dir / "data.parquet"
         if not pq_path.exists():
             continue

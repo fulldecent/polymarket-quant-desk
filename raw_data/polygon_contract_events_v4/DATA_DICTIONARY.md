@@ -8,10 +8,10 @@ Files are stored in `$POLYGON_CONTRACT_EVENTS_V4_DIR`. References below to filen
 
 ## File locations
 
-- `{contract}/{event}/1M={N}/10K={N}/`
+- `{contract}/{event}/year=YYYY/month=MM/day=DD/`
   - `data.parquet` — specified per contract/event below
-  - `metadata.json` — see [Metadata files specification](../../docs/Metadata%20files.md)
-- `manifests/1M={N}/10K={N}/`
+  - `metadata.json` — see [Metadata files specification](../../docs/Metadata%20files.md). Parameters are `year`, `month`, `day`, `min_block`, and `max_block`.
+- `manifests/year=YYYY/month=MM/day=DD/`
   - `_SUCCESS` — empty file (i.e. zero file length)
 
 ## Parquet type contract
@@ -32,13 +32,17 @@ Notes:
 - **Our `"BLOB"` columns use variable length physical type (`BYTE_ARRAY`).** Each column is specified as exactly 20 or 32 bytes and we would prefer to use `FIXED_LEN_BYTE_ARRAY` length guarantees, but our writer implementation [does not support this](https://github.com/duckdb/duckdb/blob/2cda70b1eb522ea29831904613b29a7eda1f333e/extension/parquet/parquet_writer.cpp#L115-L116).
 - **uint256 values are strings, not integers.** EVM uint256 exceeds the range of any native Parquet integer. Strings have capacity to store every value the chain emits.
 - **Variable-length arrays are JSON strings.** Variable length JSON arrays must be valid JSON arrays, encoded without spaces. Each element MUST be the JSON-string representation of a non-negative uint256 written in base-10. Examples:  `[]` (empty array), `["1","2"]`. We also considered Parquet's `LIST` format but found this to be more useful.
-- **Small bounded integers use unsigned `INT32`.** Block are created every two seconds, so block numbers will fit in unsigned `INT32` until year ~2300. We use unsigned `INT32` here and for some other values that have natural or technical guarantees to fit in this column type.
+- **Small bounded integers use unsigned `INT32`.** At a one-second block period, block numbers still fit in unsigned `INT32` for more than a century. We use unsigned `INT32` here and for some other values that have natural or technical guarantees to fit in this column type.
 
 ## Partitioning
 
-- **Index column:** `block_number`
-- **Scheme:** `1M={N}/10K={N}/data.parquet` — 1M-block directories containing 100 10K-block partitions
-- **Example:** `CTFExchange/order_filled/1M=83000000/10K=83010000/data.parquet` covers blocks 83,010,000–83,019,999
+- **Index:** the UTC day of `block_timestamp`
+- **Scheme:** `year=YYYY/month=MM/day=DD/data.parquet`. `MM` and `DD` are zero-padded, so lexicographic order is chronological.
+- **Example:** `CTFExchange/order_filled/year=2026/month=10/day=12/data.parquet` holds the rows whose header times fall on 2026-10-12 UTC, from that day's `min_block` through `max_block` inclusive.
+- **Why a day is a function of the block:** Bor rejects a header when `parent.Time + period > header.Time` (`ErrInvalidTimestamp`, commit `9c445ef`, `consensus/bor/bor.go` lines 131–133). Mainnet period is 2 seconds from genesis and 1 second from block 80,084,800, and is never 0, so consecutive header timestamps strictly increase. The UTC day of a block does not depend on which headers a reader happened to walk.
+- The first day is the UTC day of block 33,605,403. Blocks before that block are absent even when they share that UTC day.
+- A contract that deploys during a UTC day still has that day's files when `deployment_block <= max_block`. A day with no events for an active contract still has `data.parquet` and `metadata.json`.
+- `year`, `month`, and `day` are directory keys. They are not columns in the Parquet file. `block_timestamp` stays in the file.
 
 ## Physical sort order
 
@@ -58,26 +62,26 @@ Following is a formalization of those guarantees.
 
 The producer makes exactly the following guarantees regarding file visibility and immutability. Such guarantees are absolute, even in the event of race conditions, power outages and errors writing to disk.
 
-- `{contract}/{event}/1M={N}/10K={N}/`
+- `{contract}/{event}/year=YYYY/month=MM/day=DD/`
   - Any folder existing with this path pattern shall contain exactly two files: `data.parquet` and `metadata.json`.
-- `manifests/1M={N}/10K={N}/`
+- `manifests/year=YYYY/month=MM/day=DD/`
   - Any folder existing with this path pattern shall contain exactly one file: `_SUCCESS`. **The producer shall never modify, replace or delete this file.**
-  - Its `1M={N}/10K={N}` path part shall be lexicographically greater than or equal to `1M=33000000/10K=33600000` (this is the partition containing `SCRAPE_START_BLOCK`).
-  - For every pattern  `1M={N}/10K={N}` lexicographically between `1M=33000000/10K=33600000` and this folder (inclusive), a folder at that path `manifests/1M={N}/10K={N}/` shall also exist.
-  - Let the "block upper bound" for this partition be `N + 9,999`, where `N` is the number in `10K={N}`.
-  - For every (contract, event) [specified below](#events-by-contract) with deployment block less than or equal to that upper bound, the folder `{contract}/{event}/1M={N}/10K={N}/` shall exist. A contract that deploys mid-partition still gets files in that 10K. **The producer shall never modify, replace or delete its two files.**
+  - Its day shall be the UTC day of block 33,605,403 or a later UTC day.
+  - For every UTC day from the day of block 33,605,403 through this day, inclusive, a folder at `manifests/year=YYYY/month=MM/day=DD/` shall also exist.
+  - Let `max_block` be the `max_block` parameter in that day's `metadata.json`. Every event folder for that day records the same `min_block` and `max_block`.
+  - For every (contract, event) [specified below](#events-by-contract) with deployment block less than or equal to that `max_block`, the folder `{contract}/{event}/year=YYYY/month=MM/day=DD/` shall exist. A contract that deploys during that UTC day still gets that day's files. **The producer shall never modify, replace or delete its two files.**
+  - Every row in those files has `block_number` in `[min_block, max_block]` and `block_timestamp` on that UTC day.
 
-The folder existing with the lexicographically highest pattern `manifests/1M={N}/10K={N}/` is called the "frontier". For the avoidance of doubt, no guarantees are made regarding the existance, completeness or immutability of files in ``{contract}/{event}/1M={N}/10K={N}/`` folders which are lexicographically higher than that.
+The folder existing with the lexicographically highest pattern `manifests/year=YYYY/month=MM/day=DD/` is called the "frontier". For the avoidance of doubt, no guarantees are made regarding the existence, completeness or immutability of files in `{contract}/{event}/year=YYYY/month=MM/day=DD/` folders which are lexicographically higher than that.
 
-Those higher folders are unpublished. Any `{contract}/{event}/1M={N}/10K={N}/` folder that exists
-contains exactly `data.parquet` and `metadata.json`. A 10K above the frontier may already have
-every expected two-file event folder; that 10K has no `manifests/1M={N}/10K={N}/_SUCCESS`.
+Those higher folders are unpublished. Any `{contract}/{event}/year=YYYY/month=MM/day=DD/` folder that exists contains exactly `data.parquet` and `metadata.json`. A day above the frontier may already have every expected two-file event folder; that day has no `manifests/year=YYYY/month=MM/day=DD/_SUCCESS`.
 
 ## Known limitations
 
 - Some conditions prepared before block 33,605,403 exist on-chain but are not in this dataset — exactly 84 orphaned conditions are known and tolerated (see [test_token_registered_conditions_have_preparation](tests/data_validation/test_token_registered_conditions_have_preparation.py)).
 - Some fills  on CTFExchange occur after condition resolution, this is an off-chain invariant the contracts do not enforce — exactly 54 such cases are known and tolerated (see [test_no_trading_after_resolution](tests/data_validation/test_no_trading_after_resolution.py)).
 - **Not included in this dataset:** ERC-20 token transfers (USDC.e and other tokens), ERC-1155 outcome-token transfers from `ConditionalTokens` (`TransferSingle` / `TransferBatch`), proxy-wallet creation/management events, generic NegRisk wrapped-collateral transfers, and any events from contracts not listed in the [Contracts](#contracts) table. These flows are relevant to the Polymarket ecosystem but live outside the events scraped here.
+- A chain reorganization deeper than 256 blocks can change blocks that already sit inside a sunk day. Sunk day folders are not rewritten. A day is published only once that day's last block is at least 256 blocks behind the chain head.
 
 ## Schema common columns
 
@@ -85,14 +89,14 @@ All tables share these four columns, in this order, **before any event-specific 
 
 | Column | Parquet logical type | Description | Guarantees |
 |---|---|---|---|
-| `block_number` | `INT(bitWidth=32, isSigned=false)` | Polygon block number | Strictly within partition bounds; fits in uint32 |
-| `block_timestamp` | `INT(bitWidth=32, isSigned=false)` | Unix seconds from `eth_getBlockByNumber` for this `block_number` | Fits in uint32. Header time, not interpolated. Polygon header times can go backwards; this column is data, not a partition key. |
+| `block_number` | `INT(bitWidth=32, isSigned=false)` | Polygon block number | Inside that day's `[min_block, max_block]`; fits in uint32 |
+| `block_timestamp` | `INT(bitWidth=32, isSigned=false)` | Unix seconds from `eth_getBlockByNumber` for this `block_number` | Fits in uint32. Header time, not interpolated. Consecutive header times strictly increase (Bor `ErrInvalidTimestamp`, commit `9c445ef`, `consensus/bor/bor.go` lines 131–133; mainnet period is never 0). The UTC day folder is the day of this value. The column remains in the file. |
 | `transaction_index` | `INT(bitWidth=32, isSigned=false)` | Position of the transaction within the block | Fits in uint32 |
 | `log_index` | `INT(bitWidth=32, isSigned=false)` | Position of the log within the block | Fits in uint32 |
 
 The emitting contract address is **not** stored as a column — it is implicit from the directory path (e.g., `CTFExchange/order_filled/`).
 
-The partition values (`1M=…`, `10K=…`) are encoded in the directory path. They **must not appear as columns inside the Parquet file** — they are Hive-style partition keys, not data.
+The partition values (`year`, `month`, `day`) are encoded in the directory path. They **must not appear as columns inside the Parquet file** — they are Hive-style partition keys, not data.
 
 ## Contracts
 
@@ -518,9 +522,9 @@ Most guarantees written before the v2 exchanges existed reference columns (`make
 
 ### Row identity (every contract, every event)
 
-- [test_block_transaction_log_index_unique_per_partition](tests/data_validation/test_block_transaction_log_index_unique_per_partition.py) — within every 10K partition, `(block_number, transaction_index, log_index)` is unique across every event row from every contract.
+- [test_block_transaction_log_index_unique_per_partition](tests/data_validation/test_block_transaction_log_index_unique_per_partition.py) — within every UTC day, `(block_number, transaction_index, log_index)` is unique across every event row from every contract.
 - [test_no_transaction_hash_column](tests/data_validation/test_no_transaction_hash_column.py) — no event-table Parquet file has a `transaction_hash` column.
-- [test_block_timestamp_is_unix_seconds](tests/data_validation/test_block_timestamp_is_unix_seconds.py) — `block_timestamp` is present, non-null, and constant per `block_number` within a partition.
+- [test_block_timestamp_is_unix_seconds](tests/data_validation/test_block_timestamp_is_unix_seconds.py) — `block_timestamp` is present, non-null, and constant per `block_number` within a UTC day.
 - [test_no_null_values_anywhere](tests/data_validation/test_no_null_values_anywhere.py) — no column in any event-table Parquet file contains a NULL value. **Scope:** every column of every event table from every contract.
 - [test_rows_sorted_within_each_file](tests/data_validation/test_rows_sorted_within_each_file.py) — every Parquet file is sorted internally by `(block_number, transaction_index, log_index)`. **Scope:** every event-table Parquet file from every contract.
 
@@ -528,10 +532,10 @@ Most guarantees written before the v2 exchanges existed reference columns (`make
 
 - [test_address_hash_format_valid](tests/data_validation/test_address_hash_format_valid.py) — every 20-byte address column is exactly 20 bytes and every 32-byte hash column is exactly 32 bytes. **Scope:** v1 exchange directories (`CTFExchange/{order_filled, orders_matched, fee_charged}`, `NegRiskCtfExchange/{order_filled, orders_matched, fee_charged}`) plus `*/token_registered` (every exchange that emits it). Does not cover v2 exchanges or non-exchange contracts; rewriting it to cover those is open work.
 - [test_v2_exchange_tables](tests/data_validation/test_v2_exchange_tables.py) — for v2 exchanges, `order_filled` and `orders_matched` rows have `side ∈ {0, 1}` and `fee_charged` has no `token_id` column. **Scope:** v2 exchanges only (`CTFExchangeV2`, `NegRiskCtfExchangeV2`) by construction.
-- [test_no_partition_key_columns_in_files](tests/data_validation/test_no_partition_key_columns_in_files.py) — no Parquet file contains a column named `1M` or `10K` (those values live in the directory path, not as data). **Scope:** every event-table Parquet file from every contract.
+- [test_no_partition_key_columns_in_files](tests/data_validation/test_no_partition_key_columns_in_files.py) — no Parquet file contains a column named `year`, `month`, or `day` (those values live in the directory path, not as data). **Scope:** every event-table Parquet file from every contract.
 - [test_array_columns_well_formed](tests/data_validation/test_array_columns_well_formed.py) — every JSON-array column (`payout_numerators`, `partition`, `index_sets`, `amounts`, `payouts`) parses as a valid JSON array (the empty array `[]` is allowed; NULL is not), and additionally `json_array_length(condition_resolution.payout_numerators) == outcome_slot_count` per Gnosis CTF's `reportPayouts` contract. **Scope:** every directory that emits each column.
-- [test_partition_paths_have_no_gaps](tests/data_validation/test_partition_paths_have_no_gaps.py) — for each `(contract, event)`, the 10K partitions on disk form a contiguous chain from `floor(deployment_block / 10_000) * 10_000` upward, with no missing 10K cells. **Scope:** every `(contract, event)` directory; filename-only check.
-- [test_no_partition_before_contract_deployment](tests/data_validation/test_no_partition_before_contract_deployment.py) — no `(contract, event)` partition exists with an end block earlier than the contract's `deployment_block`. **Scope:** every `(contract, event)` directory; filename-only check.
+- [test_partition_paths_have_no_gaps](tests/data_validation/test_partition_paths_have_no_gaps.py) — for each `(contract, event)`, the UTC day folders on disk form a contiguous calendar chain from that pair's earliest day through its latest day. **Scope:** every `(contract, event)` directory; filename-only check.
+- [test_no_partition_before_contract_deployment](tests/data_validation/test_no_partition_before_contract_deployment.py) — every manifested day includes each contract deployed by that day's `max_block`, and no event folder's `max_block` is earlier than the contract's `deployment_block`. **Scope:** manifests and `metadata.json` parameters.
 
 ### Numeric value sanity
 
@@ -587,4 +591,4 @@ Not exchange-specific.
 
 ## Versioning
 
-This is `v4`. Breaking change from `v3`: dropped `transaction_hash` from every event table; added `block_timestamp` (Unix seconds from the block header). Grain is `(block_number, transaction_index, log_index)`. Partitioning is still `1M=` / `10K=`. No back-compat with `v3` parquet.
+This is `v4`. Breaking change from `v3`: dropped `transaction_hash` from every event table; added `block_timestamp` (Unix seconds from the block header); cold layout is `year=YYYY/month=MM/day=DD/` instead of `1M=` / `10K=`. Grain is `(block_number, transaction_index, log_index)`. No back-compat with `v3` parquet.

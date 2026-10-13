@@ -1,4 +1,4 @@
-"""Unit tests for condition_by_10k_v2 aggregation against fixture inputs."""
+"""Unit tests for condition_by_day_v2 aggregation against fixture inputs."""
 
 from __future__ import annotations
 
@@ -17,10 +17,12 @@ _DATASET_DIR = Path(__file__).resolve().parents[2]
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from lib.partition_utils import partition_dir  # noqa: E402
+from lib.ymd_partition import day_dir  # noqa: E402
 
-K_VAL = 70_000_000
-M_VAL = 70_000_000
+DAY_KEY = 20261012
+MIN_BLOCK = 70_000_000
+MAX_BLOCK = 70_009_999
+K_VAL = MIN_BLOCK
 COND_A = bytes.fromhex("aa" * 32)
 COND_B = bytes.fromhex("bb" * 32)
 COND_OTHER = bytes.fromhex("cc" * 32)
@@ -29,7 +31,7 @@ ACCT = bytes.fromhex("11" * 20)
 
 def _load_main():
     spec = importlib.util.spec_from_file_location(
-        "condition_by_10k_v2_main", _DATASET_DIR / "main.py"
+        "condition_by_day_v2_main", _DATASET_DIR / "main.py"
     )
     mod = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -48,7 +50,7 @@ def _setup(tmp_path: Path, *, fills_rows: list[dict], resolutions: list[dict], m
     raw = tmp_path / "raw"
     token_map = tmp_path / "token_map"
     out = tmp_path / "out"
-    fills_path = fills / partition_dir(K_VAL) / "data.parquet"
+    fills_path = fills / day_dir(DAY_KEY) / "data.parquet"
     if fills_rows:
         _write_parquet(
             fills_path,
@@ -97,7 +99,7 @@ def _setup(tmp_path: Path, *, fills_rows: list[dict], resolutions: list[dict], m
         )
     if resolutions:
         res_path = (
-            raw / "ConditionalTokens" / "condition_resolution" / partition_dir(K_VAL) / "data.parquet"
+            raw / "ConditionalTokens" / "condition_resolution" / day_dir(DAY_KEY) / "data.parquet"
         )
         _write_parquet(
             res_path,
@@ -120,7 +122,7 @@ def _setup(tmp_path: Path, *, fills_rows: list[dict], resolutions: list[dict], m
                 }
             ),
         )
-    map_path = token_map / "1M=0" / "10K=0" / "data.parquet"
+    map_path = token_map / day_dir(DAY_KEY) / "data.parquet"
     _write_parquet(
         map_path,
         pa.table({"condition_id": pa.array(mapped, type=pa.binary())}),
@@ -131,8 +133,8 @@ def _setup(tmp_path: Path, *, fills_rows: list[dict], resolutions: list[dict], m
     mod.OUT_DIR = str(out)
     con = duckdb.connect()
     mod._load_polymarket_conditions(con)
-    n = mod.process_chunk(con, M_VAL, K_VAL, logging.getLogger("test"))
-    result = pq.read_table(out / partition_dir(K_VAL) / "data.parquet")
+    n = mod.process_chunk(con, DAY_KEY, MIN_BLOCK, MAX_BLOCK, logging.getLogger("test"))
+    result = pq.read_table(out / day_dir(DAY_KEY) / "data.parquet")
     return n, result
 
 

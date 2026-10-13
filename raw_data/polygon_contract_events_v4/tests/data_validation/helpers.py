@@ -3,16 +3,19 @@ Helpers for polygon_contract_events_v4 data validation tests.
 
 Provides functions for reading v4 partitioned Parquet data, where the layout is:
 
-    {RAW}/{contract}/{event}/1M={N}/10K={N}/data.parquet
+    {RAW}/{contract}/{event}/year=YYYY/month=MM/day=DD/data.parquet
 
+The integers these helpers call "ranges" are UTC day keys (YYYYMMDD).
 Event-name lookups union across contracts automatically.
 """
+import json
 import os
 import sys
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 from dotenv import load_dotenv
+from lib.ymd_partition import day_dir, day_key_from_parts
 
 _project_root = Path(__file__).resolve().parent.parent.parent.parent.parent
 load_dotenv(_project_root / ".env")
@@ -24,8 +27,6 @@ if not RAW:
 SCRATCH_DIR = os.environ.get("SCRATCH_DIR", "")
 if not SCRATCH_DIR:
     sys.exit("SCRATCH_DIR not set in .env")
-
-_10K_DIRS_PER_1M = 100
 
 # SQL expression for the 32-byte zero blob representing USDC (collateral).
 # Asset IDs are BLOB(32) on disk; USDC is all zeros.
@@ -123,59 +124,78 @@ def glob_all(event: str) -> str:
     return f"read_parquet([{path_list}])"
 
 
-def _complete_1m_ranges_for_path(event_path: str) -> set[int]:
-    """Return set of 1M values with exactly 100 10K sub-dirs."""
+def _day_keys_for_path(event_path: str) -> set[int]:
+    """UTC day keys that have ``data.parquet`` under one contract/event path."""
     full = os.path.join(RAW, event_path)
     if not os.path.isdir(full):
         return set()
-    complete = set()
-    for entry in os.scandir(full):
-        if not entry.is_dir() or not entry.name.startswith("1M="):
+    keys: set[int] = set()
+    for year in os.scandir(full):
+        if not year.is_dir() or not year.name.startswith("year="):
             continue
-        n_10k = sum(1 for e in os.scandir(entry.path) if e.is_dir())
-        if n_10k == _10K_DIRS_PER_1M:
-            complete.add(int(entry.name.split("=")[1]))
-    return complete
+        y = int(year.name.split("=", 1)[1])
+        for month in os.scandir(year.path):
+            if not month.is_dir() or not month.name.startswith("month="):
+                continue
+            m = int(month.name.split("=", 1)[1])
+            for day in os.scandir(month.path):
+                if (
+                    not day.is_dir()
+                    or not day.name.startswith("day=")
+                    or day.name.endswith(".tmp")
+                ):
+                    continue
+                pq = os.path.join(day.path, "data.parquet")
+                if not os.path.isfile(pq):
+                    continue
+                d = int(day.name.split("=", 1)[1])
+                keys.add(day_key_from_parts(y, m, d))
+    return keys
 
 
 def complete_1m_ranges(event: str = "order_filled") -> list[int]:
-    """Return sorted list of 1M values that are complete across all contracts
-    that have this event.  'Complete' = each contract's 1M dir has 100 10K
-    sub-dirs, intersected across contracts."""
+    """Sorted UTC day keys present for every contract that has this event."""
     paths = _event_locations().get(event, [])
     if not paths:
         return []
-    _emit_progress(f"computing complete 1M ranges for {event} across {len(paths)} path(s)")
-    sets = [_complete_1m_ranges_for_path(p) for p in paths]
+    _emit_progress(f"computing complete day keys for {event} across {len(paths)} path(s)")
+    sets = [_day_keys_for_path(p) for p in paths]
     return sorted(sets[0].intersection(*sets[1:]))
 
 
+def _parquet_sources(paths: list[str], day_keys: list[int]) -> list[str]:
+    sources: list[str] = []
+    for path in paths:
+        for day_key in day_keys:
+            parquet = os.path.join(RAW, path, day_dir(day_key), "data.parquet")
+            if os.path.isfile(parquet):
+                sources.append(f"'{parquet}'")
+    return sources
+
+
+def _read_parquet_sql(sources: list[str]) -> str:
+    if len(sources) == 1:
+        return f"read_parquet({sources[0]})"
+    return f"read_parquet([{', '.join(sources)}])"
+
+
 def glob_complete(event: str, ranges: list[int]) -> str:
-    """Read only complete 1M partitions for a logical event name, unioned
-    across contracts."""
+    """Read the given UTC days for a logical event, unioned across contracts."""
     paths = _event_locations().get(event, [])
     if not paths:
         raise ValueError(f"no data found for event {event!r}")
-    all_parquet = []
-    for p in paths:
-        for v in ranges:
-            d = os.path.join(RAW, p, f"1M={v}")
-            if os.path.isdir(d):
-                all_parquet.append(f"'{RAW}/{p}/1M={v}/**/*.parquet'")
-    if not all_parquet:
+    sources = _parquet_sources(paths, ranges)
+    if not sources:
         raise ValueError(f"no complete partitions found for {event!r}")
-    if len(all_parquet) == 1:
-        return f"read_parquet({all_parquet[0]})"
-    return f"read_parquet([{', '.join(all_parquet)}])"
+    return _read_parquet_sql(sources)
 
 
 def complete_1m_ranges_for(event: str) -> set[int]:
-    """Return set of 1M values complete for a specific event (intersected
-    across contracts)."""
+    """UTC day keys present for every contract that has this event."""
     paths = _event_locations().get(event, [])
     if not paths:
         return set()
-    sets = [_complete_1m_ranges_for_path(p) for p in paths]
+    sets = [_day_keys_for_path(p) for p in paths]
     return sets[0].intersection(*sets[1:])
 
 
@@ -183,29 +203,21 @@ V1_EXCHANGE_CONTRACTS = frozenset({"CTFExchange", "NegRiskCtfExchange"})
 
 
 def glob_complete_contract_prefix(prefix: str, ranges: list[int]) -> str:
-    """Read only complete 1M partitions for events whose contract path starts with a prefix.
+    """Read the given UTC days for events whose path starts with ``prefix``.
 
     Example: prefix="ConditionalTokens" matches ConditionalTokens/position_split,
     ConditionalTokens/positions_merge, etc., but not NegRiskAdapter/*.
     """
-    # Build a synthetic event map filtered by prefix
     all_locs = _event_locations()
-    # The values are lists of "contract/event" paths; filter those starting with the prefix
-    filtered_paths = [p for p in sum(all_locs.values(), []) if p == prefix or p.startswith(prefix + "/")]
+    filtered_paths = [
+        p for p in sum(all_locs.values(), []) if p == prefix or p.startswith(prefix + "/")
+    ]
     if not filtered_paths:
         raise ValueError(f"no data found for contract prefix {prefix!r}")
-
-    all_parquet = []
-    for p in filtered_paths:
-        for v in ranges:
-            d = os.path.join(RAW, p, f"1M={v}")
-            if os.path.isdir(d):
-                all_parquet.append(f"'{RAW}/{p}/1M={v}/**/*.parquet'")
-    if not all_parquet:
+    sources = _parquet_sources(filtered_paths, ranges)
+    if not sources:
         raise ValueError(f"no complete partitions found for contract prefix {prefix!r}")
-    if len(all_parquet) == 1:
-        return f"read_parquet({all_parquet[0]})"
-    return f"read_parquet([{', '.join(all_parquet)}])"
+    return _read_parquet_sql(sources)
 
 
 def glob_complete_v1(event: str, ranges: list[int]) -> str:
@@ -213,50 +225,59 @@ def glob_complete_v1(event: str, ranges: list[int]) -> str:
 
     Use for queries that reference V1-only schema columns like
     maker_asset_id and taker_asset_id, to avoid schema mismatch with
-    V2 directories that share the same 1M partition ranges.
+    V2 directories that share the same UTC days.
     """
-    paths = [p for p in _event_locations().get(event, [])
-             if p.split("/")[0] in V1_EXCHANGE_CONTRACTS]
+    paths = [
+        p for p in _event_locations().get(event, [])
+        if p.split("/")[0] in V1_EXCHANGE_CONTRACTS
+    ]
     if not paths:
         raise ValueError(f"no V1 data found for event {event!r}")
-    all_parquet = []
-    for p in paths:
-        for v in ranges:
-            d = os.path.join(RAW, p, f"1M={v}")
-            if os.path.isdir(d):
-                all_parquet.append(f"'{RAW}/{p}/1M={v}/**/*.parquet'")
-    if not all_parquet:
+    sources = _parquet_sources(paths, ranges)
+    if not sources:
         raise ValueError(f"no complete V1 partitions found for {event!r}")
-    if len(all_parquet) == 1:
-        return f"read_parquet({all_parquet[0]})"
-    return f"read_parquet([{', '.join(all_parquet)}])"
+    return _read_parquet_sql(sources)
 
 
 def complete_1m_ranges_for_paths(paths: list[str]) -> set[int]:
-        """Return set of 1M values complete across the provided event paths.
+    """UTC day keys present on every provided event path.
 
-        Paths are relative to RAW, for example:
-            - CTFExchange/order_filled
-            - NegRiskCtfExchange/order_filled
-        """
-        if not paths:
-                return set()
-        sets = [_complete_1m_ranges_for_path(p) for p in paths]
-        return sets[0].intersection(*sets[1:])
+    Paths are relative to RAW, for example:
+        - CTFExchange/order_filled
+        - NegRiskCtfExchange/order_filled
+    """
+    if not paths:
+        return set()
+    sets = [_day_keys_for_path(p) for p in paths]
+    return sets[0].intersection(*sets[1:])
+
+
+def event_day_parquet(contract: str, event: str, day_key: int) -> Path:
+    """Path of one event file for a UTC day. The file need not exist yet."""
+    return Path(RAW) / contract / event / day_dir(day_key) / "data.parquet"
+
+
+def parquet_covering_block(contract: str, event: str, block: int) -> str:
+    """``data.parquet`` whose metadata span contains ``block``."""
+    root = Path(RAW) / contract / event
+    for meta in root.glob("year=*/month=*/day=*/metadata.json"):
+        payload = json.loads(meta.read_text(encoding="utf-8"))
+        params = payload.get("parameters") or {}
+        if int(params["min_block"]) <= block <= int(params["max_block"]):
+            parquet = meta.parent / "data.parquet"
+            if parquet.is_file():
+                return str(parquet)
+    raise FileNotFoundError(f"no {contract}/{event} day covers block {block}")
 
 
 def iter_partitions_with_files() -> "list[tuple[int, list[str]]]":
-    """Return [(10K partition start, [parquet paths across every event table that
-    cover that 10K range])], sorted by partition start.
+    """Return [(day_key, [parquet paths])], sorted by UTC day.
 
     Used by global-invariant assertions that need to scan every event row for
-    a given block range together. Each partition entry is bounded in size
-    (one 10K block range across at most ~42 event tables), which keeps
-    per-partition aggregations memory-cheap.
+    one UTC day together. Each entry is one day across at most ~42 event tables.
     """
-    # partition_start -> list of absolute parquet paths
-    by_partition: dict[int, list[str]] = {}
-    contract_entries = [e for e in os.scandir(RAW) if e.is_dir()]
+    by_day: dict[int, list[str]] = {}
+    contract_entries = [e for e in os.scandir(RAW) if e.is_dir() and e.name != "manifests"]
     total_contracts = len(contract_entries)
     step = _progress_step(total_contracts) if total_contracts else 1
 
@@ -271,17 +292,10 @@ def iter_partitions_with_files() -> "list[tuple[int, list[str]]]":
         for event in os.scandir(contract.path):
             if not event.is_dir():
                 continue
-            for m_entry in os.scandir(event.path):
-                if not m_entry.is_dir() or not m_entry.name.startswith("1M="):
-                    continue
-                for k_entry in os.scandir(m_entry.path):
-                    if not k_entry.is_dir() or not k_entry.name.startswith("10K="):
-                        continue
-                    pq = os.path.join(k_entry.path, "data.parquet")
-                    if not os.path.isfile(pq):
-                        continue
-                    block_start = int(k_entry.name.split("=", 1)[1])
-                    by_partition.setdefault(block_start, []).append(pq)
-    items = sorted(by_partition.items())
+            rel = os.path.relpath(event.path, RAW)
+            for day_key in _day_keys_for_path(rel):
+                pq = os.path.join(event.path, day_dir(day_key), "data.parquet")
+                by_day.setdefault(day_key, []).append(pq)
+    items = sorted(by_day.items())
     _emit_progress(f"discovered {len(items)} parquet partition(s)")
     return _ProgressSequence(items, label="checking parquet partitions")

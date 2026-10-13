@@ -1,4 +1,4 @@
-"""Unit tests for account_by_10k_v2 aggregation and entropy."""
+"""Unit tests for account_by_day_v2 aggregation and entropy."""
 
 from __future__ import annotations
 
@@ -16,10 +16,10 @@ _DATASET_DIR = Path(__file__).resolve().parents[2]
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from lib.partition_utils import partition_dir  # noqa: E402
+from lib.ymd_partition import day_dir  # noqa: E402
 
+DAY_KEY = 20261012
 K_VAL = 70_000_000
-M_VAL = 70_000_000
 EARLY_K = 60_000_000
 COND_A = bytes.fromhex("aa" * 32)
 COND_B = bytes.fromhex("bb" * 32)
@@ -29,7 +29,7 @@ ACCT_2 = bytes.fromhex("22" * 20)
 
 def _load_main():
     spec = importlib.util.spec_from_file_location(
-        "account_by_10k_v2_main", _DATASET_DIR / "main.py"
+        "account_by_day_v2_main", _DATASET_DIR / "main.py"
     )
     mod = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -37,11 +37,11 @@ def _load_main():
     return mod
 
 
-def _run(tmp_path: Path, rows: list[dict], k_val: int = K_VAL):
+def _run(tmp_path: Path, rows: list[dict], min_block: int = K_VAL):
     mod = _load_main()
     fills = tmp_path / "fills"
     out = tmp_path / "out"
-    path = fills / partition_dir(k_val) / "data.parquet"
+    path = fills / day_dir(DAY_KEY) / "data.parquet"
     path.parent.mkdir(parents=True, exist_ok=True)
     table = pa.table(
         {
@@ -67,8 +67,14 @@ def _run(tmp_path: Path, rows: list[dict], k_val: int = K_VAL):
     pq.write_table(table, path)
     mod.FILLS = str(fills)
     mod.OUT_DIR = str(out)
-    n = mod.process_chunk(duckdb.connect(), (k_val // 1_000_000) * 1_000_000, k_val, logging.getLogger("test"))
-    return n, pq.read_table(out / partition_dir(k_val) / "data.parquet")
+    n = mod.process_chunk(
+        duckdb.connect(),
+        DAY_KEY,
+        min_block,
+        min_block + 9_999,
+        logging.getLogger("test"),
+    )
+    return n, pq.read_table(out / day_dir(DAY_KEY) / "data.parquet")
 
 
 def test_counts_volume_and_maker_ratio(tmp_path: Path):
@@ -129,6 +135,6 @@ def test_entropy_ln2_for_two_equal_hours(tmp_path: Path):
 
 def test_entropy_null_before_min_block(tmp_path: Path):
     rows = [{"block_number": EARLY_K, "is_taker": True} for _ in range(100)]
-    _, table = _run(tmp_path, rows, k_val=EARLY_K)
+    _, table = _run(tmp_path, rows, min_block=EARLY_K)
     assert pa.compute.is_null(table.column("taker_hour_entropy"))[0].as_py()
     assert pa.compute.is_null(table.column("maker_hour_entropy"))[0].as_py()

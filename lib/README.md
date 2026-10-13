@@ -8,7 +8,7 @@ Raw and derived producers depend on these for the contract-critical primitives �
 
 ### partition_utils.py
 
-Single source of truth for the 1M/10K nested partition scheme used by every dataset.
+Single source of truth for the 1M/10K nested partition scheme used by v1 and v3. v4 raw and v2 derived use [`ymd_partition.py`](#ymd_partitionpy).
 
 | name | description |
 |---|---|
@@ -17,7 +17,21 @@ Single source of truth for the 1M/10K nested partition scheme used by every data
 | `partition_start(block)` / `partition_end(block)` | aligned start / inclusive end of the 10K partition containing a block |
 | `partition_dir(block)` | canonical relative dir, e.g. `"1M=33000000/10K=33600000"` |
 | `mask_partition(partition_start)` | screen form with the last four digits masked, e.g. `"8,45X,XXX"` |
-| `enumerate_partitions(start_block, frontier)` | every consecutive `(m, k)` partition from `start_block` up to the frontier, by block range (no gaps) — the canonical partition-planning primitive for derived producers |
+| `enumerate_partitions(start_block, frontier)` | every consecutive `(m, k)` partition from `start_block` up to the frontier, by block range (no gaps) — the partition-planning primitive for v1 derived producers |
+
+### ymd_partition.py
+
+UTC day partitions for v4 raw and v2 derived. A day key is the integer `YYYYMMDD`. Bor `ErrInvalidTimestamp` (commit `9c445ef`, `consensus/bor/bor.go` lines 131–133) keeps header time strictly increasing, so a day folder is a function of block number.
+
+| name | description |
+|---|---|
+| `day_key_from_timestamp(ts)` | `YYYYMMDD` for a Unix timestamp |
+| `day_dir(day_key)` / `day_label(day_key)` | `year=YYYY/month=MM/day=DD` and `YYYY-MM-DD` |
+| `next_day_key` / `prev_day_key` / `utc_midnight` | calendar neighbors and the Unix midnight of a day |
+| `midnights_crossed(ts_lo, ts_hi)` | UTC midnights strictly after `ts_lo` and at or before `ts_hi` |
+| `first_block_on_or_after(ts_at, lo, hi, midnight)` | smallest block in `(lo, hi]` whose header time is at or after `midnight` |
+| `iter_manifest_day_keys(cold_root)` | sorted day keys that have a manifest `_SUCCESS` |
+| `day_block_span(cold_root, day_key)` | `(min_block, max_block)` from that day's `metadata.json` |
 
 ### atomic_publish.py
 
@@ -89,6 +103,7 @@ Modules that contain a self-test run it when executed directly and exit non-zero
 # from the project root, activate whatever venv applies to the calling script, then:
 python lib/ct_helpers.py        # checks computed token IDs against known on-chain values
 python lib/partition_utils.py   # checks partition math against hand-computed values
+python lib/ymd_partition.py      # checks UTC day keys, midnights, and the block cut
 ```
 
 Expected output ends with all checks marked `PASS`; exit code is `0` on success, `1` on any failure.

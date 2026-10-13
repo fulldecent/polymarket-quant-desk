@@ -14,7 +14,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from _internal.persistence import HotStore, HotStoreConfig
-from _internal.tables import PARTITION_SIZE_10K, SCRAPE_START_BLOCK, table_name
+from _internal.tables import SCRAPE_START_BLOCK, table_name
 
 SCHEMA = str(Path(__file__).resolve().parents[2] / "schema.sql")
 TARGET = ("ConditionalTokens", "condition_preparation")
@@ -45,7 +45,7 @@ def one_row(block: int) -> dict:
 
 
 def test_a_range_below_the_sunk_frontier_is_refused(store):
-    sunk_through = SCRAPE_START_BLOCK + PARTITION_SIZE_10K - 1
+    sunk_through = SCRAPE_START_BLOCK + 999
     store.sunk_frontier = sunk_through
 
     with pytest.raises(ValueError, match="sunk frontier"):

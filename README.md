@@ -41,12 +41,12 @@ python raw_data/polygon_contract_events_v4/main.py
 python derived_data/token_id_map_v2/main.py
 python derived_data/fills_v2/main.py
 python derived_data/condition_by_block_v2/main.py
-python derived_data/condition_by_10k_v2/main.py
-python derived_data/account_condition_by_10k_v2/main.py
-python derived_data/account_by_10k_v2/main.py
+python derived_data/condition_by_day_v2/main.py
+python derived_data/account_condition_by_day_v2/main.py
+python derived_data/account_by_day_v2/main.py
 ```
 
-The full dependency graph for your pipeline is in the [data catalog](docs/Data%20catalog.md), and links to each dataset's data dictionary. These scripts all produce data in partitions of 10,000 blockchain blocks which is immutable and reproducible.
+The full dependency graph for your pipeline is in the [data catalog](docs/Data%20catalog.md), and links to each dataset's data dictionary. These scripts produce UTC day partitions (`year=YYYY/month=MM/day=DD`), which are immutable and reproducible.
 
 This is information you use to find alpha!
 

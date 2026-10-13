@@ -15,7 +15,7 @@ TX 2 (CTF): 0x3DAB75C74D0752AFF1CA64430A1F23F089D14BAA40161BF43DC562DCE88F5A07
 v4 identifies a transaction by ``(block_number, transaction_index)``.
 The hashes above are documentation for Polygonscan lookup only.
 """
-from helpers import RAW
+from helpers import parquet_covering_block
 
 
 _TX1_BLOCK = 83_851_893
@@ -25,9 +25,7 @@ _TX2_INDEX = 149
 
 
 def _partition_path(contract, event, block):
-    m = (block // 1_000_000) * 1_000_000
-    k = (block // 10_000) * 10_000
-    return f"{RAW}/{contract}/{event}/1M={m}/10K={k}/data.parquet"
+    return parquet_covering_block(contract, event, block)
 
 
 def _read_fee_refunded(con, contract, block, tx_index):

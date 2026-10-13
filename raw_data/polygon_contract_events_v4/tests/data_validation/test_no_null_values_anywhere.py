@@ -6,7 +6,7 @@ column in any table is ever NULL." This test enforces that for every
 column of every event-table file. A NULL in any column is a producer
 contract violation, not a valid value.
 
-Scope: every `*/*/1M=*/10K=*/data.parquet` file on disk, for every event
+Scope: every `*/*/year=*/month=*/day=*/data.parquet` file on disk, for every event
 table from every contract.
 
 Implementation: read each column chunk's ``stats_null_count`` from the
@@ -21,7 +21,7 @@ from helpers import RAW
 
 
 def test_no_null_values_anywhere(con):
-    glob_pattern = f"{RAW}/*/*/1M=*/10K=*/data.parquet"
+    glob_pattern = f"{RAW}/*/*/year=*/month=*/day=*/data.parquet"
     # Sanity-check that the glob matches something.
     n_files = con.execute(f"""
         SELECT COUNT(DISTINCT file_name)

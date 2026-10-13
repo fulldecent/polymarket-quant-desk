@@ -63,13 +63,13 @@ Within each partition file, rows are sorted ascending by `(block_number, logical
 4. Maker legs ordered by implied price, best-for-taker first: when the taker is buying outcome tokens, lowest price first; when the taker is selling, highest price first.
 5. Ties (makers at the same price) broken by `log_index` ascending.
 
-This ordering makes each partition file row-for-row reproducible from identical source data.
+This ordering makes each day file row-for-row reproducible from identical source data.
 
 ## Partitioning
 
-**1M/10K nested partitioning** (same scheme as the raw tables and `token_id_map_v2`).
+**UTC day folders** `year=YYYY/month=MM/day=DD` (same scheme as `token_id_map_v2`).
 
-Each fill is materialized in exactly the 10K partition whose block range contains its `block_number`. A 10K block range with no fills still writes a zero-row `data.parquet` plus `metadata.json`. Once written, a partition file is immutable.
+Each fill is materialized in the UTC day whose block span contains its `block_number`. The day identity is the folder, not a column. A manifested day with no fills still writes a zero-row `data.parquet` plus `metadata.json`. Once written, a day folder is immutable.
 
 ## Fee mechanics
 
@@ -86,7 +86,7 @@ Per Polymarket's CTF documentation (<https://github.com/Polymarket/agent-skills/
 
 ## Row suppression: fills after condition resolution
 
-Fills that occur after the resolution of their condition are suppressed from output and do not appear in any partition file. A fill is suppressed if its `(block_number, log_index)` is strictly after the `(block_number, log_index)` of the `ConditionalTokens/condition_resolution` event for its `condition_id`.
+Fills that occur after the resolution of their condition are suppressed from output and do not appear in any day file. A fill is suppressed if its `(block_number, log_index)` is strictly after the `(block_number, log_index)` of the `ConditionalTokens/condition_resolution` event for its `condition_id`.
 
 This suppression is deterministic and depends only on the condition's resolution timestamp (on-chain), not on partition boundaries or producer state. The same fill will always be suppressed or included across all runs. Consumers should never observe fills with `condition_id` values in resolved states at their respective `(block_number, log_index)` tuples.
 
