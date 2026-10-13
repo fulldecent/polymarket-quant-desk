@@ -28,7 +28,7 @@ This repo is one publication. New programs match existing ones. Do not add a par
 
 ## v4 RPC progress lines
 
-Each per-RPC sticky line in `polygon_contract_events_v4` leads with the live worker count and a multiplication sign: `3× Scraping {label}  {rate} blk/s  max blks/req {n}`. A dead lane keeps the prefix (`3× Failed ...`). Do not put `threads N` on that line.
+Each per-RPC sticky line in `polygon_contract_events_v4` leads with the live worker count and a multiplication sign: `3× Scraping {label}  {rate} blk/s  max blks/req {n}`. A permanently failed lane is `0× Failed ...`. Do not put `threads N` on that line.
 
 Scrolling `updating speed` and `backing off` lines still end with `threads N  max blks/req N`. v3 still puts `threads N` at the end of its sticky line. Leave v3 alone.
 

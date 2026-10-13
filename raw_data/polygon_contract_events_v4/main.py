@@ -529,12 +529,12 @@ def _unique_endpoint_labels(urls: list[str]) -> list[str]:
 def _lane_footer_text(lane: "_RpcLane", *, run_seconds: float) -> str:
     """Sticky-footer copy for one RPC lane.
 
-    The live worker count leads the text (``3× Scraping ...``). A dead lane
-    keeps the same prefix. ``max blks/req`` stays; ``threads N`` does not.
+    The live worker count leads the text (``3× Scraping ...``). A permanently
+    failed lane leads with ``0×``. ``max blks/req`` stays; ``threads N`` does not.
     """
-    prefix = f"{lane.optimizer.params.workers}× "
     if lane.fatal_reason is not None:
-        return f"{prefix}Failed {lane.label}  {lane.fatal_reason}"
+        return f"0× Failed {lane.label}  {lane.fatal_reason}"
+    prefix = f"{lane.optimizer.params.workers}× "
     rate = lane.blocks_done / run_seconds if run_seconds > 0 else 0.0
     max_blks = lane.planner.next_span(lane.optimizer.params.result_budget)
     return (

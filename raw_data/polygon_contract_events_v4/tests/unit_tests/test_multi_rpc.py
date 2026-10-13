@@ -123,7 +123,7 @@ def test_footer_line_spins_while_working_and_says_failed_when_dead():
 
     lane.fatal_reason = "HTTP 401 from the RPC provider"
     failed = scraper._lane_footer_text(lane, run_seconds=10.0)
-    assert failed == "3× Failed lb.drpc.live AmP...UMv  HTTP 401 from the RPC provider"
+    assert failed == "0× Failed lb.drpc.live AmP...UMv  HTTP 401 from the RPC provider"
 
 
 def test_failed_scrape_row_uses_the_stopped_glyph_and_stays_failed():
