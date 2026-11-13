@@ -26,8 +26,14 @@ This repo is one publication. New programs match existing ones. Do not add a par
 - Closing: blank line, `run complete` / `run failed`, indented `time:`.
 - Logs: `logs/main-{YYYY-MM-DDTHHMMSS}Z.log` next to the script. Every screen line in the file (UTC). Secrets never printed in full.
 
+## v4 RPC progress lines
+
+Each per-RPC sticky line in `polygon_contract_events_v4` leads with the live worker count and a multiplication sign: `3× Scraping {label}  {rate} blk/s  max blks/req {n}`. A permanently failed lane is `0× Failed ...`. Do not put `threads N` on that line.
+
+Scrolling `updating speed` and `backing off` lines still end with `threads N  max blks/req N`. v3 still puts `threads N` at the end of its sticky line. Leave v3 alone.
+
 ## If you find a mismatch
 
-1. Match the scraper in the code you are touching.
+1. Match the scraper in the code you are touching, except the v4 RPC prefix above. That prefix is an explicit override of the v3 sticky line.
 2. Do not rewrite the style guide.
 3. Tell the human: what diverged, that the scraper is source of truth, and that `.github/copilot-instructions.md` should be updated if they want the written guide to match.

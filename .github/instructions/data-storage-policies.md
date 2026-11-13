@@ -12,7 +12,7 @@ These are the rules that are most often gotten wrong. They are absolute.
 2. **Never consume data past the frontier.** Data beyond the upstream frontier is UNUSABLE AND UNSTABLE. A derived dataset reads only partitions whose inclusive end block is `<= frontier` (see "Frontier" below). Reading unsunk/unstable data is a correctness bug, not a performance tradeoff.
 3. **Errors are never acceptable. Fail fast.** There is no `--skip-errors`. Any error during materialization (corrupt input, failed assertion, unexpected shape) stops the program loudly so a human investigates. Never log-and-continue past a bad partition.
 4. **Never run with a dirty git tree.** Provenance depends on `git_commit` in every `metadata.json`. There is no `--run-dirty`. The producer refuses to start if `git status --porcelain` is non-empty. Commit or stash first.
-5. **Cover every partition consecutively, with no gaps.** A derived dataset materializes every 10K partition from its start partition up to the frontier, in strict ascending order, with no gaps. A 10K range that happens to have no source rows STILL produces a partition — a zero-row `data.parquet` plus its `metadata.json`. See "Complete consecutive coverage" below.
+5. **Cover every partition consecutively, with no gaps.** A derived dataset materializes every partition from its start through the frontier, in the scheme's ascending order, with no gaps. A range that happens to have no source rows STILL produces a partition — a zero-row `data.parquet` plus its `metadata.json`. See "Complete consecutive coverage" below.
 6. **Match upstream logical Parquet types so joins are clean.** Data types are chosen to make joining easy. Mirror the raw dataset's logical types exactly. In particular `BLOB` is Parquet `BYTE_ARRAY` (variable length, no logical type) — never `FIXED_LEN_BYTE_ARRAY`. See "Logical types" below.
 7. **Define and enforce a deterministic sort order.** Every dataset's `DATA_DICTIONARY.md` declares a physical sort order, and the producer enforces it, so each partition file is byte-for-byte reproducible from identical source. See "Sort order" below.
 
@@ -20,19 +20,20 @@ Forbidden command-line flags, anywhere in this repo: `--force`, `--skip-errors`,
 
 ## Frontier
 
-The frontier is the highest block whose data is finalized and stable upstream. For raw `polygon_contract_events_v3`, get it from `get_sunk_frontier(RAW)`; the stable partitions are exactly those backed by a `manifests/.../_SUCCESS` marker.
+The frontier is the highest block whose data is finalized and stable upstream. For raw `polygon_contract_events_v4`, get it from `get_sunk_frontier(RAW)`. That value is `max_block` in the metadata of the last contiguous `manifests/year=/month=/day=/_SUCCESS`. No manifests means nothing is sunk.
 
-- A derived job includes a partition only if `partition_end(k) <= frontier`.
+- A v1/v3 derived job includes a 10K partition only if `partition_end(k) <= frontier`.
+- A v2 derived job includes a UTC day only if that day's manifest `_SUCCESS` is inside the contiguous run and the day's `max_block` is `<= frontier`. List those days from the raw manifests. Do not invent calendar days the raw scrape has not sunk.
 - Discover the frontier once at startup; never read past it.
 - Do not infer stability from the mere existence of a raw `contract/event` parquet file — those can change until the manifest entry is published. Use the frontier / manifest, never raw-folder existence, to decide what is safe.
 
 ## Complete consecutive coverage
 
-Partition discovery for a derived dataset is by BLOCK RANGE, not by source-folder existence.
+Partition discovery for a derived dataset follows the upstream scheme, not source-folder existence.
 
-- The start partition is the 10K partition containing the dataset's first relevant block. For Polymarket-wide data this is the partition containing `SCRAPE_START_BLOCK` (`raw_data/polygon_contract_events_v3`).
-- Enumerate every 10K partition from the start partition through the highest partition with `partition_end(k) <= frontier`. No gaps are permitted.
-- Every enumerated partition produces an output folder. If the partition has no rows to emit, write a zero-row `data.parquet` with the correct schema plus its `metadata.json`. A missing partition folder is a bug; an empty partition folder is correct and expected.
+- v1 and v3: the start partition is the 10K partition containing the dataset's first relevant block. Enumerate every 10K partition from that start through the highest partition with `partition_end(k) <= frontier`, using `lib.partition_utils.enumerate_partitions`. No gaps are permitted.
+- v2, reading v4: the start day is the UTC day of `SCRAPE_START_BLOCK`'s header. Walk `next_day_key` across the contiguous raw manifest days. A day the raw scrape has not manifested is not work yet.
+- Every enumerated partition produces an output folder. If the partition has no rows to emit, write a zero-row `data.parquet` with the correct schema plus its `metadata.json`. A missing partition folder inside the enumerated range is a bug; an empty partition folder is correct and expected.
 - Already-landed partitions (output folder exists) are immutable and skipped. They must not be re-read, re-computed, or shown in progress output.
 
 ## Atomic publish
@@ -45,7 +46,7 @@ Every partition becomes visible atomically.
 
 ## Logical types
 
-Mirror the raw `polygon_contract_events_v3` logical Parquet types so derived columns join cleanly against raw columns and against each other.
+Mirror the raw `polygon_contract_events_v4` logical Parquet types so derived columns join cleanly against raw columns and against each other.
 
 | Dictionary type | Parquet encoding | PyArrow type | Notes |
 |---|---|---|---|
@@ -65,13 +66,17 @@ Reproducibility requires a total, declared order.
 
 ## Metadata
 
-Every partition has a `metadata.json` written via `lib.metadata_utils.create_parquet_metadata_json`. It records `git_commit`, `source_script`, `input_hashes`, partition parameters (`1M`, `10K`, `min_block`, `max_block`), `row_count`, and `created_at`. See `docs/Metadata files.md`.
+Every partition has a `metadata.json` written via `lib.metadata_utils.create_parquet_metadata_json`. It records `git_commit`, `source_script`, `input_hashes`, partition parameters, `row_count`, and `created_at`. See `docs/Metadata files.md`.
+
+- v1 and v3 parameters: `1M`, `10K`, `min_block`, `max_block`.
+- v4 and v2 parameters: `year`, `month`, `day`, `min_block`, `max_block`.
 
 ## Partitioning and naming
 
-- Nested `1M={N}/10K={K}/` directories; `data.parquet` + `metadata.json` inside.
-- Partition-key columns (`1M`, `10K`) are NEVER stored inside the file.
-- Use `lib.partition_utils` (`partition_start`, `partition_end`, `partition_dir`) for all partition math — do not hand-roll modulo arithmetic.
+Two schemes. Do not mix them inside one dataset.
+
+- v1 and v3: nested `1M={N}/10K={K}/` directories; `data.parquet` + `metadata.json` inside. Partition-key columns (`1M`, `10K`) are NEVER stored inside the file. Use `lib.partition_utils` (`partition_start`, `partition_end`, `partition_dir`) — do not hand-roll modulo arithmetic.
+- v4 and v2: nested `year=YYYY/month=MM/day=DD/` directories, zero-padded UTC so lexicographic order is chronological. `data.parquet` + `metadata.json` inside. Partition-key columns (`year`, `month`, `day`) are NEVER stored inside the file. Use `lib.ymd_partition` (`day_dir`, `next_day_key`, `day_key_from_timestamp`) — do not hand-roll calendar paths. Header time strictly increases (Bor `ErrInvalidTimestamp`, commit `9c445ef`, `consensus/bor/bor.go` lines 131–133; mainnet period is never 0), so the day of a block does not depend on which headers a producer happened to walk. A reorg deeper than the raw scraper's 256-block head buffer can still rewrite a sunk day; sunk days are not rewritten in place.
 
 ## Operator experience
 

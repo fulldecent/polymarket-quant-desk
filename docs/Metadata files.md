@@ -20,7 +20,7 @@ The JSON is a single object with the following fields:
 - `file_size_bytes`: parquet file size in bytes
 - `content_hash`: sha256 hash string, prefixed like sha256:...
 - `input_hashes`: map of input file path to sha256 hash (required for derived datasets)
-- `parameters`: optional run parameters, such as min and max block
+- `parameters`: optional run parameters, such as min and max block. v4 raw and v2 derived files use `year`, `month`, `day`, `min_block`, and `max_block`.
 
 ## Rules
 

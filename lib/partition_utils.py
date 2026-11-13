@@ -1,8 +1,9 @@
-"""Shared helpers for partition math and canonical partition directory names.
+"""Shared helpers for 1M/10K partition math and directory names.
 
-Every dataset in this project (raw and derived) uses the same 1M/10K nested
-partition scheme. These helpers are the single source of truth for that math so
-producers never re-derive partition sizes or directory names by hand.
+v1 and v3 datasets use this nested scheme. v4 raw and v2 derived datasets
+use UTC days in ``lib.ymd_partition`` instead. These helpers stay the
+single source of truth for 1M/10K math so those producers never re-derive
+partition sizes or directory names by hand.
 """
 
 from __future__ import annotations
